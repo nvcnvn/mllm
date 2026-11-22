@@ -81,7 +81,7 @@ Your `attn()` / `ffn()` split, cut where the hardware cuts:
 |---|---|---|
 | Weights | `mlx_lm.load()` modules; compiled Core ML model per dense block, cached under `/Volumes/T5/cache/mllm/ane/<model>/S<chunk>_<format>/` | `mmap` + `newBufferWithBytesNoCopy`, Core ML compiled models |
 | Arena storage | one numpy `uint8` array `[N, unit_bytes]`, with typed views per object: KV units as fp16 `[G, 2, kv_heads, T, head_dim]` (same bytes as `offset_in_unit`, so it checks the layout), state units as fp32 | one untracked `MTLBuffer` in a residency set |
-| Arena bookkeeping | Python class with the exact API: `admit(n)`, `alloc()`, `release(slot)`, `retire(step)` | C++ class (memory-design build step 2). Bind it with nanobind and drop it into the Python engine first |
+| Arena bookkeeping | Python class with the exact API: `admit(n)`, `alloc()`, `release(slot)`, `retire(step)` | C++ class (memory-design build step 2), unit-tested on its own ([cpp-port.md](cpp-port.md) §3) |
 | Workspace | object with named fields (`x`, `q`, `k`, `v`, `a`, `logits`) holding MLX/numpy arrays; ops reassign them | fixed `MTLBuffer`s; ANE in/out are IOSurfaces read by Metal without a copy |
 | Step tables | the slot lists inside each work item | 2 `MTLBuffer`s, alternated by step parity |
 
@@ -163,7 +163,7 @@ Python reuses mlx-lm wherever it can: `mlx_lm.load` for weights and the GPU dens
      | LUT4 + per-channel scale | — | 0.968 | — | — (runs on the CPU, 5–9× slower) |
 
      All of these run at the same ANE speed (1.1–1.3 ms per block), except LUT4 per-row k-means (2.4 ms). LUT4 fails because a 16-value table shared by whole rows can't represent weights that already have a separate scale for every 64 inputs.
-4. Port to C++ one component at a time, keeping Python as the reference: arena (nanobind) → memory regions → `gpu` with Metal kernels (a paged-attention `.metal` can first run from Python through `mx.fast.metal_kernel`) → `ane` with IOSurface I/O → lanes with threads → engine.
+4. Port to C++ without Python bindings: Python stays the reference through dumped golden data. Checklist and decisions: [cpp-port.md](cpp-port.md).
 
 ## Deferred, with triggers
 | Item | Add when |
