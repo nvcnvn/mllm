@@ -38,10 +38,10 @@ This is the whole `py/` → `src/` port. Interfaces, names and the engine loop c
 
 ## 4. `gpu`: kernels and `GpuOps`
 Each item is checked against the golden data for its layer. The goal is matching greedy tokens (64/64). Intermediate tensors need cosine ≥ 0.99999 against the bf16 golden data.
-- [ ] Quantized embedding gather (4-bit affine, group 64). **Check:** `ws.x` after `dense(0)`'s embedding.
-- [ ] RMSNorm, plus RMSNorm gated by `z`. **Check:** the normalized inputs the dense ops consume.
-- [ ] 4-bit affine matmul, two kernels: `qmv` for decode (B ≤ 32) and `qmm` for prefill. **Check:** each projection output; time compared with `tools/roofline.py`.
-- [ ] `dense(i)`, both layer kinds:
+- [x] Quantized embedding gather (4-bit affine, group 64). **Check:** `ws.x` after `dense(0)`'s embedding.
+- [x] RMSNorm, plus RMSNorm gated by `z`. **Check:** the normalized inputs the dense ops consume.
+- [x] 4-bit affine matmul, two kernels: `qmv` for decode (B ≤ 32) and `qmm` for prefill. **Check:** each projection output; time compared with `tools/roofline.py`.
+- [x] `dense(i)`, both layer kinds:
   - Every layer: o/out projection + residual, post-attention norm, SwiGLU MLP + residual, input norm.
   - Full layers: q/gate split, `q_norm` / `k_norm`.
   - Linear layers: `in_proj_qkv` / `z` / `b` / `a`.
