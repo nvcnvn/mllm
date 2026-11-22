@@ -5,13 +5,13 @@ This is the whole `py/` → `src/` port. Interfaces, names and the engine loop c
 ## Decisions
 - **No Python bindings.** `py/` is the reference, not a host. `py/dump_golden.py` writes the reference data once: token ids, every workspace field after each `dense(i)` and `attn(i)`, K/V pages, linear-attention state, logits and greedy tokens. The C++ tests compare against those files. That gives the same layer-by-layer verification bindings would, without nanobind or MLX interop code.
 - **Raw Metal, not libmlx.** The design needs fixed buffers, one untracked arena buffer, one command buffer per step, and ANE IOSurfaces read with no copy. libmlx owns its own allocation and command buffers, so it conflicts with all four. Kernels are vendored (MIT): MLX's `quantized.metal`, `rms_norm.metal`, `rope.metal`, `sdpa_vector.h`, and mlx-lm's gated-delta kernel. Starting from the same kernels also gives us a fair chance at bit-exact tokens.
-- **Languages:** Objective-C++ (`.mm`) for files that touch Metal or Core ML; C++20 everywhere else. Build with CMake, which produces `libmllm`, the `mllm` CLI, the test executables, and `mllm.metallib` (via `xcrun metal`). Tests are plain executables with `assert`, no test framework.
+- **Languages:** Objective-C++ (`.mm`) for files that touch Metal or Core ML; C++20 everywhere else. Build with one `Makefile` (clang++ and `xcrun metal` are already installed; CMake isn't), which produces `libmllm`, the `mllm` CLI, the test executables, and `mllm.metallib`. Tests are plain executables with `assert`, no test framework.
 - **Tokenizer:** our own byte-level BPE. The pre-tokenizer regex uses Unicode classes (`\p{L}\p{M}\p{N}`), so we vendor llama.cpp's `unicode.cpp` / `unicode-data.cpp` (MIT). The chat template is hard-coded ChatML for `qwen3_5`, text only. *ponytail: Jinja (llama.cpp `common/jinja`) arrives with the second model family.*
 - **Core ML models are still built by Python** (`ane.py`, coremltools). C++ only loads the compiled `.mlmodelc` from the same cache path (`_model_key`).
 - Same component, file and method names as `py/mllm` (architecture rule 5).
 
 ## 0. Scaffolding and reference data
-- [ ] `CMakeLists.txt`, `src/`, `src/kernels/`, `tests/`; vendored code under `src/vendor/` with its licenses. **Check:** `cmake --build` produces the CLI, the tests and the metallib on a clean clone.
+- [ ] `Makefile`, `src/`, `src/kernels/`, `tests/`; vendored code under `src/vendor/` with its licenses. **Check:** `make` produces the CLI, the tests and the metallib on a clean clone.
 - [ ] `py/dump_golden.py MODEL OUT`. Writes safetensors to `/Volumes/T5/cache/mllm/golden/<model_key>/`, which is not in git. Contents:
   - Spec fields.
   - Token ids for a string set: ASCII, CJK, emoji, digits, whitespace runs, special tokens, and the 3 chat prompts from `test_engine.py`.
