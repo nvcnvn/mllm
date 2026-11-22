@@ -26,15 +26,15 @@ This is the whole `py/` → `src/` port. Interfaces, names and the engine loop c
 - [x] Safetensors reader: `mmap` each file, parse the header, and keep a view of each tensor (dtype, shape, offset). The whole mapping is wrapped once with `newBufferWithBytesNoCopy` (16 KiB-aligned), and each tensor is a buffer plus offset. **Check:** a hash of every tensor's bytes matches what Python sees.
 
 ## 2. `tokenizer`
-- [ ] BPE from `tokenizer.json`: vocab, merges, and special/added tokens split out before the BPE runs. **Check:** ids equal the golden ids for the whole string set.
-- [ ] `encode_chat`: ChatML with `add_generation_prompt` and the template's default thinking behaviour. **Check:** ids equal the golden ids for the 3 chat prompts.
-- [ ] `Detokenizer` `push`/`flush`: byte-level decoding that holds back incomplete UTF-8. **Check:** streaming the golden outputs one token at a time gives byte-exact text, including multibyte characters split across tokens.
+- [x] BPE from `tokenizer.json`: vocab, merges, and special/added tokens split out before the BPE runs. **Check:** ids equal the golden ids for the whole string set.
+- [x] `encode_chat`: ChatML with `add_generation_prompt` and the template's default thinking behaviour. **Check:** ids equal the golden ids for the 3 chat prompts.
+- [x] `Detokenizer` `push`/`flush`: byte-level decoding that holds back incomplete UTF-8. **Check:** streaming the golden outputs one token at a time gives byte-exact text, including multibyte characters split across tokens.
 
 ## 3. `memory`
-- [ ] Arena bookkeeping (CPU only), from memory-design: free bitmap, `req_refs` / `cache_refs`, `pending`, `admit` / `alloc` / `release` / `unreserve` / `retire`. **Check:** a unit test covering admit up to the limit, `alloc` never failing after `admit`, refcounted release, pending reclaim gated by step, and no starvation of the oldest waiter.
-- [ ] Arena storage: one shared, untracked `MTLBuffer`, pre-touched with `memset`, in a residency set, with `requestResidency` called again on a timer. The layout must be byte-identical to `memory.py` (unit size, KV group offsets, state slot layout), so golden K/V compares directly. **Check:** for the same config, `unit_bytes`, `state_units` and `n_units` equal Python's, and the golden K/V copied in at the Python offsets reads back correctly through the C++ offsets.
-- [ ] Workspace: fixed named `MTLBuffer`s, sized for the largest of chunk × batch. **Check:** nothing allocates after startup. Assert it with an allocation counter in a debug build.
-- [ ] Step tables: 2 copies, chosen by step parity. **Check:** a unit test where the CPU never writes the copy the in-flight step reads.
+- [x] Arena bookkeeping (CPU only), from memory-design: free bitmap, `req_refs` / `cache_refs`, `pending`, `admit` / `alloc` / `release` / `unreserve` / `retire`. **Check:** a unit test covering admit up to the limit, `alloc` never failing after `admit`, refcounted release, pending reclaim gated by step, and no starvation of the oldest waiter.
+- [x] Arena storage: one shared, untracked `MTLBuffer`, pre-touched with `memset`, in a residency set, with `requestResidency` called again on a timer. The layout must be byte-identical to `memory.py` (unit size, KV group offsets, state slot layout), so golden K/V compares directly. **Check:** for the same config, `unit_bytes`, `state_units` and `n_units` equal Python's, and the golden K/V copied in at the Python offsets reads back correctly through the C++ offsets.
+- [x] Workspace: fixed named `MTLBuffer`s, sized for the largest of chunk × batch. **Check:** nothing allocates after startup. Assert it with an allocation counter in a debug build.
+- [x] Step tables: 2 copies, chosen by step parity. **Check:** a unit test where the CPU never writes the copy the in-flight step reads.
 
 ## 4. `gpu`: kernels and `GpuOps`
 Each item is checked against the golden data for its layer. The goal is matching greedy tokens (64/64). Intermediate tensors need cosine ≥ 0.99999 against the bf16 golden data.
