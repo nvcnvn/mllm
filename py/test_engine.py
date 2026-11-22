@@ -79,6 +79,20 @@ def main():
     small = Engine(MODEL, arena_bytes=need * e.mem.arena.unit_bytes, chunk=CHUNK)
     assert run(small, PROMPTS) == solo, "waiting requests produced different tokens"
     print(f"wait  ok with a {need}-unit arena")
+
+    # 4. a generate() stopped early, and a lane call that raises, both return every unit
+    g = e.generate(PROMPTS[0], max_tokens=N)
+    next(g)
+    g.close()
+    e.decode.submit = lambda w: 1 / 0
+    try:
+        list(e.generate(PROMPTS[1], max_tokens=N))
+        raise AssertionError("lane error swallowed")
+    except ZeroDivisionError:
+        pass
+    del e.decode.submit
+    run(e, [])  # steps until the cancelled request is polled, then checks the arena
+    print("abort ok")
     print("PASS")
 
 

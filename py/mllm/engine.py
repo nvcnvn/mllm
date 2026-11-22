@@ -1,10 +1,11 @@
-"""Engine: requests and the loop. submit() + step() is the API; generate() is sugar over them.
+"""Engine: requests and the loop. submit() + step() + cancel() is the API; generate() is sugar over them.
 
     from mllm.engine import Engine
     e = Engine("mlx-community/Qwen3.5-0.8B-4bit")
     for text in e.generate([{"role": "user", "content": "hi"}]):
         print(text, end="", flush=True)
 """
+from collections import deque
 from dataclasses import dataclass, field
 
 from mlx_lm.sample_utils import make_sampler
@@ -32,6 +33,7 @@ class Request:
     reserved: int = 0               # units promised to this request, not yet allocated
     out: list = field(default_factory=list)
     in_flight: bool = False
+    cancelled: bool = False         # finish at the next poll (architecture.md: aborts wait for their chunk)
 
 
 class Engine:
@@ -53,6 +55,8 @@ class Engine:
         self.reqs = {}                  # live requests by id, in arrival order
         self.next_id = 0
         self.step_no = 0
+        self._events = []               # step()'s output; kept if step() raises midway
+        self._inbox = {}                # req id -> events, for requests a generate() is reading
 
     # --- API ---
     def submit(self, prompt, max_tokens=256, temperature=0.0, top_p=0.0):
@@ -72,18 +76,31 @@ class Engine:
         self.next_id += 1
         return r.id
 
+    def cancel(self, req_id):
+        """Stop a request and return its units. One in a lane is finished when step() polls it."""
+        r = self.reqs.get(req_id)
+        if r and r.state != DONE:
+            r.cancelled = True
+            if not r.in_flight:
+                self._finish(r)
+
     def step(self):
-        """One turn of the loop -> [(req_id, token, text, done)]."""
-        events = []
+        """One turn of the loop -> [(req_id, token, text, done)]. token None = aborted (a lane call raised)."""
         for w in self.prefill.poll():
             r = self.reqs[w.req_id]
             r.in_flight = False
+            if r.cancelled:
+                self._finish(r)
+                continue
             r.pos += w.n_valid
             if r.pos == len(r.ids) - 1:
                 r.state = DECODE
         for req_id, t in self.decode.poll():
             r = self.reqs[req_id]
             r.in_flight = False
+            if r.cancelled:
+                self._finish(r)
+                continue
             r.pos += 1
             r.out.append(t)
             done = t in self.tok.eos or len(r.out) >= r.max_tokens
@@ -91,10 +108,12 @@ class Engine:
             if done:
                 text += r.detok.flush()
                 self._finish(r)
-            events.append((req_id, t, text, done))
+            self._emit((req_id, t, text, done))
 
         for r in self.reqs.values():
-            if r.state == WAITING and self.mem.arena.admit(self._demand(r)):
+            if r.state == WAITING:
+                if not self.mem.arena.admit(self._demand(r)):
+                    break  # arrival order: later requests never overtake the oldest waiter
                 r.reserved = self._demand(r)
                 r.state_slots = [self._alloc(r) for _ in range(self.mem.state_units)]
                 self.mem.zero(r.state_slots)  # reused units hold an old request's state
@@ -106,7 +125,11 @@ class Engine:
                 n = min(self.chunk, len(r.ids) - 1 - r.pos)
                 self._ensure_pages(r, r.pos + n)
                 r.in_flight = True
-                self.prefill.submit(PrefillWork(r.id, r.ids[r.pos: r.pos + n], r.pos, list(r.pages), r.state_slots))
+                try:
+                    self.prefill.submit(PrefillWork(r.id, r.ids[r.pos: r.pos + n], r.pos, list(r.pages), r.state_slots))
+                except BaseException:
+                    self._abort([r])
+                    raise
 
         batch = [r for r in self.reqs.values() if r.state == DECODE and not r.in_flight]
         if batch and self.decode.can_submit():
@@ -115,21 +138,35 @@ class Engine:
                 self._ensure_pages(r, r.pos + 1)
                 r.in_flight = True
                 rows.append(DecodeRow(r.id, r.out[-1] if r.out else r.ids[-1], r.pos, list(r.pages), r.state_slots, r.sampler))
-            self.decode.submit(DecodeWork(self.step_no, rows))
+            try:
+                self.decode.submit(DecodeWork(self.step_no, rows))
+            except BaseException:
+                self._abort(batch)
+                raise
             self.step_no += 1
 
         self.reqs = {k: r for k, r in self.reqs.items() if r.state != DONE}
+        events, self._events = self._events, []
         return events
 
     def generate(self, prompt, **kw):
+        """Yields text. Other requests' events still come out of step(); stopping early cancels this one."""
         rid = self.submit(prompt, **kw)
-        while True:
-            for req_id, _, text, done in self.step():
-                if req_id == rid:
-                    if text:
-                        yield text
-                    if done:
-                        return
+        q = self._inbox[rid] = deque()
+        try:
+            while True:
+                while not q:
+                    self._events.extend(self.step())  # not ours: hand back to the next step() caller
+                _, t, text, done = q.popleft()
+                if t is None:
+                    raise RuntimeError(f"request {rid} aborted")
+                if text:
+                    yield text
+                if done:
+                    return
+        finally:
+            del self._inbox[rid]
+            self.cancel(rid)
 
     # --- internals ---
     def _demand(self, r):
@@ -143,6 +180,16 @@ class Engine:
     def _ensure_pages(self, r, n_tokens):
         while len(r.pages) * self.mem.T < n_tokens:
             r.pages.append(self._alloc(r))
+
+    def _emit(self, ev):
+        self._inbox.get(ev[0], self._events).append(ev)
+
+    def _abort(self, rows):
+        """A lane call raised: rows may be half-written (in-place state), so end them, never retry."""
+        for r in rows:
+            r.in_flight = False
+            self._finish(r)
+            self._emit((r.id, None, "", True))
 
     def _finish(self, r):
         a = self.mem.arena

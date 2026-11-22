@@ -8,6 +8,7 @@ Layout on the ANE is channels-first (1, C, 1, S); linears are 1x1 convs.
 
 ponytail: numpy copies at the ANE<->MLX boundary (~GB/s). C++ uses IOSurface backings (tools/ane_iosurface.swift).
 """
+import hashlib
 import json
 import os
 import shutil
@@ -17,9 +18,20 @@ from pathlib import Path
 import mlx.core as mx
 import numpy as np
 
-CACHE = Path(os.environ.get("MLLM_CACHE", "/Volumes/T5/cache/mllm"))  # keep big files off the internal disk
-os.makedirs(CACHE / "tmp", exist_ok=True)
-tempfile.tempdir = str(CACHE / "tmp")  # coremltools compiles models into the temp dir
+# keep big files off the internal disk: the T5 drive when mounted, else the user cache dir
+CACHE = Path(os.environ.get("MLLM_CACHE") or
+             ("/Volumes/T5/cache/mllm" if os.path.isdir("/Volumes/T5") else Path.home() / "Library/Caches/mllm"))
+
+
+def _model_key(path):
+    """Cache dir name unique to these weights: resolved path + size/mtime of config and weight files."""
+    p = Path(path).resolve()
+    h = hashlib.sha1(str(p).encode())
+    for f in sorted(p.glob("*.safetensors")) + [p / "config.json"]:
+        st = f.stat()
+        h.update(f"{f.name}:{st.st_size}:{st.st_mtime_ns}".encode())
+    name = p.parent.parent.name if p.parent.name == "snapshots" else p.name  # HF: models--org--name
+    return f"{name}-{h.hexdigest()[:12]}"
 
 
 def _fp16(linear):
@@ -146,13 +158,19 @@ class AneOps:
     def __init__(self, gpu, S, weights="fp16"):
         import coremltools as ct
         self.gpu, self.spec, self.S = gpu, gpu.spec, S
-        root = CACHE / "ane" / gpu.spec.path.parent.parent.name / f"S{S}_{weights}"
+        root = CACHE / "ane" / _model_key(gpu.spec.path) / f"S{S}_{weights}"
         self.models = []
         for i in range(self.spec.n_layers):
             p = root / f"dense_{i:03d}"
             if not p.exists():
                 print(f"[ane] building dense block {i} -> {p}", flush=True)
-                _build(gpu, i, S, p, weights)
+                tmp, old = CACHE / "tmp", tempfile.tempdir
+                tmp.mkdir(parents=True, exist_ok=True)
+                tempfile.tempdir = str(tmp)  # coremltools compiles into the temp dir; only while building
+                try:
+                    _build(gpu, i, S, p, weights)
+                finally:
+                    tempfile.tempdir = old
             io = json.loads((p / "io.json").read_text())
             m = ct.models.CompiledMLModel(str(p / "model.mlmodelc"), compute_units=ct.ComputeUnit.CPU_AND_NE)
             self.models.append((m, io))

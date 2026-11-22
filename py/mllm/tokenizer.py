@@ -11,7 +11,7 @@ class Tokenizer:
         return self._t.encode(text)
 
     def encode_chat(self, messages):
-        return self._t.apply_chat_template(messages, add_generation_prompt=True)
+        return self._t.apply_chat_template(messages, add_generation_prompt=True, tokenize=True, return_dict=False)
 
     def detokenizer(self):
         return Detokenizer(self._t.detokenizer)
