@@ -49,10 +49,10 @@ Each item is checked against the golden data for its layer. The goal is matching
 
   **Check:** every workspace field after each `dense(i)`.
 - [x] Full-attention `attn(i)`: RoPE at the right positions, K/V written into pages through the step table, then paged attention. Decode: one query per row over its pages (`sdpa_vector`-style). Prefill: causal attention over the prefix pages plus the chunk. Then the sigmoid gate. **Check:** golden K/V pages and `ws.o`.
-- [ ] Linear `attn(i)`: depthwise conv1d with the conv window updated in place, SiLU, q/k/v split, `normalize_qk`, the gated-delta update in place on the arena state, then the gated norm. **Check:** golden conv state, recurrent state and `ws.o`.
-- [ ] `lm_head` (tied embedding used as a quantized linear) and sampling. Greedy argmax runs on the GPU; temperature and top-p match `make_sampler`. **Check:** logits and greedy ids; a seeded sampling test gives the same distribution shape.
-- [ ] Batch decode in one dispatch per op for all B rows, with no loop over rows (this removes the Python version's ponytail). **Check:** golden decode for batch 2 matches row by row.
-- [ ] `mllm bench-ops`: time per op at decode B = 1/8/16 and prefill S = 512. **Check:** listed next to the roofline. Any op below about 70% of its bound gets a note.
+- [x] Linear `attn(i)`: depthwise conv1d with the conv window updated in place, SiLU, q/k/v split, `normalize_qk`, the gated-delta update in place on the arena state, then the gated norm. **Check:** golden conv state, recurrent state and `ws.o`.
+- [x] `lm_head` (tied embedding used as a quantized linear) and sampling. Greedy argmax runs on the GPU; temperature and top-p match `make_sampler`. **Check:** logits and greedy ids; a seeded sampling test gives the same distribution shape.
+- [x] Batch decode in one dispatch per op for all B rows, with no loop over rows (this removes the Python version's ponytail). **Check:** golden decode for batch 2 matches row by row.
+- [x] `mllm bench-ops`: time per op at decode B = 1/8/16 and prefill S = 512. **Check:** listed next to the roofline. Any op below about 70% of its bound gets a note.
 
 ## 5. `lanes` and `engine` (GPU only)
 - [ ] `DecodeLane`: one command buffer per step, `MTLSharedEvent` signaled with the step number, `submit` / `poll` / `can_submit`, at most one step ahead.
