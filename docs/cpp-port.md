@@ -11,19 +11,19 @@ This is the whole `py/` → `src/` port. Interfaces, names and the engine loop c
 - Same component, file and method names as `py/mllm` (architecture rule 5).
 
 ## 0. Scaffolding and reference data
-- [ ] `Makefile`, `src/`, `src/kernels/`, `tests/`; vendored code under `src/vendor/` with its licenses. **Check:** `make` produces the CLI, the tests and the metallib on a clean clone.
-- [ ] `py/dump_golden.py MODEL OUT`. Writes safetensors to `/Volumes/T5/cache/mllm/golden/<model_key>/`, which is not in git. Contents:
+- [x] `Makefile`, `src/`, `src/kernels/`, `tests/`; vendored code under `src/vendor/` with its licenses. **Check:** `make` produces the CLI, the tests and the metallib on a clean clone.
+- [x] `py/dump_golden.py MODEL OUT`. Writes safetensors to `/Volumes/T5/cache/mllm/golden/<model_key>/`, which is not in git. Contents:
   - Spec fields.
   - Token ids for a string set: ASCII, CJK, emoji, digits, whitespace runs, special tokens, and the 3 chat prompts from `test_engine.py`.
   - For one prompt with 2 prefill chunks then 3 decode steps of batch 2: every workspace field after each `dense(i)` / `attn(i)`, each layer's K/V pages, each linear layer's conv and recurrent state, and the logits.
   - Greedy 64 tokens for each prompt.
 
   **Check:** reruns are byte-identical.
-- [ ] `tests/golden.h`: loads golden tensors and compares them, exact for integers, cosine plus max-abs for floats. **Check:** comparing a golden file with itself passes; comparing it with a perturbed copy fails.
+- [x] `tests/golden.h`: loads golden tensors and compares them, exact for integers, cosine plus max-abs for floats. **Check:** comparing a golden file with itself passes; comparing it with a perturbed copy fails.
 
 ## 1. `spec` and weights
-- [ ] `spec.h/.cpp`: `config.json` → `ModelSpec` with the same fields as `spec.py` (vendored nlohmann/json). `resolve()` finds the HF snapshot via `$HF_HOME/hub/models--org--name/refs/main` and never downloads. **Check:** every field equals the golden spec.
-- [ ] Safetensors reader: `mmap` each file, parse the header, and keep a view of each tensor (dtype, shape, offset). The whole mapping is wrapped once with `newBufferWithBytesNoCopy` (16 KiB-aligned), and each tensor is a buffer plus offset. **Check:** a hash of every tensor's bytes matches what Python sees.
+- [x] `spec.h/.cpp`: `config.json` → `ModelSpec` with the same fields as `spec.py` (vendored nlohmann/json). `resolve()` finds the HF snapshot via `$HF_HOME/hub/models--org--name/refs/main` and never downloads. **Check:** every field equals the golden spec.
+- [x] Safetensors reader: `mmap` each file, parse the header, and keep a view of each tensor (dtype, shape, offset). The whole mapping is wrapped once with `newBufferWithBytesNoCopy` (16 KiB-aligned), and each tensor is a buffer plus offset. **Check:** a hash of every tensor's bytes matches what Python sees.
 
 ## 2. `tokenizer`
 - [ ] BPE from `tokenizer.json`: vocab, merges, and special/added tokens split out before the BPE runs. **Check:** ids equal the golden ids for the whole string set.
