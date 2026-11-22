@@ -2,6 +2,7 @@
 
 #include <unistd.h>
 
+#include <cassert>
 #include <filesystem>
 #include <fstream>
 #include <stdexcept>
@@ -61,6 +62,138 @@ Weights::Weights(const std::string& path, id<MTLDevice> device) : st(aligned(pat
 Weights::View Weights::operator[](const std::string& name) const {
     const Tensor& t = st.at(name);
     return {buffers[t.file], t.offset, t};
+}
+
+Arena::Arena(size_t unit_bytes, uint32_t n_units)
+    : unit_bytes(unit_bytes), n_units(n_units), free((n_units + 63) / 64, ~0ull), req_refs(n_units),
+      cache_refs(n_units), free_units(n_units) {
+    if (n_units % 64) free.back() = (1ull << (n_units % 64)) - 1;
+}
+
+bool Arena::admit(uint32_t n) {
+    if (!can_ever(n)) return false;
+    // ponytail: no prefix cache yet, so cache_only_units == 0 and can_ever == fits. With the cache, the eviction
+    // loop goes here: while (!fits(n)) evict the cache's next victim.
+    assert(fits(n));
+    reserved += n;
+    return true;
+}
+
+uint32_t Arena::alloc() {
+    assert(reserved > 0 && "alloc without reservation");
+    size_t w = 0;
+    while (w < free.size() && !free[w]) w++;
+    // admit guarantees a unit with no references; if all of them are still pending, the caller waits for the
+    // GPU event to pass their step and calls retire first.
+    assert(w < free.size() && "no free unit: retire(signaled) first");
+    uint32_t s = (uint32_t)(w * 64 + __builtin_ctzll(free[w]));
+    free[w] &= free[w] - 1;
+    req_refs[s] = 1;
+    free_units--, reserved--;
+    return s;
+}
+
+void Arena::unreserve(uint32_t n) {
+    assert(n <= reserved);
+    reserved -= n;
+}
+
+void Arena::release(const std::vector<uint32_t>& slots) {
+    for (uint32_t s : slots) {
+        assert(req_refs[s] > 0);
+        if (--req_refs[s]) continue;
+        if (cache_refs[s]) {
+            cache_only_units++;
+            continue;
+        }
+        assert(pending.empty() || pending.back().second <= committed);
+        pending.emplace_back(s, committed);
+        free_units++;
+    }
+}
+
+void Arena::retire(uint64_t signaled) {
+    for (; !pending.empty() && pending.front().second <= signaled; pending.pop_front())
+        free[pending.front().first / 64] |= 1ull << (pending.front().first % 64);
+}
+
+id<MTLBuffer> StepTables::begin(uint64_t step, uint64_t signaled) {
+    // before filling step N+2's table, step N must be done: then only step N+1 can be in flight, on the other copy
+    assert(signaled + 2 >= step && "CPU more than one step ahead of the GPU");
+    return copies[step % 2];
+}
+
+// memory.py: a unit is one KV page (T tokens) of every full layer, rounded up to the OS page.
+static size_t unit_of(const ModelSpec& s, int T) {
+    size_t kv = s.full_layers().size() * 2 * s.n_kv_heads * T * s.head_dim * ELEM;
+    return (kv + PAGE - 1) / PAGE * PAGE;
+}
+
+Memory::Memory(const ModelSpec& spec, id<MTLDevice> device, size_t arena_bytes, int page_tokens)
+    : spec(spec), device(device), T(page_tokens),
+      arena(unit_of(spec, page_tokens), (uint32_t)(arena_bytes / unit_of(spec, page_tokens))) {
+    conv_bytes = (spec.conv_kernel - 1) * spec.conv_dim() * ELEM;
+    delta_bytes = (size_t)spec.lin_v_heads * spec.lin_v_dim * spec.lin_k_dim * 4;
+    size_t per_layer = conv_bytes + delta_bytes;
+    auto lin = spec.linear_layers();
+    state_units = (uint32_t)((per_layer * lin.size() + arena.unit_bytes - 1) / arena.unit_bytes);
+    state_off.assign(spec.n_layers(), SIZE_MAX);
+    for (size_t j = 0; j < lin.size(); j++) state_off[lin[j]] = j * per_layer;
+
+    arena_buffer = buffer((size_t)arena.n_units * arena.unit_bytes,
+                          MTLResourceStorageModeShared | MTLResourceHazardTrackingModeUntracked);
+    memset(arena_buffer.contents, 0, arena_buffer.length);  // pre-touch: page in now, not during a step
+    NSError* err = nil;
+    residency = [device newResidencySetWithDescriptor:[MTLResidencySetDescriptor new] error:&err];
+    if (!residency) throw std::runtime_error(std::string("residency set: ") + err.localizedDescription.UTF8String);
+    [residency addAllocation:arena_buffer];
+    [residency commit];
+    [residency requestResidency];
+}
+
+size_t Memory::kv_offset(int g, int kv, int head, int token) const {
+    return ((((size_t)g * 2 + kv) * spec.n_kv_heads + head) * T + token) * spec.head_dim * ELEM;
+}
+
+size_t Memory::state_offset(int layer) const {
+    assert(state_off[layer] != SIZE_MAX && "not a linear layer");
+    return state_off[layer];
+}
+
+id<MTLBuffer> Memory::buffer(size_t bytes, MTLResourceOptions options) {
+    assert(!frozen && "allocation after startup");
+    id<MTLBuffer> b = [device newBufferWithLength:bytes options:options];
+    if (!b) throw std::runtime_error("newBufferWithLength failed: " + std::to_string(bytes) + " bytes");
+    allocations++;
+    return b;
+}
+
+Workspace Memory::workspace(int chunk, int max_batch) {
+    const ModelSpec& s = spec;
+    size_t R = std::max(chunk, max_batch) * ELEM;  // bytes per element column, over all rows
+    size_t qd = (size_t)s.n_heads * s.head_dim, kvd = (size_t)s.n_kv_heads * s.head_dim;
+    size_t vd = (size_t)s.lin_v_heads * s.lin_v_dim;
+    return {
+        .tokens = buffer(std::max(chunk, max_batch) * sizeof(int32_t)),
+        .x = buffer(R * s.hidden),
+        .o = buffer(R * std::max(qd, vd)),
+        .q = buffer(R * qd),
+        .k = buffer(R * kvd),
+        .v = buffer(R * kvd),
+        .gate = buffer(R * qd),
+        .qkv = buffer(R * s.conv_dim()),
+        .z = buffer(R * vd),
+        .b = buffer(R * s.lin_v_heads),
+        .a = buffer(R * s.lin_v_heads),
+        .logits = buffer((size_t)max_batch * s.vocab * ELEM),
+    };
+}
+
+StepTables Memory::step_tables(int max_rows) {
+    // ponytail: slot words <= n_units while no unit is shared; the prefix cache lets rows share units, then size
+    // by the sum of the rows' slot counts.
+    size_t words = 1 + (max_rows + 1) + arena.n_units;
+    return {{buffer(words * 4), buffer(words * 4)}, words};
 }
 
 }  // namespace mllm

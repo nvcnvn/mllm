@@ -5,8 +5,12 @@
 OUT defaults to $MLLM_CACHE/golden/<model_key>/ (model_key as in ane.py). Reruns are byte-identical.
 
 Files and keys (bf16 stays bf16, ints are int32):
-  spec.json           {"spec": ModelSpec fields, "strings": [...], "chat": [3 message lists],
-                       "chunk", "page_tokens", "calls": [{"name", "rows": [{"req", "pos", "n"}]}]}
+  spec.json           {"spec": ModelSpec fields, "strings": [...], "chat": [message lists; the first 3 are PROMPTS],
+                       "eos": [ids], "chunk", "page_tokens", "calls": [{"name", "rows": [{"req", "pos", "n"}]}],
+                       "detok": [{"ids", "segments"}]  Detokenizer push(id) per id, then flush(): len(ids) + 1,
+                       "layout": Memory(arena_bytes, page_tokens=32) sizes, kv view strides (bytes) and
+                                 byte offsets from numpy pointers: "kv" [[slot, g, kv, head, token, offset]],
+                                 "state" [[layer, conv offset, delta offset]] within a state slot span}
   weights.json        {tensor name: {"file", "dtype", "shape", "sha256"}} over the model's *.safetensors
   tokens.safetensors  str/NN    ids of strings[NN] (tokenizer.encode)
                       chat/N    ids of chat[N] (encode_chat)
@@ -46,8 +50,23 @@ STRINGS = [
     "<think>\n\n</think>\n\nok<|endoftext|>",
     "",
     " ",
+    "It's they'LL we'Re I'M he'd you've CAN'T 's",
+    "a\n\n\nb\n \n\tc\r\r\n\n\t\t x",
+    "Cafe\u0301 nai\u0308ve n\u0303o A\u030a \ufb01 \u1100\u1161\u11a8 é",
+    "12345678901234567890 \u0661\u0662\u0663 0.000001",
+    "Mixed: English, Русский, Ελληνικά, العربية, עברית, हिन्दी, ไทย",
+    "<|im_start|><|im_end|><|im_start|>x<tool_call>a</tool_call><think>",
 ]
+# system + multi-turn, with a thinking block in assistant history (the template strips it) and padded content
+MULTI = [{"role": "system", "content": "You are terse. "},
+         {"role": "user", "content": "  Hi there\n"},
+         {"role": "assistant", "content": "<think>\nhmm\n</think>\n\nHello!"},
+         {"role": "user", "content": "Bye?"}]
+# Unicode whitespace padding (NBSP, U+3000): the template's |trim strips it like str.strip
+PAD = [{"role": "system", "content": "\u3000sys\u00a0"}, {"role": "user", "content": "\u00a0\u3000 pad \u00a0\u3000"}]
+CHATS = PROMPTS + [MULTI, PAD]
 DECODE_STEPS = 3
+ARENA = 256 << 20
 
 
 def weight_hashes(path):
@@ -69,6 +88,36 @@ def weight_hashes(path):
 
 def i32(x):
     return mx.array(np.asarray(x, np.int32))
+
+
+def detok(tok, ids):
+    d = tok.detokenizer()
+    return {"ids": ids, "segments": [d.push(t) for t in ids] + [d.flush()]}
+
+
+def detok_cases(tok, greedy):
+    """The greedy outputs, plus one sequence that splits multibyte characters across tokens, has a lone
+    continuation byte (U+FFFD), special tokens, and leading/lone space tokens."""
+    from mlx_lm.tokenizer_utils import _byte_decoder
+    t = tok._t
+    byte_tok = {b: t.convert_tokens_to_ids(c) for c, b in _byte_decoder().items()}
+    ids = (tok.encode(" Hello") + tok.encode("emoji: 😀👍🏽 👨‍👩‍👧‍👦 🇻🇳 你好") + [byte_tok[0x80]] + tok.encode("a")
+           + tok.encode("<|im_end|>\n<think>") + [byte_tok[0x20]] + tok.encode("x") + [byte_tok[0xE4], byte_tok[0xBD]]
+           + tok.encode("<|endoftext|>") + [byte_tok[0x20]])
+    cases = [detok(tok, g) for g in greedy] + [detok(tok, ids)]
+    assert "" in cases[-1]["segments"][:-1], "no token was held back"
+    return cases
+
+
+def layout(mem):
+    base = mem.arena.bytes.ctypes.data
+    kv = [[s, g, k, h, t, mem.kv[s, g, k, h, t].ctypes.data - base]
+          for s, g, k, h, t in [(0, 0, 0, 0, 0), (0, 0, 1, 0, 0), (1, 0, 0, 1, 0), (2, 1, 1, 1, 31), (5, len(mem.g_of) - 1, 1, 0, 7)]]
+    buf, views = mem.load_state(list(range(mem.state_units)))
+    state = [[l, conv.ctypes.data - buf.ctypes.data, delta.ctypes.data - buf.ctypes.data] for l, (conv, delta) in views.items()]
+    return {"unit_bytes": mem.arena.unit_bytes, "n_units": mem.arena.n_units, "state_units": mem.state_units,
+            "conv_bytes": mem.conv_bytes, "delta_bytes": mem.delta_bytes, "kv_strides": list(mem.kv.strides),
+            "kv": kv, "state": state}
 
 
 def trace(e):
@@ -150,27 +199,31 @@ def trace(e):
 
 def main():
     model = sys.argv[1]
-    eng = Engine(model, arena_bytes=256 << 20, chunk=CHUNK)
+    eng = Engine(model, arena_bytes=ARENA, chunk=CHUNK)
     s = eng.spec
     dst = Path(sys.argv[2]) if len(sys.argv) > 2 else CACHE / "golden" / _model_key(s.path)
     dst.mkdir(parents=True, exist_ok=True)
 
     tokens = {f"str/{i:02d}": i32(eng.tok.encode(t)) for i, t in enumerate(STRINGS)}
-    for i, p in enumerate(PROMPTS):
+    for i, p in enumerate(CHATS):
         tokens[f"chat/{i}"] = i32(eng.tok.encode_chat(p))
+    greedy = []
+    for i, p in enumerate(PROMPTS):
         rid = eng.submit(p, max_tokens=N)
         toks = []
         while eng.reqs:
             toks += [t for r, t, _, _ in eng.step() if r == rid]
         tokens[f"greedy/{i}"] = i32(toks)
+        greedy.append(toks)
     mx.save_safetensors(str(dst / "tokens.safetensors"), tokens)
 
-    tr, calls = trace(Engine(model, arena_bytes=256 << 20, chunk=CHUNK))
+    tr, calls = trace(Engine(model, arena_bytes=ARENA, chunk=CHUNK))
     mx.save_safetensors(str(dst / "trace.safetensors"), tr)
 
     spec = {k: (str(v) if isinstance(v, Path) else list(v) if isinstance(v, tuple) else v) for k, v in vars(s).items()}
-    meta = {"spec": spec, "strings": STRINGS, "chat": PROMPTS, "chunk": CHUNK,
-            "page_tokens": eng.mem.T, "calls": calls}
+    meta = {"spec": spec, "strings": STRINGS, "chat": CHATS, "eos": sorted(eng.tok.eos), "chunk": CHUNK,
+            "page_tokens": eng.mem.T, "calls": calls, "detok": detok_cases(eng.tok, greedy),
+            "layout": {"arena_bytes": ARENA, **layout(eng.mem)}}
     (dst / "spec.json").write_text(json.dumps(meta, indent=1, ensure_ascii=False, sort_keys=True) + "\n")
     (dst / "weights.json").write_text(json.dumps(weight_hashes(s.path), indent=1, sort_keys=True) + "\n")
     print(f"{dst}: {len(tokens)} token arrays, {len(tr)} trace tensors")

@@ -6,7 +6,7 @@ LDLIBS := -framework Metal -framework Foundation
 B := build
 export HF_HOME ?= /Volumes/T5/huggingface
 
-LIB_SRC := $(filter-out src/main.cpp,$(wildcard src/*.cpp src/*.mm))
+LIB_SRC := $(filter-out src/main.cpp,$(wildcard src/*.cpp src/*.mm src/vendor/*/*.cpp))
 LIB_OBJ := $(LIB_SRC:src/%=$(B)/obj/%.o)
 TESTS := $(patsubst tests/%,$(B)/tests/%,$(basename $(wildcard tests/*.cpp tests/*.mm)))
 AIR := $(patsubst src/kernels/%.metal,$(B)/air/%.air,$(wildcard src/kernels/*.metal))
@@ -53,4 +53,4 @@ clean:
 	rm -rf $(B)
 
 .PHONY: all test clean
--include $(wildcard $(B)/obj/*.d $(B)/tests/*.d $(B)/air/*.d)
+-include $(wildcard $(B)/obj/*.d $(B)/obj/*/*/*.d $(B)/tests/*.d $(B)/air/*.d)
