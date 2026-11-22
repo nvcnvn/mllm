@@ -1,0 +1,548 @@
+<title>mllm Arena Memory</title>
+<meta name="claude:viewport-fit-sides" content="cover">
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link rel="stylesheet" href="https://fonts.googleapis.com/css2?family=Space+Grotesk:wght@500;600;700&family=Inter:wght@400;500;600&family=JetBrains+Mono:wght@400;500&display=swap">
+<style>
+/* Layout: one reading column (~760px) with wide figures (~960px); scenarios are a stepper: step list + arena grid + live counters. */
+:root{
+  --bg:#F4F6F9; --surface:#FFFFFF; --fg:#151922; --muted:#586172; --line:#D5DAE3; --soft:#E9EDF3;
+  --full:#3557D6; --win:#0E8F78; --state:#C9741C; --wts:#7C8799; --ane:#8A6BD1;
+  --hl:#D6336C; --ok:#1E8E3E; --bad:#C92A2A; --on:#FFFFFF;
+  --f-display:"Space Grotesk",ui-sans-serif,system-ui,sans-serif;
+  --f-body:"Inter",ui-sans-serif,system-ui,-apple-system,sans-serif;
+  --f-mono:"JetBrains Mono",ui-monospace,SFMono-Regular,Menlo,monospace;
+}
+@media (prefers-color-scheme: dark){:root:not([data-theme="light"]){
+  --bg:#0E1116; --surface:#161A21; --fg:#E6E9EE; --muted:#9AA3B2; --line:#2C333F; --soft:#1F252E;
+  --full:#6A82EC; --win:#1C9E84; --state:#C98236; --wts:#7E8899; --ane:#9A80DE;
+  --hl:#FF6B9A; --ok:#4CC26B; --bad:#FF6B6B; --on:#0E1116; color-scheme:dark}}
+:root[data-theme="dark"]{
+  --bg:#0E1116; --surface:#161A21; --fg:#E6E9EE; --muted:#9AA3B2; --line:#2C333F; --soft:#1F252E;
+  --full:#6A82EC; --win:#1C9E84; --state:#C98236; --wts:#7E8899; --ane:#9A80DE;
+  --hl:#FF6B9A; --ok:#4CC26B; --bad:#FF6B6B; --on:#0E1116; color-scheme:dark}
+
+*{box-sizing:border-box}
+body{background:var(--bg);color:var(--fg);font:15px/1.6 var(--f-body);
+  padding-left:max(16px,env(safe-area-inset-left,0px));padding-right:max(16px,env(safe-area-inset-right,0px));padding-block:40px 80px}
+.wrap{max-width:760px;margin:0 auto}
+.wide{max-width:980px;margin:0 auto}
+h1,h2,h3{font-family:var(--f-display);text-wrap:balance;line-height:1.2;margin:0}
+h1{font-size:clamp(30px,5vw,44px);font-weight:700;letter-spacing:-.01em}
+h2{font-size:26px;font-weight:600;margin-top:56px}
+h3{font-size:18px;font-weight:600}
+p{margin:12px 0}
+code,.mono{font-family:var(--f-mono);font-size:.88em}
+p code,li code,td code{background:var(--soft);padding:1px 5px;border-radius:4px}
+.eyebrow{font:500 12px/1 var(--f-mono);letter-spacing:.08em;text-transform:uppercase;color:var(--muted)}
+.lede{font-size:17px;color:var(--muted);max-width:65ch}
+.tldr{display:grid;gap:10px;margin:24px 0 0;padding:0;list-style:none}
+.tldr li{padding-left:16px;border-left:2px solid var(--line)}
+.tldr b{font-family:var(--f-display);font-weight:600}
+figure{margin:28px 0}
+figcaption{font-size:13.5px;color:var(--muted);margin-top:10px;max-width:80ch}
+figcaption b{color:var(--fg)}
+.scroll{overflow-x:auto;-webkit-overflow-scrolling:touch}
+svg{display:block;max-width:100%;height:auto}
+.fig svg{min-width:680px;color:var(--fg)}
+.fig svg text{font-family:var(--f-body)}
+table{border-collapse:collapse;width:100%;font-size:14px;font-variant-numeric:tabular-nums}
+th,td{text-align:left;padding:8px 10px;border-bottom:1px solid var(--line);vertical-align:top}
+th{font-weight:600;color:var(--muted);font-size:12.5px;text-transform:uppercase;letter-spacing:.04em}
+pre{background:var(--surface);border:1px solid var(--line);border-radius:8px;padding:14px 16px;overflow-x:auto;font:13px/1.55 var(--f-mono);margin:16px 0}
+.legend{display:flex;flex-wrap:wrap;gap:8px 18px;font-size:13px;color:var(--muted);margin:10px 0}
+.legend span{display:inline-flex;align-items:center;gap:6px}
+.sw{width:22px;height:16px;border-radius:3px;display:inline-grid;place-items:center;font:600 10px var(--f-mono);color:var(--on)}
+
+/* arena grid */
+.grid{display:grid;grid-template-columns:repeat(8,minmax(0,1fr));gap:4px}
+.cell{position:relative;min-height:58px;border-radius:5px;border:1px solid var(--line);padding:4px 5px;display:flex;flex-direction:column;justify-content:space-between;font-family:var(--f-mono);font-size:11px;line-height:1.2;color:var(--muted);background:var(--surface);transition:background .25s,border-color .25s}
+.cell .sn{font-size:9.5px;opacity:.75}
+.cell .lb{font-weight:500;font-size:12px}
+.cell .rf{font-size:9.5px;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
+.cell.k-F{background:var(--full);border-color:var(--full);color:var(--on)}
+.cell.k-W{background:var(--win);border-color:var(--win);color:var(--on)}
+.cell.k-S{background:var(--state);border-color:var(--state);color:var(--on)}
+.cell.co.k-F{background:color-mix(in srgb,var(--full) 16%,var(--surface));border:2px dashed var(--full);color:var(--fg)}
+.cell.co.k-W{background:color-mix(in srgb,var(--win) 16%,var(--surface));border:2px dashed var(--win);color:var(--fg)}
+.cell.pend{background:repeating-linear-gradient(45deg,var(--soft) 0 5px,var(--surface) 5px 10px);border:1px dashed var(--muted);color:var(--muted)}
+.cell.shared::after{content:"";position:absolute;top:5px;right:5px;width:7px;height:7px;border-radius:50%;background:var(--on);box-shadow:0 0 0 2px var(--fg)}
+.cell.hl{outline:2.5px solid var(--hl);outline-offset:1px}
+@media (max-width:560px){.cell{min-height:44px;padding:3px}.cell .rf{display:none}.cell .lb{font-size:10px}}
+
+/* scenarios */
+.tabs{display:flex;flex-wrap:wrap;gap:6px;margin:20px 0 0}
+.tab{font:500 13.5px var(--f-body);padding:8px 12px;border-radius:999px;border:1px solid var(--line);background:var(--surface);color:var(--fg);cursor:pointer}
+.tab[aria-selected="true"]{background:var(--fg);color:var(--bg);border-color:var(--fg)}
+.tab:focus-visible,.stepbtn:focus-visible,.nav button:focus-visible,input:focus-visible,select:focus-visible{outline:2px solid var(--hl);outline-offset:2px}
+.scen{margin-top:16px;background:var(--surface);border:1px solid var(--line);border-radius:12px;padding:20px;display:grid;grid-template-columns:230px minmax(0,1fr);gap:24px}
+@media (max-width:820px){.scen{grid-template-columns:minmax(0,1fr);padding:14px}}
+.steps{list-style:none;margin:0;padding:0;display:flex;flex-direction:column;gap:2px;counter-reset:s}
+.stepbtn{all:unset;box-sizing:border-box;display:flex;gap:10px;width:100%;padding:7px 8px;border-radius:6px;cursor:pointer;font-size:13.5px;line-height:1.35;color:var(--muted)}
+.stepbtn .n{flex:none;width:20px;height:20px;border-radius:50%;border:1px solid var(--line);display:grid;place-items:center;font:500 11px var(--f-mono)}
+.stepbtn[aria-current="step"]{background:var(--soft);color:var(--fg);font-weight:500}
+.stepbtn[aria-current="step"] .n{background:var(--hl);border-color:var(--hl);color:var(--on)}
+.stepbtn.done .n{background:var(--soft)}
+@media (max-width:820px){.steps{flex-direction:row;overflow-x:auto;gap:4px}.stepbtn{width:auto;white-space:nowrap}.stepbtn .t{display:none}}
+.main{min-width:0;display:flex;flex-direction:column;gap:14px}
+.stephead{display:flex;justify-content:space-between;align-items:baseline;gap:12px;flex-wrap:wrap}
+.stephead h3{font-size:20px}
+.desc{margin:0;max-width:70ch}
+.nav{display:flex;gap:8px}
+.nav button{font:500 13px var(--f-body);padding:7px 14px;border-radius:6px;border:1px solid var(--line);background:var(--bg);color:var(--fg);cursor:pointer}
+.nav button:disabled{opacity:.4;cursor:default}
+.panels{display:grid;grid-template-columns:repeat(auto-fit,minmax(250px,1fr));gap:12px}
+.panel{border:1px solid var(--line);border-radius:8px;padding:10px 12px;font-size:13px;min-width:0}
+.panel h4{margin:0 0 6px;font:500 11.5px var(--f-mono);letter-spacing:.06em;text-transform:uppercase;color:var(--muted)}
+.kv{display:grid;grid-template-columns:auto 1fr;gap:2px 12px;font-family:var(--f-mono);font-size:12.5px;font-variant-numeric:tabular-nums}
+.kv b{font-weight:500;text-align:right}
+.cap{display:flex;height:14px;border-radius:4px;overflow:hidden;gap:2px;margin:8px 0 4px;background:var(--surface)}
+.cap i{display:block;height:100%}
+.capleg{display:flex;flex-wrap:wrap;gap:2px 10px;font-size:11.5px;color:var(--muted)}
+.capleg span::before{content:"";display:inline-block;width:9px;height:9px;border-radius:2px;margin-right:4px;background:var(--c);vertical-align:-1px}
+.ask{font-family:var(--f-mono);font-size:12.5px;line-height:1.7;white-space:pre-wrap}
+.ok{color:var(--ok);font-weight:600}.bad{color:var(--bad);font-weight:600}
+.verdict{margin-top:4px;font-family:var(--f-body);font-weight:600}
+.req{font-family:var(--f-mono);font-size:12px;line-height:1.6;margin:0 0 6px;overflow-wrap:anywhere}
+.chip{display:inline-block;font:500 10.5px var(--f-body);padding:1px 7px;border-radius:999px;border:1px solid var(--line);margin-left:6px;vertical-align:1px}
+.chip.running{border-color:var(--ok);color:var(--ok)}
+.chip.paused,.chip.waiting{border-color:var(--state);color:var(--state)}
+.chip.rejected{border-color:var(--bad);color:var(--bad)}
+.lane{display:grid;grid-template-columns:44px repeat(4,1fr);gap:4px;font:12px var(--f-mono);align-items:center;margin-bottom:4px}
+.lane div{padding:3px 4px;border-radius:4px;text-align:center;border:1px solid transparent}
+.lane .on{border-color:var(--fg);font-weight:500}
+.lane .lbl{text-align:left;color:var(--muted);padding:0}
+.toy{font-size:13px;color:var(--muted);border-top:1px solid var(--line);padding-top:10px;margin-top:4px}
+
+/* calculator */
+.calc{display:grid;grid-template-columns:repeat(auto-fit,minmax(150px,1fr));gap:10px 16px;margin:14px 0}
+.calc label{display:flex;flex-direction:column;gap:4px;font-size:12.5px;color:var(--muted)}
+.calc output{font-family:var(--f-mono);color:var(--fg)}
+.calc input[type=range]{width:100%;accent-color:var(--hl)}
+.calc select{font:inherit;padding:4px;border-radius:6px;border:1px solid var(--line);background:var(--surface);color:var(--fg)}
+.result{font-family:var(--f-mono);font-size:13px;background:var(--surface);border:1px solid var(--line);border-radius:8px;padding:12px 14px;overflow-x:auto;white-space:pre;line-height:1.7}
+.tip{position:absolute;pointer-events:none;background:var(--surface);border:1px solid var(--line);border-radius:6px;padding:6px 9px;font:12px/1.5 var(--f-mono);box-shadow:0 4px 14px rgb(0 0 0 / .12);white-space:nowrap}
+@media (prefers-reduced-motion:reduce){.cell{transition:none}}
+</style>
+
+<div class="wrap">
+  <p class="eyebrow">mllm · memory design v1 · Mac mini M4 Pro, 64 GB</p>
+  <h1>One arena, one unit size</h1>
+  <p class="lede">A visual walk through <code>docs/memory-design.md</code>: what the hardware gives us, how the arena is cut into 1 MiB units, and what happens to those units, step by step, in six everyday situations.</p>
+  <ul class="tldr">
+    <li><b>One buffer for all per-token state.</b> Full-attention pages, window pages and linear-attention state all live in one <code>MTLBuffer</code> of equal 1 MiB units.</li>
+    <li><b>Any free unit serves any need.</b> No bands, no ratio setting, nothing to compact. An object's units don't have to be adjacent; the GPU finds each through a step table.</li>
+    <li><b>Units never move.</b> <code>address = slot × unit + offset</code>. No virtual ids, no translation table.</li>
+    <li><b>One capacity question.</b> Every caller goes through <code>admit(n)</code>. Once admitted, a request's <code>alloc()</code> cannot fail.</li>
+    <li><b>Free now, reuse later.</b> A released unit waits in <code>pending</code> until the GPU step that might read it has finished.</li>
+  </ul>
+</div>
+
+<div class="wrap"><h2>1 · What the machine gives us</h2>
+<p>CPU, GPU and Neural Engine share one pool of LPDDR5X. A Metal buffer in <code>StorageModeShared</code> is the same physical 16 KiB pages mapped into both the CPU's and the GPU's page tables, so there is no copy. Everything below is about how we carve that pool up.</p></div>
+
+<figure class="wide fig">
+<div class="scroll">
+<svg viewBox="0 0 900 380" role="img" aria-label="CPU, GPU and Neural Engine share a System Level Cache and one 64 GB LPDDR5X pool. The pool holds five regions: weights, ANE weights, the arena, workspace and two step tables. Model files come from the USB volume by mmap; the internal SSD is the spill tier for the arena.">
+  <defs><marker id="ah" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path d="M0 0L10 5L0 10z" fill="currentColor"/></marker></defs>
+  <g fill="none" stroke="var(--line)" stroke-width="1.5">
+    <rect x="40" y="16" width="230" height="58" rx="8" fill="var(--surface)"/>
+    <rect x="335" y="16" width="230" height="58" rx="8" fill="var(--surface)"/>
+    <rect x="630" y="16" width="230" height="58" rx="8" fill="var(--surface)"/>
+    <rect x="40" y="108" width="820" height="38" rx="8" fill="var(--soft)"/>
+    <rect x="40" y="180" width="820" height="112" rx="10" fill="var(--surface)"/>
+  </g>
+  <g stroke="var(--muted)" stroke-width="1.5"><line x1="155" y1="74" x2="155" y2="108"/><line x1="450" y1="74" x2="450" y2="108"/><line x1="745" y1="74" x2="745" y2="108"/><line x1="450" y1="146" x2="450" y2="180"/></g>
+  <g font-size="14" font-weight="600" fill="currentColor" text-anchor="middle">
+    <text x="155" y="40">CPU</text><text x="450" y="40">GPU</text><text x="745" y="40">Neural Engine</text>
+  </g>
+  <g font-size="11.5" fill="var(--muted)" text-anchor="middle">
+    <text x="155" y="60">2 P-clusters × 5 cores, 16 MiB L2 each</text>
+    <text x="450" y="60">210–238 GB/s measured reads</text>
+    <text x="745" y="60">reads its own weights, IOSurfaces</text>
+    <text x="450" y="132">System Level Cache · ~32 MiB (estimate) · bigger working sets stream from DRAM</text>
+  </g>
+  <text x="56" y="203" font-size="13" font-weight="600" fill="currentColor">LPDDR5X · 64 GB · 273 GB/s peak · 128 B cache line · 16 KiB pages</text>
+  <g font-size="12" text-anchor="middle">
+    <rect x="52" y="215" width="152" height="64" rx="6" fill="color-mix(in srgb,var(--wts) 18%,var(--surface))" stroke="var(--wts)"/>
+    <text x="128" y="236" font-weight="600" fill="currentColor">Weights</text><text x="128" y="252" fill="var(--muted)">4-bit MLX, mmap</text><text x="128" y="268" fill="var(--muted)">GPU reads</text>
+    <rect x="214" y="215" width="152" height="64" rx="6" fill="color-mix(in srgb,var(--ane) 18%,var(--surface))" stroke="var(--ane)"/>
+    <text x="290" y="236" font-weight="600" fill="currentColor">ANE weights</text><text x="290" y="252" fill="var(--muted)">Core ML, 4-bit LUT</text><text x="290" y="268" fill="var(--muted)">ANE reads</text>
+    <rect x="376" y="215" width="152" height="64" rx="6" fill="color-mix(in srgb,var(--full) 18%,var(--surface))" stroke="var(--full)" stroke-width="2"/>
+    <text x="452" y="236" font-weight="600" fill="currentColor">Arena</text><text x="452" y="252" fill="var(--muted)">per-token state</text><text x="452" y="268" fill="var(--muted)">GPU r/w · CPU (SSD)</text>
+    <rect x="538" y="215" width="152" height="64" rx="6" fill="var(--soft)" stroke="var(--line)"/>
+    <text x="614" y="236" font-weight="600" fill="currentColor">Workspace</text><text x="614" y="252" fill="var(--muted)">activations per chunk</text><text x="614" y="268" fill="var(--muted)">GPU · ANE, reused</text>
+    <rect x="700" y="215" width="150" height="64" rx="6" fill="var(--soft)" stroke="var(--line)"/>
+    <text x="775" y="236" font-weight="600" fill="currentColor">Step tables ×2</text><text x="775" y="252" fill="var(--muted)">uint32 slot lists</text><text x="775" y="268" fill="var(--muted)">CPU writes · GPU reads</text>
+  </g>
+  <g font-size="12" text-anchor="middle">
+    <rect x="52" y="320" width="230" height="44" rx="6" fill="none" stroke="var(--muted)" stroke-dasharray="4 3"/>
+    <text x="167" y="338" font-weight="600" fill="currentColor">USB volume /Volumes/T5</text><text x="167" y="354" fill="var(--muted)">model files, read once at load</text>
+    <rect x="337" y="320" width="230" height="44" rx="6" fill="none" stroke="var(--muted)" stroke-dasharray="4 3"/>
+    <text x="452" y="338" font-weight="600" fill="currentColor">Internal SSD · 34 GiB free</text><text x="452" y="354" fill="var(--muted)">spill tier + swap</text>
+  </g>
+  <g stroke="currentColor" stroke-width="1.4" fill="none" color="var(--muted)">
+    <line x1="128" y1="320" x2="128" y2="281" marker-end="url(#ah)"/>
+    <line x1="452" y1="320" x2="452" y2="281" marker-start="url(#ah)" marker-end="url(#ah)"/>
+  </g>
+  <g font-size="11" fill="var(--muted)"><text x="136" y="306">mmap → newBufferWithBytesNoCopy</text><text x="460" y="306">pwrite (spill) / pread (load)</text></g>
+</svg>
+</div>
+<figcaption><b>Figure 1.</b> One physical pool, five regions. All of them are allocated once at startup, pre-touched, and kept in <code>MTLResidencySet</code>s. Nothing is created in the token loop. A residency set is not a pin: under memory pressure the OS still evicts idle buffers in it (measured).</figcaption>
+</figure>
+
+<figure class="wide fig">
+<div class="scroll">
+<svg viewBox="0 0 900 230" role="img" aria-label="Budget for 64 GB with a 27B mixed-attention model: macOS and apps 12 to 16 GB, ANE weights about 15, GPU weights about 15, arena 12, workspace 1 to 2, about 6 spare. The GPU working set of about 29 GB is under the 55.7 GB limit; the 12 GB arena is under the 41.7 GB single-buffer limit.">
+  <g font-size="12" fill="var(--muted)"><text x="20" y="28">Physical memory, 64 GB (a ~27B mixed-attention model)</text></g>
+  <g stroke="var(--surface)" stroke-width="2">
+    <rect x="20" y="38" width="188" height="44" fill="var(--soft)"/>
+    <rect x="208" y="38" width="202" height="44" fill="var(--ane)"/>
+    <rect x="410" y="38" width="201" height="44" fill="var(--wts)"/>
+    <rect x="611" y="38" width="161" height="44" fill="var(--full)"/>
+    <rect x="772" y="38" width="27" height="44" fill="var(--state)"/>
+    <rect x="800" y="39" width="79" height="42" fill="none" stroke="var(--muted)" stroke-dasharray="4 3"/>
+  </g>
+  <g font-size="12" font-weight="600" text-anchor="middle">
+    <text x="114" y="64" fill="currentColor">macOS + apps 12–16</text>
+    <text x="309" y="64" fill="var(--on)">ANE weights ~15</text>
+    <text x="510" y="64" fill="var(--on)">GPU weights ~15</text>
+    <text x="691" y="64" fill="var(--on)">Arena 12</text>
+    <text x="840" y="64" fill="var(--muted)" font-weight="500">spare ~6</text>
+  </g>
+  <line x1="785" y1="82" x2="785" y2="96" stroke="var(--muted)"/><text x="785" y="108" font-size="11" fill="var(--muted)" text-anchor="middle">workspace + tables 1–2</text>
+  <path d="M410 90 v6 h389 v-6" fill="none" stroke="currentColor"/>
+  <text x="560" y="112" font-size="11.5" fill="currentColor" text-anchor="middle">everything the GPU touches ≈ 29 GB</text>
+
+  <g font-size="12" fill="var(--muted)"><text x="20" y="146">recommendedMaxWorkingSetSize · 55.7 GB</text><text x="20" y="196">maxBufferLength · 41.7 GB (one MTLBuffer)</text></g>
+  <rect x="20" y="154" width="748" height="14" rx="3" fill="var(--soft)"/>
+  <rect x="20" y="154" width="390" height="14" rx="3" fill="var(--wts)"/>
+  <text x="418" y="165" font-size="11" fill="currentColor">29 GB used</text>
+  <rect x="20" y="204" width="560" height="14" rx="3" fill="var(--soft)"/>
+  <rect x="20" y="204" width="161" height="14" rx="3" fill="var(--full)"/>
+  <text x="189" y="215" font-size="11" fill="currentColor">arena 12 GB = 12,288 units of 1 MiB</text>
+</svg>
+</div>
+<figcaption><b>Figure 2.</b> Where the 64 GB go, drawn to one scale (13.4 px per GB). The arena size is the one memory setting. Past 41.7 GB it would need several buffers, which is deferred.</figcaption>
+</figure>
+
+<div class="wrap"><h2>2 · The arena</h2>
+<p>The arena is <b>N equal units</b>; slot <code>s</code> starts at byte <code>s × unit</code>. Every kind of state is a whole number of units, and the units of one object can be anywhere. Below is a snapshot (taken from scenario 3) with the encoding used in every figure on this page.</p>
+<div class="legend">
+  <span><i class="sw" style="background:var(--full)">F</i>full-attention page · 1 unit</span>
+  <span><i class="sw" style="background:var(--win)">W</i>window page · 3 units</span>
+  <span><i class="sw" style="background:var(--state)">S</i>state slot · 24 units</span>
+  <span><i class="sw" style="background:color-mix(in srgb,var(--full) 16%,var(--surface));border:2px dashed var(--full)"></i>held by the cache only</span>
+  <span><i class="sw" style="background:var(--full);position:relative"><i style="width:7px;height:7px;border-radius:50%;background:var(--on);box-shadow:0 0 0 2px var(--fg)"></i></i>shared: request + cache</span>
+  <span><i class="sw" style="background:repeating-linear-gradient(45deg,var(--soft) 0 5px,var(--surface) 5px 10px);border:1px dashed var(--muted)"></i>pending</span>
+  <span><i class="sw" style="border:1px solid var(--line);background:var(--surface)"></i>free</span>
+</div></div>
+<figure class="wrap">
+  <div id="snapshot" class="grid" aria-label="Arena snapshot"></div>
+  <figcaption><b>Figure 3.</b> 40 slots of a real 12,288. Labels read <code>owner·page</code>; the small line says who holds the unit (<code>req</code> = live requests, <code>cache</code> = prefix-cache entries). C's window page <code>W3</code> is three units in three different places.</figcaption>
+</figure>
+
+<div class="wrap">
+<h3 style="margin-top:36px">How big is a unit?</h3>
+<p>Example model: 8 full-attention layers, 24 window layers, 8 KV heads, head size 128, fp16, 32 tokens per page. One unit holds <code>G</code> layers, and <code>G</code> defaults to the number of full-attention layers, so a full-attention page is exactly one unit with no waste. Pick any coordinate and see where its two bytes live.</p>
+<div class="calc">
+  <label for="c-slot">slot <output id="o-slot">5</output><input id="c-slot" type="range" min="0" max="12287" value="5"></label>
+  <label for="c-l">layer in unit (l) <output id="o-l">3</output><input id="c-l" type="range" min="0" max="7" value="3"></label>
+  <label for="c-kv">K or V<select id="c-kv"><option value="0">K</option><option value="1" selected>V</option></select></label>
+  <label for="c-h">head <output id="o-h">5</output><input id="c-h" type="range" min="0" max="7" value="5"></label>
+  <label for="c-t">token in page <output id="o-t">17</output><input id="c-t" type="range" min="0" max="31" value="17"></label>
+  <label for="c-d">dim <output id="o-d">9</output><input id="c-d" type="range" min="0" max="127" value="9"></label>
+</div>
+</div>
+<figure class="wide fig">
+  <div class="scroll"><svg id="zoom" viewBox="0 0 900 300" role="img" aria-label="Zoom from one 1 MiB unit to 8 layers of 128 KiB, to 16 blocks of 8 KiB (K and V for 8 heads), to 32 token rows of 256 bytes, to 128 dims of 2 bytes."></svg></div>
+  <div class="wrap"><div class="result" id="calcout"></div>
+  <figcaption><b>Figure 4.</b> Each (layer, K/V, head) is one contiguous 8 KiB run, so the attention kernel reads 64 cache lines in a row. Measured: decode-shaped reads over shuffled units run at 243–249 GB/s for 16 to 128 tokens per page, the same as one contiguous stream, even when each unit gives only one isolated 4 KiB block.</figcaption></div>
+</figure>
+
+<div class="wrap">
+<h3 style="margin-top:36px">Objects built from units</h3>
+<div class="scroll"><table>
+<tr><th>Object</th><th>Units</th><th>Notes</th></tr>
+<tr><td>Full-attention page (32 tokens, 8 layers)</td><td>1</td><td>Grows with the request</td></tr>
+<tr><td>Window page (32 tokens, 24 layers)</td><td>3</td><td>Layers 0–7, 8–15, 16–23, each anywhere</td></tr>
+<tr><td>State slot (linear attention)</td><td>24 <i>(illustrative)</i></td><td>≈ 24 MiB, fixed per request, updated in place</td></tr>
+</table></div>
+</div>
+<figure class="wide fig" style="position:relative">
+  <div class="scroll" style="position:relative"><svg id="cost" viewBox="0 0 900 300" role="img" aria-label="Memory per request against context length. Full-attention layers grow linearly at 32 KiB per token, reaching 1 GiB at 32k tokens. Window layers stop growing at 99 MiB once the 1024-token window is full."></svg><div class="tip" id="tip" hidden></div></div>
+  <div class="wrap"><figcaption><b>Figure 5.</b> Why the two kinds want different amounts of memory, and why one pool helps: full-attention layers cost 32 KiB per token; window layers (1024-token window) cap at (32 + 1) pages × 3 units = 99 MiB. Hover for values.</figcaption></div>
+</figure>
+
+<div class="wrap"><h2>3 · A unit's life</h2>
+<p>Each slot has two counts, <code>req_refs</code> (live requests) and <code>cache_refs</code> (prefix-cache entries). A unit is reusable only when both are 0 and the GPU is done with it. All bookkeeping is plain CPU arrays on one scheduler thread, no locks.</p></div>
+<figure class="wide fig">
+<div class="scroll">
+<svg viewBox="0 0 900 200" role="img" aria-label="Slot lifecycle: free, then live after alloc from a reservation, then pending when the last reference drops, then free again once the GPU event passes the step number.">
+  <defs><marker id="ah2" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto"><path d="M0 0L10 5L0 10z" fill="currentColor"/></marker></defs>
+  <rect x="40" y="62" width="180" height="60" rx="8" fill="var(--surface)" stroke="var(--line)" stroke-width="1.5"/>
+  <rect x="360" y="62" width="180" height="60" rx="8" fill="color-mix(in srgb,var(--full) 18%,var(--surface))" stroke="var(--full)" stroke-width="1.5"/>
+  <rect x="680" y="62" width="180" height="60" rx="8" fill="var(--soft)" stroke="var(--muted)" stroke-dasharray="4 3" stroke-width="1.5"/>
+  <g text-anchor="middle"><g font-size="15" font-weight="600" fill="currentColor"><text x="130" y="88">free</text><text x="450" y="88">live</text><text x="770" y="88">pending</text></g>
+  <g font-size="11.5" fill="var(--muted)"><text x="130" y="107">bit set in the free bitmap</text><text x="450" y="107">req_refs &gt; 0 or cache_refs &gt; 0</text><text x="770" y="107">counted in free_units, not reusable</text></g></g>
+  <g stroke="currentColor" stroke-width="1.5" fill="none">
+    <line x1="220" y1="92" x2="356" y2="92" marker-end="url(#ah2)"/>
+    <line x1="540" y1="92" x2="676" y2="92" marker-end="url(#ah2)"/>
+    <path d="M770 122 C770 186 130 186 130 126" marker-end="url(#ah2)"/>
+    <path d="M415 62 C415 18 485 18 485 58" marker-end="url(#ah2)"/>
+  </g>
+  <g font-size="11.5" fill="currentColor" text-anchor="middle">
+    <text x="288" y="84">alloc()</text><text x="288" y="112" fill="var(--muted)">from a reservation</text>
+    <text x="608" y="84">last ref drops</text><text x="608" y="112" fill="var(--muted)">pending.push(slot, N)</text>
+    <text x="450" y="14">cache hit / evict: refs ± 1</text>
+    <text x="450" y="174">event.signaledValue ≥ N: the GPU has finished step N</text>
+  </g>
+</svg>
+</div>
+<figcaption><b>Figure 6.</b> <b>free → live → pending → free.</b> N is the last committed step. The pending → free move happens inside the next <code>alloc()</code>.</figcaption>
+</figure>
+
+<div class="wrap"><h2>4 · The one capacity question</h2>
+<p>A new request, a generation top-up, a load from SSD and a cache state copy all ask the same thing:</p>
+<pre>fits(n):      n ≤ free_units − reserved
+can_ever(n):  n ≤ free_units + cache_only_units − reserved
+
+admit(n):
+    if not can_ever(n): return WAIT        # evict nothing
+    while not fits(n): evict the cache's next victim
+    reserved += n</pre>
+<p><code>n</code> = pages for the uncached part of the prompt, plus a generation allowance, plus the request's bounded state (window ring with one page in transit, or one state slot). Each later <code>alloc()</code> takes one unit out of the request's reservation, and since <code>reserved ≤ free_units</code> always holds, it cannot fail. In the scenarios below the capacity bar shows these quantities live.</p>
+</div>
+
+<div class="wide"><h2 class="wrap" style="max-width:760px">5 · Scenarios, one step at a time</h2>
+<div class="wrap" style="padding:0"><p>Pick a scenario, then step through it with the buttons or the ← → keys. The changed units get a pink outline.</p></div>
+<div class="tabs" role="tablist" id="tabs"></div>
+<section class="scen" id="scen" aria-live="polite">
+  <ol class="steps" id="steps"></ol>
+  <div class="main">
+    <div class="stephead"><h3 id="stitle"></h3><div class="nav"><button id="prev" type="button">← Back</button><button id="next" type="button">Next →</button></div></div>
+    <p class="desc" id="sdesc"></p>
+    <div class="grid" id="sgrid"></div>
+    <div class="panels" id="spanels"></div>
+    <p class="toy">Toy sizes so it fits on screen: 40 slots, 32 tokens per page, generation allowance 64 tokens (2 pages), and a 32-token window, so a window ring is 1 page + 1 in transit (6 units). The real window ring is 33 pages.</p>
+  </div>
+</section>
+</div>
+
+<div class="wrap"><h2>6 · What we measured, what's open, what's deferred</h2>
+<div class="scroll"><table>
+<tr><th>Question</th><th>Result (2026-11-22)</th><th>So</th></tr>
+<tr><td>Can the GPU read ANE output IOSurfaces without a copy?</td><td><b>Yes.</b> Core ML writes into our IOSurface; Metal reads it as a texture or a <code>bytesNoCopy</code> buffer, bit-exact, live across predictions</td><td>Prefill K/V reaches the arena through a GPU kernel, no CPU copy</td></tr>
+<tr><td>Do 8 KiB runs keep full bandwidth? Tokens per page?</td><td><b>Yes, at every size tried.</b> 243–249 GB/s for T = 16–128, shuffled or in order, vs a 243 GB/s contiguous stream. int8 reads take half the time</td><td>Keep 32 tokens per page for other reasons. Kernel compute decides 8-bit KV</td></tr>
+<tr><td>Does a residency set keep file-backed weights resident?</td><td><b>No, and not anonymous memory either.</b> Under pressure: file-backed 100 → 60 %, anonymous 100 → 0 %</td><td>Keep <code>mmap</code> weights: evicted file pages are dropped, not swapped</td></tr>
+<tr><td>Does <code>mlock</code> on the weights hold under pressure?</td><td>Open. Wire limit 52.5 GB, no sudo needed</td><td>Needs an idle machine: pressure tests grow swap</td></tr>
+</table></div>
+<div class="scroll" style="margin-top:20px"><table>
+<tr><th>Deferred</th><th>Add when</th></tr>
+<tr><td>Cache entries that end mid-page</td><td>The ≤ 31-token recompute shows up in time to first token</td></tr>
+<tr><td>Preempt a live request and spill it</td><td>Paused requests show up in real use</td></tr>
+<tr><td>Arena &gt; 41.7 GB (several buffers)</td><td>Arena setting exceeds <code>maxBufferLength</code></td></tr>
+<tr><td>8-bit KV layout</td><td>Kernel benchmark shows the decode win</td></tr>
+<tr><td>Draft model state in the same arena</td><td>Speculative decoding proves worth it</td></tr>
+<tr><td>More than one step encoded ahead</td><td>GPU-side sampling removes the per-token CPU round trip</td></tr>
+</table></div>
+<h3 style="margin-top:28px">Build order</h3>
+<ol>
+<li>Throwaway attention benchmark over shuffled units: 16/32/64/128 tokens per page vs contiguous, fp16 vs 8-bit.</li>
+<li>Allocator in C++, CPU only: bitmap, reference counts, pending, <code>admit</code>, eviction loop. Unit tests, no GPU.</li>
+<li>Wrap it in one <code>MTLBuffer</code> + residency set; step tables; event-driven reclaim.</li>
+<li>Attention kernels that read units through the step table.</li>
+</ol>
+</div>
+
+<script>
+/* ---------- arena model (mirrors docs/memory-design.md) ---------- */
+const N = 40;
+const freeCell = () => ({k:null,o:'',l:'',rq:[],cn:[],pend:null});
+function blank(){return {s:Array.from({length:N},freeCell),reserved:0,res:{},req:{},cache:{},committed:7,signaled:6,ask:null,hl:[],pipe:null,ssd:null}}
+function setReq(st,o,status='running'){st.req[o]??={full:[],win:[],status};st.req[o].status=status;return st.req[o]}
+function put(st,i,k,o,l,rq,cn=[]){Object.assign(st.s[i],{k,o,l,rq:[...rq],cn:[...cn],pend:null})}
+function placeReq(st,o,full,win,wl){const r=setReq(st,o);full.forEach(i=>{put(st,i,'F',o,'F'+r.full.length,[o]);r.full.push(i)});
+  win.forEach((g,p)=>{const name=wl?wl[p]:'W'+r.win.length;g.forEach((i,j)=>put(st,i,'W',o,`${name}.${j}`,[o]));r.win.push(g)})}
+function placeCache(st,name,full,win,tokens){full.forEach((i,n)=>put(st,i,'F',name,'F'+n,[],[name]));win.forEach(g=>g.forEach((i,j)=>put(st,i,'W',name,'W.'+j,[],[name])));st.cache[name]={full,win,tokens,where:'arena'}}
+function reserve(st,o,n){st.reserved+=n;st.res[o]=(st.res[o]||0)+n}
+function reclaim(st){st.s.forEach((c,i)=>{if(c.pend!==null&&c.pend<=st.signaled)st.s[i]=freeCell()})}
+function takeSlot(st){reclaim(st);let i=st.s.findIndex(c=>c.k===null);
+  if(i<0){st.signaled=st.committed;reclaim(st);i=st.s.findIndex(c=>c.k===null)} /* wait for the event, at most one step */
+  return i}
+function alloc(st,o,k,l){const i=takeSlot(st);put(st,i,k,o,l,[o]);st.reserved--;st.res[o]--;st.hl.push(i);return i}
+function allocFull(st,o,n,label){const r=st.req[o];for(let j=0;j<n;j++)r.full.push(alloc(st,o,'F',label||'F'+r.full.length))}
+function allocWin(st,o,n,label){const r=st.req[o];for(let j=0;j<n;j++){const nm=label||'W'+r.win.length;r.win.push([0,1,2].map(x=>alloc(st,o,'W',`${nm}.${x}`)))}}
+function drop(st,i){const c=st.s[i];if(!c.rq.length&&!c.cn.length&&c.pend===null){c.pend=st.committed;st.hl.push(i)}}
+function endReq(st,o,status='finished'){st.s.forEach((c,i)=>{if(c.rq.includes(o)){c.rq=c.rq.filter(x=>x!==o);drop(st,i)}});
+  st.reserved-=st.res[o]||0;st.res[o]=0;Object.assign(st.req[o],{full:[],win:[],status})}
+function cacheAdd(st,name,full,win,tokens){st.cache[name]={full,win,tokens,where:'arena'};[...full,...win.flat()].forEach(i=>{st.s[i].cn.push(name);st.hl.push(i)})}
+function cacheDrop(st,name,where='evicted'){const e=st.cache[name];[...e.full,...e.win.flat()].forEach(i=>{const c=st.s[i];c.cn=c.cn.filter(x=>x!==name);drop(st,i)});e.where=where}
+function share(st,o,name){const r=setReq(st,o,'admitted'),e=st.cache[name];[...e.full,...e.win.flat()].forEach(i=>{st.s[i].rq.push(o);st.hl.push(i)});r.full.push(...e.full);r.win.push(...e.win)}
+function stats(st){let free=0,co=0,live=0,pend=0;st.s.forEach(c=>{const h=c.rq.length,k=c.cn.length;if(!h&&!k){free++;if(c.pend!==null)pend++}else if(!h)co++;else live++});return {free,co,live,pend}}
+function ask(st,who,n){const t=stats(st);st.ask={who,n,free:t.free,co:t.co,res:st.reserved,fits:n<=t.free-st.reserved,can:n<=t.free+t.co-st.reserved,reject:n>N}}
+
+/* ---------- scenarios ---------- */
+const SC=[
+{name:'1 · Admit a request',sum:'A new request asks for room, gets a reservation, and prefill places its pages anywhere.',
+ base(){const st=blank();placeReq(st,'B',[0,4,9,15],[[1,2,7],[10,11,18]]);reserve(st,'B',2);return st},
+ steps:[
+ ['Starting point','B is decoding. It holds 10 units: 4 full-attention pages (1 unit each) and 2 window pages (3 units each, not adjacent). It also has 2 units reserved for the rest of its generation allowance.'],
+ ['A arrives: work out n','A\'s prompt has 80 uncached tokens → ⌈80/32⌉ = <b>3</b> full pages. Generation allowance 64 tokens → <b>2</b> pages. Window ring = 1 page + 1 in transit = <b>6</b> units. So <code>n = 11</code>. Both checks pass.',st=>{setReq(st,'A','arriving');ask(st,'A',11)}],
+ ['admit(11): reserve, don\'t pick','<code>reserved</code> goes from 2 to 13. No slot is chosen yet, the units are only counted. From now on each <code>alloc()</code> for A takes one unit out of its reservation, so none of them can fail.',st=>{reserve(st,'A',11);st.req.A.status='admitted'}],
+ ['Prefill writes 3 full pages','<code>alloc()</code> takes any free slot. A\'s pages land in slots 3, 5 and 6, in the gaps around B. They don\'t need to be adjacent: the GPU finds each one through the step table.',st=>{st.req.A.status='running';allocFull(st,'A',3)}],
+ ['…and its window page','A window page covers 24 window layers, so it is 3 units: layers 0–7, 8–15, 16–23. Here they land in slots 8, 12 and 13. The in-transit ring page stays reserved until A crosses a page boundary.',st=>allocWin(st,'A',1)],
+ ['Fill the step table','The CPU copies A\'s and B\'s slot lists into the step-table copy for step 8 (copy 0, by parity). The kernel computes <code>address = slot × 1 MiB + offset_in_unit</code>. A\'s second full page is slot 5, so it starts at byte 5 MiB. Units never move, so there is no translation table.',st=>{st.pipe={gpu:7,cpu:8}}],
+ ['A finishes','A\'s references drop to 0, so its 6 units go to <code>pending</code> tagged with step 8, the last committed step: the GPU may still be reading them. They count in <code>free_units</code> right away. The 5 units of reservation A never used come back, and <code>reserved</code> returns to 2.',st=>{st.committed=8;st.signaled=7;st.pipe={gpu:8,cpu:9};endReq(st,'A')}],
+ ['GPU finishes step 8','The shared event reaches 8. The next <code>alloc()</code> moves every pending slot with step ≤ 8 to the free bitmap. A\'s old units can now serve any kind of state for anyone.',st=>{st.signaled=8;st.committed=9;st.pipe={gpu:9,cpu:10};reclaim(st)}],
+ ]},
+{name:'2 · Generation outgrows its allowance',sum:'A request uses up its allowance in a full arena, pauses, and resumes when another request ends.',
+ base(){const st=blank();const idx=[...Array(N).keys()].filter(i=>i!==17&&i!==30);const A=idx.filter((_,j)=>j%3===0).slice(0,12),B=idx.filter(i=>!A.includes(i));
+   placeReq(st,'A',A.slice(0,6),[A.slice(6,9),A.slice(9,12)]);placeReq(st,'B',B.slice(0,14),[B.slice(14,17),B.slice(17,20),B.slice(20,23),B.slice(23,26)]);reserve(st,'B',2);return st},
+ steps:[
+ ['Starting point','The arena is busy: A holds 12 units, B holds 26. 2 units are free, and both are already reserved by B. A has generated all 64 tokens of its allowance.'],
+ ['A asks for another allowance','A\'s next token starts a new page, but its reservation is spent, so it calls <code>admit(2)</code>. <code>can_ever</code> fails: there is no room and nothing in the cache to evict. The answer is <b>WAIT</b>, and nothing is evicted.',st=>ask(st,'A',2)],
+ ['A pauses, B keeps going','A pauses and keeps all 12 of its units, so it resumes exactly where it stopped. B spends its own reservation: two more pages, and those <code>alloc()</code> calls cannot fail. If every live request were paused like A, the newest would end with stop reason <code>length</code>.',st=>{st.req.A.status='paused';allocFull(st,'B',2)}],
+ ['B finishes','B emits its stop token. Its 28 units go to pending with step 8 and count in <code>free_units</code> immediately.',st=>{st.committed=8;st.signaled=7;endReq(st,'B')}],
+ ['A retries and resumes','<code>admit(2)</code> now passes, so A is running again. Its <code>alloc()</code> finds only pending slots from step 8; it waits for the GPU to finish that step (at most one step), then reuses one of B\'s old units.',st=>{ask(st,'A',2);reserve(st,'A',2);st.req.A.status='running';allocFull(st,'A',1)}],
+ ]},
+{name:'3 · Prefix cache hit',sum:'A finished request leaves its prefix in the cache; the next request with the same prompt shares those pages.',
+ base(){const st=blank();placeReq(st,'B',[0,1,2,6,7],[[3,4,5]]);placeReq(st,'A',[8,9,10,11,14],[[12,13,16],[15,17,18]],['W3','W4']);return st},
+ steps:[
+ ['A is finishing','A\'s prompt was 140 tokens. Pages F0–F3 are full (tokens 0–127); F4 holds tokens 128–139. Its window ring holds W3 (tokens 96–127) and W4 (128–159).'],
+ ['The cache inserts entry P','Cache entries end on a page boundary, here at token 128. P takes F0–F3 and the window page covering the last window before 128 (W3): 7 units get <code>cache_refs = 1</code>. F4 is left out because it isn\'t full and would be written again.',st=>{const a=st.req.A;cacheAdd(st,'P',a.full.slice(0,4),[a.win[0]],128)}],
+ ['A ends','A\'s references drop. P\'s 7 units are now held by the cache alone (dashed): they count in <code>cache_only_units</code>, which eviction can reclaim. F4 and W4 had no other holder and go to pending.',st=>{st.committed=8;st.signaled=7;endReq(st,'A')}],
+ ['C arrives with the same prompt','C\'s prompt is the same 140 tokens plus 20 new ones. The lookup finds P, which covers 128 tokens. C takes a reference on each of P\'s 7 units, so they hold <code>req_refs = 1, cache_refs = 1</code> and are no longer cache-only. C recomputes 140 − 128 = 12 tokens (a hit never recomputes more than 31).',st=>share(st,'C','P')],
+ ['admit the rest','Uncached: 160 − 128 = 32 tokens → 1 page. Plus a 2-page allowance, plus a new window page for tokens 128–159 and one in transit (6 units). <code>n = 9</code>.',st=>{ask(st,'C',9);reserve(st,'C',9)}],
+ ['C writes only new pages','C\'s new tokens go into new units. The shared pages are full and never written again, so there is no copy-on-write. With a linear-attention model, P would also hold a copy of the state slot, because requests update state in place.',st=>{st.req.C.status='running';allocFull(st,'C',1,'F4');allocWin(st,'C',1,'W4')}],
+ ]},
+{name:'4 · Full arena: evict',sum:'There is not enough free room, so admit() evicts cache entries until the request fits, or waits.',
+ base(){const st=blank();placeCache(st,'P',[1,4,5,7],[[9,10,13]],128);placeReq(st,'B',[],[]);st.req.B.full.push(1,4);st.s[1].rq.push('B');st.s[4].rq.push('B');
+   [0,2,3,6,8,11].forEach(i=>{put(st,i,'F','B','F'+st.req.B.full.length,['B']);st.req.B.full.push(i)});[12,14,15].forEach((i,j)=>put(st,i,'W','B','W0.'+j,['B']));st.req.B.win.push([12,14,15]);
+   placeCache(st,'Q',[16,17,19],[[20,22,23]],96);placeCache(st,'R',[24,26],[[27,28,30]],64);placeReq(st,'A',[18,21,25,29,31,32],[[33,34,35]]);return st},
+ steps:[
+ ['Starting point','Two live requests (A, B) and three cache entries no request is using (P, Q, R). 4 units are free. B started from P\'s prefix, so P\'s first two pages (slots 1 and 4) are held by both B and the cache.'],
+ ['D asks for 14','<code>fits</code> fails (14 > 4), but <code>can_ever</code> passes: free units plus the 16 cache-only units are enough. So admit runs its eviction loop.',st=>{setReq(st,'D','arriving');ask(st,'D',14)}],
+ ['Evict P','The cache picks victims in its own order; P is first. Evicting it frees only the units nobody else holds: 5 go to pending. Slots 1 and 4 stay, because B still holds them. 14 still doesn\'t fit in 9.',st=>{cacheDrop(st,'P');ask(st,'D',14)}],
+ ['Evict Q, then reserve','Q\'s 6 units go too. Now 15 free units cover 14, so the loop stops and <code>reserved</code> becomes 14. R survives.',st=>{cacheDrop(st,'Q');ask(st,'D',14);reserve(st,'D',14);st.req.D.status='admitted'}],
+ ['E asks for 30','Even evicting R would leave too little room, so <code>can_ever</code> fails and nothing is evicted. E waits until units free up.',st=>{setReq(st,'E','waiting');ask(st,'E',30)}],
+ ['F asks for 45','45 units is more than the whole arena holds, even empty. F is rejected on arrival.',st=>{setReq(st,'F','rejected');ask(st,'F',45)}],
+ ]},
+{name:'5 · Free now, reuse later',sum:'The CPU builds step N+1 while the GPU runs step N, so a released unit waits for the GPU before reuse.',
+ base(){const st=blank();const idx=[...Array(N).keys()];placeReq(st,'A',idx.filter(i=>i%2===0).slice(0,12),[[24,26,28],[30,32,34]]);
+   const rest=idx.filter(i=>st.s[i].k===null);placeReq(st,'B',rest.slice(0,16),[rest.slice(16,19),rest.slice(19,22)]);st.pipe={gpu:7,cpu:8};return st},
+ steps:[
+ ['Two steps in flight','The arena is full. The GPU is running step 7 from step-table copy 1; the CPU is building step 8 into copy 0. The shared event says step 6 is the last one finished.'],
+ ['B finishes while step 8 is built','B\'s units are listed in step 7, which is on the GPU right now, so they can\'t be reused yet: <code>pending.push(slot, 7)</code>. They count in <code>free_units</code> at once, so admission can promise them.',st=>endReq(st,'B')],
+ ['C is admitted against them','<code>admit(6)</code> passes because pending units count. <code>reserved ≤ free_units</code> still holds.',st=>{setReq(st,'C','admitted');ask(st,'C',6);reserve(st,'C',6)}],
+ ['C\'s alloc() has to wait','<code>alloc()</code> first moves pending slots with step ≤ <code>event.signaledValue</code> (6) to free. There are none, and no slot is free, so it waits for the event to advance. That wait is at most one step.',st=>{st.req.C.status='waiting';st.pipe={gpu:7,cpu:8,note:'alloc() waiting for event ≥ 7'}}],
+ ['GPU completes step 7','The event becomes 7. <code>alloc()</code> retries, moves all of B\'s pending slots to free, and C gets its 3 pages.',st=>{st.signaled=7;st.req.C.status='running';allocFull(st,'C',3);st.pipe={gpu:'idle',cpu:8}}],
+ ['Commit step 8, start step 9','Step 9 will write table copy 1, the copy step 7 read. Before writing it the CPU checks <code>event ≥ 7</code>, which holds. Keeping the CPU at most one step ahead is why two copies are enough.',st=>{st.committed=8;st.pipe={gpu:8,cpu:9,note:'copy 1 is safe: event ≥ 7'}}],
+ ]},
+{name:'6 · Spill to SSD and load back',sum:'A cache-only entry is written to the internal SSD, its units are freed, and a later hit reads it straight back into new units.',
+ base(){const st=blank();placeReq(st,'B',[0,1,3,5,8,9,10,12],[[2,4,6],[14,15,16]]);placeCache(st,'P',[7,11,13,17],[[18,19,21]],128);placeCache(st,'Q',[20,22,23,24],[],128);st.ssd={files:[]};return st},
+ steps:[
+ ['Starting point','B is running. Cache entries P (7 units) and Q (4 units) are held by the cache only. Only such pages may spill: a request never references a page that isn\'t in memory.'],
+ ['Spill P: write it out','<code>pwrite</code> P\'s pages into one file on the internal SSD, page <code>i</code> at <code>i × page bytes</code>, opened with <code>F_NOCACHE</code> so the OS file cache doesn\'t keep a second copy. This is safe while the GPU still reads them, because shared pages are never written.',st=>{st.ssd.files.push('node_P.kv · 7 units · 128 tokens');const e=st.cache.P;st.hl.push(...e.full,...e.win.flat())}],
+ ['Drop the cache\'s references','The cache entry now points at the file. P\'s units have no holders and go to pending, then free.',st=>{st.committed=8;st.signaled=7;cacheDrop(st,'P','ssd')}],
+ ['C hits P','C shares P\'s 128-token prefix. Loading goes through the same <code>admit</code>: 7 units to load + 1 new page + 2 allowance + 3 in-transit window units = <code>n = 13</code>.',st=>{setReq(st,'C','admitted');ask(st,'C',13);reserve(st,'C',13)}],
+ ['pread straight into units','<code>alloc()</code> gives 7 units anywhere, and <code>pread</code> writes into them directly. The arena is shared memory, so there is no GPU upload. The reads finish before the step that uses these pages is committed.',st=>{const ids=[];for(let j=0;j<7;j++){const i=alloc(st,'C',j<4?'F':'W',j<4?'P·F'+j:'P·W.'+(j-4));st.s[i].o='';st.s[i].cn.push('P');ids.push(i)}
+   const e=st.cache.P;e.full=ids.slice(0,4);e.win=[ids.slice(4)];e.where='arena';st.req.C.full.push(...e.full);st.req.C.win.push(...e.win);st.req.C.status='running'}],
+ ['When the SSD runs low','Spilling stops when free space on the internal SSD would fall below a floor (default 16 GiB, room for swap). Past that, eviction drops pages instead of writing them.',st=>{st.ssd.note='floor 16 GiB · below it: drop, don\'t spill'}],
+ ]},
+];
+// precompute every state
+SC.forEach(sc=>{let st=sc.base();sc.states=sc.steps.map(([,,f])=>{st=structuredClone(st);st.hl=[];st.ask=null;if(f)f(st);return st})});
+
+/* ---------- rendering ---------- */
+const $=id=>document.getElementById(id);
+const esc=s=>String(s).replace(/[&<>]/g,c=>({'&':'&amp;','<':'&lt;','>':'&gt;'}[c]));
+function renderGrid(el,st){el.innerHTML=st.s.map((c,i)=>{
+  let cls='cell',lb='',rf='free';
+  if(c.k){cls+=' k-'+c.k;lb=(c.o?c.o+'·':'')+c.l;
+    if(c.pend!==null){cls='cell pend';rf='pending · step '+c.pend}
+    else{const parts=[];if(c.rq.length)parts.push('req '+c.rq.join(','));if(c.cn.length)parts.push('cache '+c.cn.join(','));rf=parts.join(' · ');
+      if(!c.rq.length&&c.cn.length)cls+=' co';if(c.rq.length&&c.cn.length)cls+=' shared'}}
+  if(st.hl.includes(i))cls+=' hl';
+  return `<div class="${cls}" title="slot ${i} · bytes ${i}–${i+1} MiB · ${esc(rf)}"><span class="sn">${i}</span><span class="lb">${esc(lb)}</span><span class="rf">${esc(rf)}</span></div>`}).join('')}
+const mark=b=>b?'<span class="ok">✓</span>':'<span class="bad">✕</span>';
+function renderPanels(el,st){const t=stats(st),avail=Math.max(0,t.free-st.reserved),rsv=Math.min(st.reserved,t.free);
+  let h=`<div class="panel"><h4>Bookkeeping</h4><div class="kv"><span>free_units</span><b>${t.free}</b><span>&nbsp;of which pending</span><b>${t.pend}</b><span>reserved</span><b>${st.reserved}</b><span>cache_only_units</span><b>${t.co}</b><span>held by requests</span><b>${t.live}</b></div>
+  <div class="cap" role="img" aria-label="${t.live} held by requests, ${t.co} cache only, ${rsv} reserved, ${avail} available">${[[t.live,'var(--fg)'],[t.co,'var(--muted)'],[rsv,'var(--state)'],[avail,'var(--ok)']].map(([n,c])=>n?`<i style="flex:${n};background:${c}"></i>`:'').join('')}</div>
+  <div class="capleg"><span style="--c:var(--fg)">requests</span><span style="--c:var(--muted)">cache only</span><span style="--c:var(--state)">reserved</span><span style="--c:var(--ok)">fits(n) room = ${avail}</span></div></div>`;
+  if(st.ask){const a=st.ask;let body,v;
+    if(a.reject){body=`${a.n} &gt; ${N} units in the arena`;v='<span class="bad">reject on arrival</span>'}
+    else{body=`can_ever: ${a.n} ≤ ${a.free} + ${a.co} − ${a.res} = ${a.free+a.co-a.res}  ${mark(a.can)}\nfits:     ${a.n} ≤ ${a.free} − ${a.res} = ${a.free-a.res}  ${mark(a.fits)}`;
+      v=!a.can?'<span class="bad">WAIT, evict nothing</span>':!a.fits?'evict the cache\'s next victim':'<span class="ok">reserved += '+a.n+'</span>'}
+    h+=`<div class="panel"><h4>admit(${a.n}) for ${a.who}</h4><div class="ask">${body}</div><div class="verdict">→ ${v}</div></div>`}
+  const reqs=Object.entries(st.req);if(reqs.length)h+=`<div class="panel"><h4>Slot lists (copied into the step table)</h4>${reqs.map(([o,r])=>`<p class="req"><b>${o}</b><span class="chip ${r.status}">${r.status}</span>${st.res[o]?` <span style="color:var(--muted)">· ${st.res[o]} reserved</span>`:''}${r.full.length?`<br>full [${r.full.join(', ')}]`:''}${r.win.length?`<br>window ${r.win.map(g=>'['+g.join(',')+']').join(' ')}`:''}</p>`).join('')}</div>`;
+  const cs=Object.entries(st.cache);if(cs.length)h+=`<div class="panel"><h4>Prefix cache</h4>${cs.map(([n,e])=>`<p class="req"><b>${n}</b> · ${e.tokens} tokens · <span style="color:var(--muted)">${e.where==='arena'?'slots ['+[...e.full,...e.win.flat()].join(', ')+']':e.where==='ssd'?'on SSD':'evicted'}</span></p>`).join('')}</div>`;
+  if(st.pipe){const p=st.pipe,cells=(cur,who)=>[6,7,8,9].map(n=>`<div class="${n===cur?'on':''}" style="${n<=st.signaled&&who==='GPU'?'color:var(--muted);text-decoration:line-through':''}">${n} <small>c${n%2}</small></div>`).join('');
+    h+=`<div class="panel"><h4>Pipeline · event.signaledValue = ${st.signaled}</h4><div class="lane"><div class="lbl">GPU</div>${cells(p.gpu,'GPU')}</div><div class="lane"><div class="lbl">CPU</div>${cells(p.cpu,'CPU')}</div>
+    <div style="color:var(--muted);font-size:12px">step number, <small>c</small> = step-table copy it uses${p.gpu==='idle'?' · GPU idle':''}${p.note?'<br><b style="color:var(--fg)">'+p.note+'</b>':''}</div></div>`}
+  if(st.ssd)h+=`<div class="panel"><h4>Internal SSD · spill tier</h4>${st.ssd.files.length?st.ssd.files.map(f=>`<p class="req">${f}</p>`).join(''):'<p class="req" style="color:var(--muted)">no spilled files</p>'}${st.ssd.note?`<p class="req" style="color:var(--muted)">${st.ssd.note}</p>`:''}</div>`;
+  el.innerHTML=h}
+
+let cur=0,step=0;
+function show(){const sc=SC[cur],st=sc.states[step];
+  [...$('tabs').children].forEach((b,i)=>b.setAttribute('aria-selected',i===cur));
+  $('steps').innerHTML=sc.steps.map(([t],i)=>`<li><button type="button" class="stepbtn ${i<step?'done':''}" ${i===step?'aria-current="step"':''} data-i="${i}"><span class="n">${i+1}</span><span class="t">${t}</span></button></li>`).join('');
+  $('stitle').textContent=`${step+1}. ${sc.steps[step][0]}`;$('sdesc').innerHTML=sc.steps[step][1];
+  renderGrid($('sgrid'),st);renderPanels($('spanels'),st);
+  $('prev').disabled=step===0;$('next').disabled=step===sc.steps.length-1}
+$('tabs').innerHTML=SC.map((s,i)=>`<button type="button" role="tab" class="tab" title="${esc(s.sum)}" data-i="${i}">${s.name}</button>`).join('');
+$('tabs').onclick=e=>{const b=e.target.closest('.tab');if(b){cur=+b.dataset.i;step=0;show()}};
+$('steps').onclick=e=>{const b=e.target.closest('.stepbtn');if(b){step=+b.dataset.i;show()}};
+$('prev').onclick=()=>{if(step>0){step--;show()}};
+$('next').onclick=()=>{if(step<SC[cur].steps.length-1){step++;show()}};
+document.addEventListener('keydown',e=>{if(e.target.matches('input,select'))return;const r=$('scen').getBoundingClientRect();if(r.bottom<0||r.top>innerHeight)return;
+  if(e.key==='ArrowRight')$('next').click();if(e.key==='ArrowLeft')$('prev').click()});
+show();
+// Figure 3 snapshot = scenario 3, step 4
+renderGrid($('snapshot'),Object.assign(structuredClone(SC[2].states[3]),{hl:[]}));
+
+/* ---------- unit calculator / zoom ---------- */
+const NS='http://www.w3.org/2000/svg';
+function zoom(){const v=id=>+$(id).value,slot=v('c-slot'),l=v('c-l'),kv=v('c-kv'),hd=v('c-h'),tk=v('c-t'),d=v('c-d');
+  ['slot','l','h','t','d'].forEach(k=>$('o-'+k).textContent=$('c-'+k).value);
+  const X=20,W=860;let s='';
+  const row=(y,h,n,sel,lab,fill,title,small)=>{const w=W/n;let r=`<text x="${X}" y="${y-7}" font-size="12" fill="var(--muted)">${title}</text>`;
+    for(let i=0;i<n;i++){const on=i===sel;r+=`<rect x="${X+i*w+(n>64?0:1)}" y="${y}" width="${Math.max(w-(n>64?0:2),.6)}" height="${h}" rx="${n>64?0:3}" fill="${on?'var(--hl)':fill}" opacity="${on?1:.9}"/>`;
+      if(lab&&w>18)r+=`<text x="${X+i*w+w/2}" y="${y+h/2+4}" font-size="${small?10:11.5}" text-anchor="middle" fill="${on?'var(--on)':'var(--fg)'}">${lab(i)}</text>`}return r};
+  const trap=(y1,i,n,y2)=>{const w=W/n;return `<path d="M${X+i*w} ${y1} L${X+i*w+w} ${y1} L${X+W} ${y2} L${X} ${y2}Z" fill="var(--hl)" opacity=".1"/>`};
+  s+=row(28,32,8,l,i=>'L'+i,'color-mix(in srgb,var(--full) 30%,var(--surface))','unit · 1 MiB = 8 layers · starts at byte slot × 1 MiB');
+  s+=trap(60,l,8,96);
+  s+=row(96,32,16,kv*8+hd,i=>(i<8?'K':'V')+(i%8),'color-mix(in srgb,var(--full) 22%,var(--surface))','layer · 128 KiB = (K, V) × 8 heads');
+  s+=trap(128,kv*8+hd,16,164);
+  s+=row(164,30,32,tk,i=>i,'color-mix(in srgb,var(--win) 22%,var(--surface))','block (layer, K/V, head) · 8 KiB contiguous = 32 token rows',true);
+  s+=trap(194,tk,32,230);
+  s+=row(230,26,128,d,null,'color-mix(in srgb,var(--state) 35%,var(--surface))','row (one token, one head) · 256 B = 128 dims × 2 B');
+  s+=`<text x="${X}" y="278" font-size="11" fill="var(--muted)">dim 0</text><text x="${X+W}" y="278" font-size="11" fill="var(--muted)" text-anchor="end">dim 127</text>`;
+  $('zoom').innerHTML=s;
+  const off=((l*2+kv)*8+hd)*8192+tk*256+d*2,addr=slot*1048576+off,f=n=>n.toLocaleString('en-US');
+  $('calcout').textContent=`offset_in_unit = ((l×2 + kv)×8 + head)×8192 + token×256 + dim×2
+               = ((${l}×2 + ${kv})×8 + ${hd})×8192 + ${tk}×256 + ${d}×2
+               = ${f(off)} B
+address        = slot × 1 MiB + offset = ${f(slot)} × 1,048,576 + ${f(off)}
+               = ${f(addr)}  (0x${addr.toString(16).toUpperCase()})`}
+['c-slot','c-l','c-kv','c-h','c-t','c-d'].forEach(id=>$(id).addEventListener('input',zoom));zoom();
+
+/* ---------- per-token cost chart ---------- */
+(function(){const x0=70,x1=860,y0=250,y1=30,T=32768,M=1024,sx=t=>x0+(x1-x0)*t/T,sy=m=>y0-(y0-y1)*m/M;
+  const full=t=>Math.ceil(t/32)*1,win=t=>Math.min(Math.ceil(t/32)+1,33)*3;
+  let s='';[0,256,512,768,1024].forEach(m=>s+=`<line x1="${x0}" x2="${x1}" y1="${sy(m)}" y2="${sy(m)}" stroke="var(--line)" stroke-width="1"/><text x="${x0-8}" y="${sy(m)+4}" font-size="11" text-anchor="end" fill="var(--muted)">${m===1024?'1 GiB':m+' MiB'}</text>`);
+  [0,8192,16384,24576,32768].forEach(t=>s+=`<text x="${sx(t)}" y="${y0+18}" font-size="11" text-anchor="middle" fill="var(--muted)">${t?t/1024+'k':'0'}</text>`);
+  s+=`<text x="${(x0+x1)/2}" y="${y0+38}" font-size="11.5" text-anchor="middle" fill="var(--muted)">tokens in the request</text>`;
+  const pts=f=>Array.from({length:129},(_,i)=>{const t=i*T/128;return `${sx(t).toFixed(1)},${sy(f(t)).toFixed(1)}`}).join(' ');
+  const wpts=[0,32,64,256,512,1024,T].map(t=>`${sx(t).toFixed(1)},${sy(win(t)).toFixed(1)}`).join(' ');
+  s+=`<polyline points="${pts(full)}" fill="none" stroke="var(--full)" stroke-width="2"/><polyline points="${wpts}" fill="none" stroke="var(--win)" stroke-width="2"/>`;
+  s+=`<circle cx="${sx(T)}" cy="${sy(1024)}" r="4" fill="var(--full)" stroke="var(--surface)" stroke-width="2"/><circle cx="${sx(T)}" cy="${sy(99)}" r="4" fill="var(--win)" stroke="var(--surface)" stroke-width="2"/>`;
+  s+=`<text x="${sx(T)-8}" y="${sy(1024)+18}" font-size="12" text-anchor="end" fill="var(--fg)">Full-attention layers · 32 KiB/token → 1 GiB</text><text x="${sx(T)-8}" y="${sy(99)-10}" font-size="12" text-anchor="end" fill="var(--fg)">Window layers · flat at 99 MiB</text>`;
+  s+=`<line id="xh" x1="0" x2="0" y1="${y1}" y2="${y0}" stroke="var(--muted)" stroke-dasharray="3 3" visibility="hidden"/><rect x="${x0}" y="${y1}" width="${x1-x0}" height="${y0-y1}" fill="transparent" id="hit"/>`;
+  const svg=$('cost');svg.innerHTML=s;const tip=$('tip'),xh=svg.querySelector('#xh');
+  svg.querySelector('#hit').addEventListener('pointermove',e=>{const r=svg.getBoundingClientRect(),vx=(e.clientX-r.left)*900/r.width,t=Math.max(0,Math.min(T,Math.round((vx-x0)/(x1-x0)*T/32)*32));
+    xh.setAttribute('x1',sx(t));xh.setAttribute('x2',sx(t));xh.setAttribute('visibility','visible');tip.hidden=false;
+    tip.innerHTML=`${t.toLocaleString('en-US')} tokens<br><span style="color:var(--full)">■</span> full ${full(t)} MiB<br><span style="color:var(--win)">■</span> window ${win(t)} MiB`;
+    const px=sx(t)*r.width/900;tip.style.left=Math.min(px+12,r.width-160)+'px';tip.style.top='20px'});
+  svg.querySelector('#hit').addEventListener('pointerleave',()=>{tip.hidden=true;xh.setAttribute('visibility','hidden')});
+})();
+</script>
