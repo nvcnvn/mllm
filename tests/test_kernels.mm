@@ -49,7 +49,7 @@ void mllm::GpuOpsTest::run() {
     id<MTLDevice> dev = MTLCreateSystemDefaultDevice();
     mllm::Weights w(s.path, dev);
     mllm::Memory mem(s, dev, 64 << 20);
-    mllm::GpuOps ops(mem, w, 1);
+    mllm::GpuOps ops(mem, w, 1, 64);
     std::mt19937 rng(0);
     std::normal_distribution<float> normal;
     const size_t big = (size_t)8224 * 1024;  // the largest x / y below, in elements

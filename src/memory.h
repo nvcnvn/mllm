@@ -4,6 +4,7 @@
 #import <Metal/Metal.h>
 
 #include <deque>
+#include <span>
 #include <string>
 #include <vector>
 
@@ -61,16 +62,24 @@ struct Workspace {
     id<MTLBuffer> tokens, x, o, q, k, v, gate, qkv, z, b, a;
     id<MTLBuffer> logits;  // [max_batch, vocab]
     int B = 0, S = 0;      // tokens' shape this step (the lane sets it); dense ops work on B * S rows
+    id<MTLBuffer> table;   // this step's StepTables copy, row b = workspace row b (the lane sets it; attn reads it)
 };
 
 // Per-step uint32 slot lists the GPU reads, 2 copies by step parity (memory-design "Step tables").
-// Layout: [n_rows][n_rows + 1 offsets into the slot words that follow][slots...].
-// ponytail: minimal layout; g4 reshapes it to what the attention kernels read.
+// Layout (uint32 words, R rows): [R][pos x R][n x R][R + 1 offsets][slots...]; row b's pages are
+// slots[off[b] .. off[b + 1]). pos: the row's first token position, n: its valid tokens this step. The attention
+// kernels read it as is (src/kernels/attention.metal Table); rope reads the pos words as its int offsets.
 struct StepTables {
+    struct Row {
+        int pos, n;
+        std::span<const uint32_t> slots;
+    };
     id<MTLBuffer> copies[2];
-    size_t words;  // capacity of each copy, in uint32
+    size_t words;      // capacity of each copy, in uint32
+    uint32_t n_units;  // slots are arena units
     // The copy to fill for step. The CPU may run one step ahead of the GPU: asserts signaled + 2 >= step.
     id<MTLBuffer> begin(uint64_t step, uint64_t signaled);
+    void write(id<MTLBuffer> table, const std::vector<Row>& rows) const;
 };
 
 class Memory {

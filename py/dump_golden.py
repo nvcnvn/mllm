@@ -24,6 +24,10 @@ Files and keys (bf16 stays bf16, ints are int32):
                                                    pages in token order: [kv_heads, n_tokens, head_dim]
                       <call>/rB/LNN/conv, delta    after the call, linear layer NN's state of row B's request
                       decodeN/logits [B, vocab], decodeN/argmax [B], decodeN/sampled [B]
+  attn.safetensors    GpuOps._full on the last full layer around MLX's SDPA switch points (random inputs, one row):
+                      N_POS/q, k, v [n, heads, dim] (the C++ row-major layout), N_POS/gate [n, heads*dim]
+                      N_POS/o [n, heads*dim]; N_POS/kv_k, kv_v [kv_heads, pos + n, dim] the pages after the call
+                      (the first pos tokens are the random prefix the call read)
 """
 import hashlib
 import json
@@ -37,6 +41,7 @@ import numpy as np
 
 from mllm.ane import CACHE, _model_key
 from mllm.engine import Engine
+from mllm.gpu import from_bits, to_bits
 from test_engine import CHUNK, N, PROMPTS
 
 STRINGS = [
@@ -197,6 +202,37 @@ def trace(e):
     return out, calls
 
 
+# (n, pos) around the switch points of MLX v0.32.4 on an 's' GPU: sdpa_vector 1-pass / 2-pass at 1024 keys and its
+# blocks (64 / 128 / 256, tk1 at 8 queries), the unfused fallback above 8 queries with gemv_wide up to 15, steel GEMM
+# alignment (64-row / 64-key tiles, 16-key K), block / looped softmax at 4096 keys
+SWEEP = [(1, 0), (1, 1022), (1, 1023), (1, 4200), (2, 0), (8, 40), (8, 1016), (4, 1100), (8, 9000), (9, 0), (9, 100),
+         (11, 50), (13, 60), (15, 0), (15, 2000), (16, 0), (16, 48), (24, 32), (33, 7), (64, 0), (100, 4000),
+         (128, 3968)]
+
+
+def attn_sweep(eng):
+    from types import SimpleNamespace
+    ops, mem, s = eng.prefill.ops, eng.mem, eng.spec
+    i, H, Hkv, D = s.full_layers[-1], s.n_heads, s.n_kv_heads, s.head_dim
+    slots = list(range(mem.arena.n_units))[::-1]  # scattered: the last units first
+    mx.random.seed(0)
+    out = {}
+    for n, pos in SWEEP:
+        r = lambda *shape: mx.random.normal(shape).astype(mx.bfloat16)
+        q, k, v, gate = r(1, n, H, D), r(1, n, Hkv, D), r(1, n, Hkv, D), r(1, n, H * D)
+        prefix_k, prefix_v = r(pos, Hkv, D), r(pos, Hkv, D)
+        if pos:
+            mem.write_kv(i, slots, 0, to_bits(prefix_k), to_bits(prefix_v))
+        ws = SimpleNamespace(q=q.transpose(0, 2, 1, 3), k=k.transpose(0, 2, 1, 3), v=v.transpose(0, 2, 1, 3), gate=gate)
+        o = ops._full(i, ws, 0, pos, slots, None)
+        kk, vv = mem.read_kv(i, slots, pos + n)
+        p = f"{n}_{pos}"
+        out |= {f"{p}/q": q[0], f"{p}/k": k[0], f"{p}/v": v[0], f"{p}/gate": gate[0], f"{p}/o": o[0],
+                f"{p}/kv_k": from_bits(np.ascontiguousarray(kk), mx.bfloat16),
+                f"{p}/kv_v": from_bits(np.ascontiguousarray(vv), mx.bfloat16)}
+    return out
+
+
 def main():
     model = sys.argv[1]
     eng = Engine(model, arena_bytes=ARENA, chunk=CHUNK)
@@ -217,6 +253,7 @@ def main():
         greedy.append(toks)
     mx.save_safetensors(str(dst / "tokens.safetensors"), tokens)
 
+    mx.save_safetensors(str(dst / "attn.safetensors"), attn_sweep(eng))
     tr, calls = trace(Engine(model, arena_bytes=ARENA, chunk=CHUNK))
     mx.save_safetensors(str(dst / "trace.safetensors"), tr)
 

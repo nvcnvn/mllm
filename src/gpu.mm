@@ -1,6 +1,11 @@
 #include "gpu.h"
 
+#include "mlx/mlx/backend/metal/kernels/steel/gemm/params.h"
+
+#include <algorithm>
 #include <cassert>
+#include <climits>
+#include <cmath>
 #include <stdexcept>
 
 namespace mllm {
@@ -8,22 +13,48 @@ namespace mllm {
 // ponytail: mlx-lm reads rms_norm_eps from config.json; every Qwen3.5 uses 1e-6. Add it to ModelSpec when a model
 // differs.
 constexpr float EPS = 1e-6f;
+// ponytail: Qwen3.5's RoPE (mlx-lm nn.RoPE(64, traditional=False, base=1e7); mrope is a no-op for text). spec.py has
+// no rope fields yet; add them when a model differs.
+constexpr int ROPE_DIMS = 64;
+constexpr float ROPE_THETA = 1e7f;
+// MLX's 'medium' (applegpu_g*s) SDPA rules: 2-pass from 1024 keys
+constexpr int SDPA_2PASS_KEYS = 1024;
+
+// sdpa_vector_2pass blocks on an 's' GPU (scaled_dot_product_attention.cpp sdpa_vector_2pass)
+static int sdpa_blocks(int N, int n_simds) {
+    if (N > 1024 && n_simds > 4) return N <= 8192 ? 128 : N <= 32768 ? 256 : N <= 65536 ? 512 : 1024;
+    return 64;
+}
+
+// attention.metal KVLayout
+struct KVLayout {
+    uint64_t unit;
+    int T, n_kv_heads, g;
+};
 
 static std::runtime_error error(const std::string& what, NSError* err) {
     return std::runtime_error(what + (err ? std::string(": ") + err.localizedDescription.UTF8String : ""));
 }
 
-id<MTLComputePipelineState> GpuOps::pipeline(NSString* name) {
-    id<MTLFunction> f = [library newFunctionWithName:name];
-    if (!f) throw error(std::string("no kernel ") + name.UTF8String + " in " + METALLIB, nil);
+id<MTLComputePipelineState> GpuOps::pipeline(NSString* name, MTLFunctionConstantValues* constants) {
     NSError* err = nil;
+    id<MTLFunction> f = constants ? [library newFunctionWithName:name constantValues:constants error:&err]
+                                  : [library newFunctionWithName:name];
+    if (!f) throw error(std::string("no kernel ") + name.UTF8String + " in " + METALLIB, err);
     id<MTLComputePipelineState> ps = [device newComputePipelineStateWithFunction:f error:&err];
     if (!ps) throw error(std::string("pipeline ") + name.UTF8String, err);
     return ps;
 }
 
-GpuOps::GpuOps(Memory& mem, const Weights& weights, int max_rows)
-    : spec(mem.spec), device(mem.device), max_rows(max_rows) {
+// bool function constants (index, value)
+id<MTLComputePipelineState> GpuOps::pipeline(NSString* name, std::initializer_list<std::pair<int, bool>> constants) {
+    MTLFunctionConstantValues* fc = [MTLFunctionConstantValues new];
+    for (auto [i, v] : constants) [fc setConstantValue:&v type:MTLDataTypeBool atIndex:i];
+    return pipeline(name, fc);
+}
+
+GpuOps::GpuOps(Memory& mem, const Weights& weights, int max_rows, int max_ctx)
+    : spec(mem.spec), mem(mem), device(mem.device), max_rows(max_rows), max_ctx(max_ctx) {
     // MLX picks kernels and tile sizes by GPU generation. Only the M4 family's branch (gen 15/16, not a 'd' Max/Ultra
     // die) is copied below. ponytail: port the other branches of quantized.cpp when another GPU shows up.
     NSString* arch = device.architecture.name;
@@ -51,6 +82,34 @@ GpuOps::GpuOps(Memory& mem, const Weights& weights, int max_rows)
     precise_swiglu_ps = pipeline(@"precise_swiglu");
     split_q_gate_ps = pipeline(@"split_q_gate");
 
+    // full attention: kernel names fix head_dim 256 (bf16)
+    if (!spec.full_layers().empty() && spec.head_dim != 256)
+        throw std::runtime_error("GpuOps: attention kernels instantiated for head_dim 256 only");
+    rope_ps = pipeline(@"rope_bfloat16", {{1, true}, {2, false}, {3, false}});  // forward, traditional, hs_transpose
+    write_kv_ps = pipeline(@"write_kv_bfloat16_256");
+    sdpa_ps = pipeline(@"sdpa_vector_paged_bfloat16_256");
+    sdpa_2pass_1[0] = pipeline(@"sdpa_vector_2pass_1_paged_bfloat16_256");
+    sdpa_2pass_1[1] = pipeline(@"sdpa_vector_2pass_1_paged_bfloat16_256_tk1");
+    sdpa_2pass_2 = pipeline(@"sdpa_vector_2pass_2_bfloat16_256");
+    sigmoid_gate_ps = pipeline(@"sigmoid_gate");
+    gather_kv_ps = pipeline(@"gather_kv_bfloat16_256");
+    causal_mask_ps = pipeline(@"causal_mask");
+    scale_ps = pipeline(@"scale_bf16");
+    softmax_ps[0] = pipeline(@"block_softmax_precise_bfloat16");
+    softmax_ps[1] = pipeline(@"looped_softmax_precise_bfloat16");
+    for (int nv = 0; nv < 2; nv++)
+        for (int kl = 0; kl < 2; kl++)  // has_batch, do_axpby
+            gemv_wide_ps[nv][kl] = pipeline([NSString stringWithFormat:@"gemv_wide_bfloat16_nv%d_kl%d", 4 + nv, 16 << kl],
+                                            {{0, true}, {1, false}});
+    for (int nn = 0; nn < 2; nn++)
+        for (int am = 0; am < 2; am++)
+            for (int an = 0; an < 2; an++)
+                for (int ak = 0; ak < 2; ak++)  // has_batch, use_out_source, do_axpby, align_M, align_N, align_K
+                    steel_ps[nn][am][an][ak] = pipeline(
+                        nn ? @"steel_gemm_fused_nn_bfloat16_bfloat16_bm64_bn64_bk16_wm2_wn2"
+                           : @"steel_gemm_fused_nt_bfloat16_bfloat16_bm64_bn64_bk16_wm2_wn2",
+                        {{10, true}, {100, false}, {110, false}, {200, am}, {201, an}, {202, ak}});
+
     auto buf = [&](const std::string& name) {
         auto v = weights[name];
         return Buf{v.buffer, v.offset};
@@ -68,10 +127,11 @@ GpuOps::GpuOps(Memory& mem, const Weights& weights, int max_rows)
     const std::string P = "language_model.model.";
     embed_tokens = qlinear(P + "embed_tokens");
     norm = buf(P + "norm.weight");
-    for (int i = 0; i < spec.n_layers(); i++) {
+    for (int i = 0, n_full = 0; i < spec.n_layers(); i++) {
         std::string p = P + "layers." + std::to_string(i) + ".";
         Layer l{};
         l.is_linear = spec.kinds[i] == "linear";
+        if (!l.is_linear) l.g = n_full++;
         l.input_layernorm = buf(p + "input_layernorm.weight");
         l.post_attention_layernorm = buf(p + "post_attention_layernorm.weight");
         l.gate_proj = qlinear(p + "mlp.gate_proj");
@@ -102,6 +162,16 @@ GpuOps::GpuOps(Memory& mem, const Weights& weights, int max_rows)
     u = mem.buffer(row * layers[0].gate_proj.N);
     qg = mem.buffer(row * 2 * spec.n_heads * spec.head_dim);
     splitk = mem.buffer(512 * 32 * 32 * sizeof(float));  // split_k * M * N <= 512 tiles of 32 x 32 (see linear)
+    const size_t H = spec.n_heads, D = spec.head_dim, gqa = H / spec.n_kv_heads;
+    ao = mem.buffer(row * H * D);
+    // 2-pass partials: decode (max_rows rows, 64 blocks) or one row of up to 8 queries at max_ctx keys
+    size_t q8 = std::min(8, max_rows), n_part = std::max(max_rows * H * 64, q8 * H * sdpa_blocks(max_ctx, gqa * q8));
+    partials = mem.buffer(n_part * D * ELEM);
+    sums = mem.buffer(n_part * sizeof(float));
+    maxs = mem.buffer(n_part * sizeof(float));
+    kc = mem.buffer(spec.n_kv_heads * (size_t)max_ctx * D * ELEM);
+    vc = mem.buffer(spec.n_kv_heads * (size_t)max_ctx * D * ELEM);
+    scores = mem.buffer(row * H * max_ctx);
 }
 
 void GpuOps::begin() {
@@ -246,6 +316,145 @@ void GpuOps::dense(int i, Workspace& ws) {
     linear(l.k_proj, {xn}, {ws.k}, M);
     rms_norm(l.k_norm, {ws.k}, {ws.k}, M * spec.n_kv_heads, D);
     linear(l.v_proj, {xn}, {ws.v}, M);
+}
+
+// mlx Matmul::eval_gpu for the fallback's two matmuls (matmul.cpp): batch [Hkv, gqa] never collapses (the repeat
+// stride of K/V is 0), 8 batches rule out split-k, so: gemv_wide when transposed B and 2 <= M <= 15, else
+// steel_matmul_regular_axpby with the 's' tiles (GEMM_TPARAM_MACRO: bm 64, bn 64, bk 16, wm 2, wn 2).
+void GpuOps::matmul(bool transpose_b, Buf a, Buf b, Buf d, int M, int N, int K, int lda, int ldb, int ldd,
+                    const int64_t a_bs[2], const int64_t b_bs[2], int64_t d_bs) {
+    const int batch_shape[2] = {spec.n_kv_heads, spec.n_heads / spec.n_kv_heads}, batches = spec.n_heads;
+    int passes = (M + 4) / 5;
+    if (transpose_b && M >= 2 && passes <= 3 && K % 4 == 0) {  // gemv_wide_config (gen >= 15, aligned)
+        assert(d_bs == (int64_t)M * N);                         // gemv_wide writes [batch, M, N] densely
+        int vecs = (M + passes - 1) / passes, k_lanes = passes == 1 || N <= 64 ? 32 : 16;
+        assert(vecs == 4 || vecs == 5);  // M 9..15: the fallback runs only above 8 queries
+        [enc setComputePipelineState:gemv_wide_ps[vecs - 4][k_lanes == 32]];
+        set(enc, b, 0), set(enc, a, 1), set(enc, d, 3);
+        set_bytes(enc, K, 4), set_bytes(enc, N, 5), set_bytes(enc, M, 6), set_bytes(enc, ldb, 7), set_bytes(enc, lda, 8);
+        set_bytes(enc, 2, 11);
+        [enc setBytes:batch_shape length:sizeof batch_shape atIndex:12];
+        [enc setBytes:a_bs length:2 * sizeof(int64_t) atIndex:13];
+        [enc setBytes:b_bs length:2 * sizeof(int64_t) atIndex:14];
+        [enc dispatchThreadgroups:MTLSizeMake(N >= 65536 ? 1 : passes, (N + 3) / 4, batches)
+            threadsPerThreadgroup:MTLSizeMake(32, k_lanes / 8, 1)];
+        return;
+    }
+    const int bm = 64, bn = 64, bk = 16;
+    [enc setComputePipelineState:steel_ps[!transpose_b][M % bm == 0][N % bn == 0][K % bk == 0]];
+    const int tn = (N + bn - 1) / bn, tm = (M + bm - 1) / bm;
+    mlx::steel::GEMMParams params{M, N, K, lda, ldb, ldd, tn, tm, a_bs[1], b_bs[1], d_bs, 0, K / bk, 2};
+    const int64_t strides[4] = {a_bs[0], a_bs[1], b_bs[0], b_bs[1]};
+    set(enc, a, 0), set(enc, b, 1), set(enc, d, 3), set_bytes(enc, params, 4);
+    [enc setBytes:batch_shape length:sizeof batch_shape atIndex:6];
+    [enc setBytes:strides length:sizeof strides atIndex:7];
+    [enc dispatchThreadgroups:MTLSizeMake(tn, tm, batches) threadsPerThreadgroup:MTLSizeMake(32, 2, 2)];
+}
+
+void GpuOps::attn(int i, Workspace& ws) {
+    assert(i >= 0 && i < spec.n_layers());
+    if (layers[i].is_linear) throw std::logic_error("GpuOps::attn: linear layers not ported yet");
+    full_attn(layers[i], ws);
+}
+
+// gpu.py _full, batched: one dispatch per op over all rows. MLX v0.32.4 ops in Python's order: fast::rope on q and k,
+// write_kv, fast::scaled_dot_product_attention (sdpa_vector / 2-pass for q length <= 8), * sigmoid(gate).
+// Lane contract: Python's GPU path never pads, and MLX picks kernels by q length, so ws.S is the row's n_valid when
+// B == 1 (prefill; g6's ANE lane converts its padded output to n rows before attn). B > 1 is decode: S == 1, rows
+// with n == 0 are skipped.
+void GpuOps::full_attn(const Layer& l, Workspace& ws) {
+    const int B = ws.B, S = ws.S, H = spec.n_heads, Hkv = spec.n_kv_heads, D = spec.head_dim, gqa = H / Hkv;
+    id<MTLBuffer> table = ws.table;
+    const uint32_t* tb = (const uint32_t*)table.contents;  // the CPU wrote it this step
+    assert((int)tb[0] == B && B * S <= max_rows && (B == 1 || S == 1));
+    int min_N = INT_MAX, max_N = 0;
+    for (int b = 0; b < B; b++) {
+        int pos = tb[1 + b], n = tb[1 + B + b], N = pos + n;
+        assert((B == 1 ? n == S : n <= S) && N <= max_ctx && tb[2 + 2 * B + b] - tb[1 + 2 * B + b] >= mem.units_for(N));
+        if (n) min_N = std::min(min_N, N), max_N = std::max(max_N, N);
+    }
+    if (!max_N) return;
+
+    // mlx fast::rope (rope.cpp), in place: the first ROPE_DIMS of each head rotate, the rest stays (MLX copies it).
+    // Batched kernel "rope_bfloat16", per-row offsets = the table's pos words.
+    auto rope = [&](id<MTLBuffer> x, int heads) {
+        [enc setComputePipelineState:rope_ps];
+        set(enc, {x}, 0), set(enc, {x}, 1), set(enc, {table, 4}, 2), set_bytes(enc, 1.0f, 3);
+        int64_t strides[3] = {D, (int64_t)heads * D, 1};
+        [enc setBytes:strides length:sizeof strides atIndex:4];
+        [enc setBytes:strides length:sizeof strides atIndex:5];
+        set_bytes(enc, (int64_t)1, 6), set_bytes(enc, heads, 7), set_bytes(enc, std::log2(ROPE_THETA), 10);
+        [enc dispatchThreads:MTLSizeMake(ROPE_DIMS / 2, S, B * ((heads + 3) / 4)) threadsPerThreadgroup:MTLSizeMake(32, 1, 1)];
+    };
+    rope(ws.q, H);
+    rope(ws.k, Hkv);
+
+    KVLayout L{mem.arena.unit_bytes / ELEM, mem.T, Hkv, l.g};
+    id<MTLBuffer> arena = mem.arena_buffer;
+    [enc setComputePipelineState:write_kv_ps];
+    set(enc, {ws.k}, 0), set(enc, {ws.v}, 1), set(enc, {arena}, 2), set(enc, {table}, 3);
+    set_bytes(enc, L, 4), set_bytes(enc, S, 5);
+    [enc dispatchThreads:MTLSizeMake(D, Hkv, B * S) threadsPerThreadgroup:MTLSizeMake(D, 1, 1)];
+    // serial encoder: dispatch order is the sync (the arena is untracked). ponytail: a concurrent encoder needs
+    // barriers at rope -> write_kv -> sdpa, 2pass_1 -> 2pass_2 -> 1-pass overwrite, gather -> GEMMs, and each GEMM
+    // / mask / softmax step.
+
+    const float scale = 1.0f / std::sqrt((float)D);  // mlx-lm: head_dim ** -0.5
+    if (S <= 8) {  // MLX: sdpa_vector, 2-pass from SDPA_2PASS_KEYS keys. Rows pick their path by N = pos + n.
+        if (max_N >= SDPA_2PASS_KEYS) {
+            const int blocks = sdpa_blocks(max_N, gqa * S);
+            assert((size_t)B * H * S * blocks <= sums.length / sizeof(float));
+            id<MTLComputePipelineState> ps = sdpa_2pass_1[32 * gqa * S > (int)sdpa_2pass_1[0].maxTotalThreadsPerThreadgroup];
+            [enc setComputePipelineState:ps];
+            set(enc, {ws.q}, 0), set(enc, {arena}, 1), set(enc, {partials}, 3), set(enc, {sums}, 4), set(enc, {maxs}, 5);
+            set(enc, {table}, 6), set_bytes(enc, L, 7), set_bytes(enc, SDPA_2PASS_KEYS, 8), set_bytes(enc, INT_MAX, 9);
+            set_bytes(enc, blocks, 11), set_bytes(enc, scale, 12);
+            [enc dispatchThreadgroups:MTLSizeMake(Hkv, B, blocks) threadsPerThreadgroup:MTLSizeMake(32, gqa, S)];
+            // over every row; the 1-pass below then overwrites the rows that are not on this path
+            [enc setComputePipelineState:sdpa_2pass_2];
+            set(enc, {partials}, 0), set(enc, {sums}, 1), set(enc, {maxs}, 2), set(enc, {ao}, 3), set_bytes(enc, blocks, 4);
+            [enc dispatchThreadgroups:MTLSizeMake(B * H, S, 1) threadsPerThreadgroup:MTLSizeMake(1024, 1, 1)];
+        }
+        if (min_N < SDPA_2PASS_KEYS) {
+            [enc setComputePipelineState:sdpa_ps];
+            set(enc, {ws.q}, 0), set(enc, {arena}, 1), set(enc, {ao}, 3), set_bytes(enc, gqa, 4), set(enc, {table}, 5);
+            set_bytes(enc, L, 6), set_bytes(enc, 0, 7), set_bytes(enc, SDPA_2PASS_KEYS, 8), set_bytes(enc, scale, 10);
+            [enc dispatchThreadgroups:MTLSizeMake(B * H, S, 1) threadsPerThreadgroup:MTLSizeMake(1024, 1, 1)];
+        }
+    } else {  // MLX's unfused fallback (fast.cpp; use_fallback: head_dim 256, q length > 8), row 0 only
+        assert(B == 1);
+        const int n = S, kL = max_N;
+        // ponytail: MLX v0.32.4 runs fused steel attention for n >= 2048 == kL (no prefix); not ported (chunks are
+        // <= 512). Port it if a lane sends such a chunk.
+        assert(!(n >= 2048 && kL == n));
+        [enc setComputePipelineState:gather_kv_ps];
+        set(enc, {arena}, 0), set(enc, {kc}, 1), set(enc, {vc}, 2), set(enc, {table}, 3), set_bytes(enc, L, 4);
+        [enc dispatchThreads:MTLSizeMake(D, kL, Hkv) threadsPerThreadgroup:MTLSizeMake(D, 1, 1)];
+        [enc setComputePipelineState:scale_ps];
+        set(enc, {ws.q}, 0), set_bytes(enc, scale, 1);
+        [enc dispatchThreads:MTLSizeMake((size_t)n * H * D, 1, 1) threadsPerThreadgroup:MTLSizeMake(256, 1, 1)];
+        // scores [H, n, kL] = q kᵀ; q is our [n, H, D], (kv head, repeat) -> head kv * gqa + repeat
+        const int64_t q_bs[2] = {(int64_t)gqa * D, D}, kv_bs[2] = {(int64_t)kL * D, 0};
+        matmul(true, {ws.q}, {kc}, {scores}, n, kL, D, H * D, D, kL, q_bs, kv_bs, (int64_t)n * kL);
+        [enc setComputePipelineState:causal_mask_ps];
+        set(enc, {scores}, 0), set(enc, {table}, 1);
+        [enc dispatchThreads:MTLSizeMake(kL, n, H) threadsPerThreadgroup:MTLSizeMake(std::min(kL, 256), 1, 1)];
+        // softmax(precise=True), in place (softmax.cpp)
+        const bool looped = kL > 4096;
+        id<MTLComputePipelineState> sm = softmax_ps[looped];
+        size_t tg = looped ? sm.maxTotalThreadsPerThreadgroup : 32 * (((kL + 3) / 4 + 31) / 32);
+        assert(tg <= sm.maxTotalThreadsPerThreadgroup);
+        [enc setComputePipelineState:sm];
+        set(enc, {scores}, 0), set(enc, {scores}, 1), set_bytes(enc, kL, 2);
+        [enc dispatchThreads:MTLSizeMake((size_t)H * n * tg, 1, 1) threadsPerThreadgroup:MTLSizeMake(tg, 1, 1)];
+        // ao [H, S, D] = p v
+        const int64_t p_bs[2] = {(int64_t)gqa * n * kL, (int64_t)n * kL};
+        matmul(false, {scores}, {vc}, {ao}, n, D, kL, kL, D, D, p_bs, kv_bs, (int64_t)S * D);
+    }
+
+    [enc setComputePipelineState:sigmoid_gate_ps];
+    set(enc, {ao}, 0), set(enc, {ws.gate}, 1), set(enc, {ws.o}, 2), set_bytes(enc, S, 3);
+    [enc dispatchThreads:MTLSizeMake(D, H, B * S) threadsPerThreadgroup:MTLSizeMake(D, 1, 1)];
 }
 
 }  // namespace mllm

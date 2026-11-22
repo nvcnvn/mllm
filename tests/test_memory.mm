@@ -6,6 +6,7 @@
 #include <sys/wait.h>
 #include <unistd.h>
 
+#include <algorithm>
 #include <cassert>
 #include <csignal>
 #include <fstream>
@@ -170,9 +171,9 @@ int main() {
         for (uint64_t inflight = signaled + 1; inflight < step; inflight++) assert(w != tables.copies[inflight % 2]);
         a.retire(signaled);
         if (a.admit(1)) held.push_back(a.alloc());
-        uint32_t* t = (uint32_t*)w.contents;  // one row holding every unit allocated so far
-        t[0] = 1, t[1] = 0, t[2] = (uint32_t)held.size();
-        std::copy(held.begin(), held.end(), t + 3);
+        tables.write(w, {{0, 1, held}});  // one row holding every unit allocated so far
+        const uint32_t* t = (const uint32_t*)w.contents;
+        assert(t[0] == 1 && t[3] == 0 && t[4] == held.size() && std::equal(held.begin(), held.end(), t + 5));
         if (step % 10 == 0) {
             a.committed = step;
             a.release(held);

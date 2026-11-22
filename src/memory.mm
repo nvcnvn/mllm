@@ -123,6 +123,24 @@ id<MTLBuffer> StepTables::begin(uint64_t step, uint64_t signaled) {
     return copies[step % 2];
 }
 
+void StepTables::write(id<MTLBuffer> table, const std::vector<Row>& rows) const {
+    const uint32_t R = (uint32_t)rows.size();
+    size_t n_slots = 0;
+    for (const Row& r : rows) n_slots += r.slots.size();
+    assert(2 + 3 * R + n_slots <= words && table.length >= words * 4);
+    uint32_t* t = (uint32_t*)table.contents;
+    t[0] = R;
+    uint32_t* off = t + 1 + 2 * R;
+    off[0] = 0;
+    for (uint32_t b = 0; b < R; b++) {
+        assert(rows[b].pos >= 0 && rows[b].n >= 0);
+        for (uint32_t s : rows[b].slots) assert(s < n_units);
+        t[1 + b] = rows[b].pos, t[1 + R + b] = rows[b].n;
+        off[b + 1] = off[b] + (uint32_t)rows[b].slots.size();
+        std::copy(rows[b].slots.begin(), rows[b].slots.end(), off + R + 1 + off[b]);
+    }
+}
+
 // memory.py: a unit is one KV page (T tokens) of every full layer, rounded up to the OS page.
 static size_t unit_of(const ModelSpec& s, int T) {
     size_t kv = s.full_layers().size() * 2 * s.n_kv_heads * T * s.head_dim * ELEM;
@@ -192,8 +210,8 @@ Workspace Memory::workspace(int chunk, int max_batch) {
 StepTables Memory::step_tables(int max_rows) {
     // ponytail: slot words <= n_units while no unit is shared; the prefix cache lets rows share units, then size
     // by the sum of the rows' slot counts.
-    size_t words = 1 + (max_rows + 1) + arena.n_units;
-    return {{buffer(words * 4), buffer(words * 4)}, words};
+    size_t words = 2 + 3 * (size_t)max_rows + arena.n_units;
+    return {{buffer(words * 4), buffer(words * 4)}, words, arena.n_units};
 }
 
 }  // namespace mllm

@@ -21,7 +21,7 @@ int main() {
     mllm::Memory mem(s, dev, 64 << 20);
     int chunk = g["chunk"].get<int>(), max_batch = 2;
     mllm::Workspace ws = mem.workspace(chunk, max_batch);
-    mllm::GpuOps ops(mem, w, std::max(chunk, max_batch));
+    mllm::GpuOps ops(mem, w, std::max(chunk, max_batch), 64);
     mem.freeze();
 
     std::map<std::string, id<MTLBuffer>> field = {{"x", ws.x}, {"q", ws.q}, {"k", ws.k}, {"v", ws.v},

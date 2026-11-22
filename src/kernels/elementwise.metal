@@ -39,3 +39,24 @@
   q[dst] = qg[src];
   gate[dst] = qg[src + n.x];
 }
+
+// gpu.py: o.transpose(0, 2, 1, 3).reshape(B, S, H * D) * mx.sigmoid(gate), each op rounded to bf16 as MLX does.
+// ao [B, H, S, D] -> o [B, S, H * D]. Grid (D, H, B * S).
+[[kernel]] void sigmoid_gate(
+    const device bfloat16_t* ao [[buffer(0)]],
+    const device bfloat16_t* gate [[buffer(1)]],
+    device bfloat16_t* o [[buffer(2)]],
+    const constant int& S [[buffer(3)]],
+    uint3 i [[thread_position_in_grid]],
+    uint3 n [[threads_per_grid]]) {
+  ulong b = i.z / S, s = i.z % S;
+  ulong src = ((b * n.y + i.y) * S + s) * n.x + i.x, dst = (ulong(i.z) * n.y + i.y) * n.x + i.x;
+  bfloat16_t g = Sigmoid{}(gate[dst]);
+  o[dst] = Multiply{}(ao[src], g);
+}
+
+// mlx fast.cpp SDPA fallback: q = multiply(array(scale, bf16), q). In place.
+[[kernel]] void scale_bf16(device bfloat16_t* x [[buffer(0)]], const constant float& scale [[buffer(1)]],
+                           uint i [[thread_position_in_grid]]) {
+  x[i] = Multiply{}(static_cast<bfloat16_t>(scale), x[i]);
+}
