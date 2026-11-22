@@ -55,13 +55,13 @@ Each item is checked against the golden data for its layer. The goal is matching
 - [x] `mllm bench-ops`: time per op at decode B = 1/8/16 and prefill S = 512. **Check:** listed next to the roofline. Any op below about 70% of its bound gets a note.
 
 ## 5. `lanes` and `engine` (GPU only)
-- [ ] `DecodeLane`: one command buffer per step, `MTLSharedEvent` signaled with the step number, `submit` / `poll` / `can_submit`, at most one step ahead.
-- [ ] `PrefillLane` on its own `MTLCommandQueue`: `submit` / `poll` / `busy`.
-- [ ] Pending reclaim: a unit freed while a step may still read it returns only after the event passes that step.
-- [ ] `engine.h/.cpp`, a 1:1 port of `engine.py`: `submit` / `step` / `cancel` / `generate`, FIFO admission, abort with token −1 when a lane fails, an event queue per request.
-- [ ] **Check (`tests/test_engine`):** the same cases as `py/test_engine.py`. 3 prompts × 64 greedy tokens equal golden, solo, batched, and waiting on a one-request arena. Cancel and abort return every unit.
-- [ ] `mllm generate MODEL PROMPT` and `mllm bench -p -g -b -n`, printing the same fields as `mlx_lm.benchmark`.
-- [ ] **Check (speed):** the same rows as [reports/mlx-lm baseline.md](../reports/mlx-lm%20baseline.md), recorded next to them. Targets: decode B=1 ≥ 300 tok/s, B=16 ≥ 1,064 tok/s; GPU prefill at 512 tokens ≥ 5,000 tok/s.
+- [x] `DecodeLane`: one command buffer per step, `MTLSharedEvent` signaled with the step number, `submit` / `poll` / `can_submit`, at most one step ahead.
+- [x] `PrefillLane` on its own `MTLCommandQueue`: `submit` / `poll` / `busy`.
+- [x] Pending reclaim: a unit freed while a step may still read it returns only after the event passes that step.
+- [x] `engine.h/.cpp`, a 1:1 port of `engine.py`: `submit` / `step` / `cancel` / `generate`, FIFO admission, abort with token −1 when a lane fails, an event queue per request.
+- [x] **Check (`tests/test_engine`):** the same cases as `py/test_engine.py`. 3 prompts × 64 greedy tokens equal golden, solo, batched, and waiting on a one-request arena. Cancel and abort return every unit.
+- [x] `mllm generate MODEL PROMPT` and `mllm bench -p -g -b -n`, printing the same fields as `mlx_lm.benchmark`.
+- [x] **Check (speed):** the same rows as [reports/mlx-lm baseline.md](../reports/mlx-lm%20baseline.md), recorded next to them. Targets: decode B=1 ≥ 300 tok/s, B=16 ≥ 1,064 tok/s; GPU prefill at 512 tokens ≥ 5,000 tok/s. *Result: prefill ≥ 5,000 at 512 and decode B=16 ≥ 1,064 met; decode B=1 is 295–299, just under 300 (see the report).*
 
 ## 6. `ane`
 - [ ] Load the cached `.mlmodelc` for each dense block (`MLModel`, compute units CPU + NE). If a block is missing, tell the user to build it with `py/test_ane.py` / `ane.py`. **Check:** loads all 24 blocks for S = 512.
