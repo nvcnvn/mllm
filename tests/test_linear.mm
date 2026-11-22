@@ -12,7 +12,7 @@
 #include <string>
 
 #include "golden.h"
-#include "gpu.h"
+#include "lanes.h"
 
 static double max_diff(const std::string& dtype, const uint8_t* got, const uint8_t* want, size_t n) {
     if (!memcmp(got, want, n * (dtype == "F32" ? 4 : 2))) return 0;
@@ -33,8 +33,9 @@ int main() {
     mllm::Weights w(s.path, dev);
     mllm::Memory mem(s, dev, 256 << 20);
     const int chunk = g["chunk"], max_batch = 5, rows_max = std::max(chunk, max_batch);
-    mllm::Workspace ws = mem.workspace(chunk, max_batch);
-    mllm::GpuOps ops(mem, w, rows_max, 1024);
+    mllm::GpuOps ops(mem, w);
+    mllm::Workspace ws = ops.workspace(chunk, max_batch, 1024);
+    id<MTLCommandQueue> q = [dev newCommandQueue];
     mllm::StepTables tables = mem.step_tables(rows_max);
     mem.freeze();
     id<MTLBuffer> table = ws.table = tables.copies[0];
@@ -125,9 +126,9 @@ int main() {
             load(pre + "dense/qkv", ws.qkv, src), load(pre + "dense/z", ws.z, src);
             load(pre + "dense/b", ws.b, src), load(pre + "dense/a", ws.a, src);
             @autoreleasepool {
-                ops.begin();
-                ops.attn(li, ws);
-                ops.commit_and_wait();
+                mllm::encode_and_wait(q, ws, [&] {
+                    ops.attn(li, ws);
+                });
             }
             const mllm::Tensor& o = tr.at(pre + "attn/o");
             const uint8_t* got = (const uint8_t*)ws.o.contents;

@@ -63,6 +63,16 @@ struct Workspace {
     id<MTLBuffer> logits;  // [max_batch, vocab]
     int B = 0, S = 0;      // tokens' shape this step (the lane sets it); dense ops work on B * S rows
     id<MTLBuffer> table;   // this step's StepTables copy, row b = workspace row b (the lane sets it; attn reads it)
+    id<MTLComputeCommandEncoder> enc;  // GpuOps encodes into it (the lane sets it; serial: dispatch order is the sync)
+    int rows = 0, max_ctx = 0;         // capacity: B * S <= rows, pos + n <= max_ctx
+
+    // GpuOps' scratch (GpuOps::workspace allocates it), one set per workspace so lanes on two queues never share:
+    // [rows, ...] bf16: h (residual after attn), xn (normed), t (projection out), g / u (MLP), qg (q_proj out);
+    // splitk: qmm_t_splitk's fp32 partial sums. Attention: ao (attention out, MLX's [B, H, S, D]); partials / sums /
+    // maxs (sdpa 2-pass); kc / vc (prefill: the row's K/V gathered, [Hkv, max_ctx, D]); scores [H, rows, max_ctx].
+    // Linear attention: nqkv (normed q / k, [rows, conv_dim]), gdn_g (fp32) / beta [rows, Hv].
+    // ids: lm_head's argmax per row (int32), read by sample after the command buffer completed.
+    id<MTLBuffer> h, xn, t, g, u, qg, splitk, ao, partials, sums, maxs, kc, vc, scores, nqkv, gdn_g, beta, ids;
 };
 
 // Per-step uint32 slot lists the GPU reads, 2 copies by step parity (memory-design "Step tables").
@@ -96,7 +106,7 @@ public:
 
     Workspace workspace(int chunk, int max_batch);
     StepTables step_tables(int max_rows);
-    // ponytail: the engine calls this periodically so the OS keeps the arena wired (g5 owns the timer).
+    // The engine calls this periodically so the OS keeps the arena and weights wired.
     void request_residency() { [residency requestResidency]; }
 
     id<MTLBuffer> buffer(size_t bytes, MTLResourceOptions options = MTLResourceStorageModeShared);  // every allocation
@@ -111,9 +121,10 @@ public:
     uint32_t state_units;
     int allocations = 0;
 
+    id<MTLResidencySet> residency;  // the arena; the engine adds the weights and attaches it to the lanes' queues
+
 private:
     std::vector<size_t> state_off;  // per layer; linear layers only
-    id<MTLResidencySet> residency;
     bool frozen = false;
 };
 

@@ -82,8 +82,8 @@ Your `attn()` / `ffn()` split, cut where the hardware cuts:
 | Weights | `mlx_lm.load()` modules; compiled Core ML model per dense block, cached under `/Volumes/T5/cache/mllm/ane/<model>/S<chunk>_<format>/` | `mmap` + `newBufferWithBytesNoCopy`, Core ML compiled models |
 | Arena storage | one numpy `uint8` array `[N, unit_bytes]`, with typed views per object: KV units as fp16 `[G, 2, kv_heads, T, head_dim]` (same bytes as `offset_in_unit`, so it checks the layout), state units as fp32 | one untracked `MTLBuffer` in a residency set |
 | Arena bookkeeping | Python class with the exact API: `admit(n)`, `alloc()`, `release(slot)`, `retire(step)` | C++ class (memory-design build step 2), unit-tested on its own ([cpp-port.md](cpp-port.md) §3) |
-| Workspace | object with named fields (`x`, `q`, `k`, `v`, `a`, `logits`) holding MLX/numpy arrays; ops reassign them | fixed `MTLBuffer`s; ANE in/out are IOSurfaces read by Metal without a copy |
-| Step tables | the slot lists inside each work item | 2 `MTLBuffer`s, alternated by step parity |
+| Workspace | object with named fields (`x`, `q`, `k`, `v`, `a`, `logits`) holding MLX/numpy arrays; ops reassign them | fixed `MTLBuffer`s, plus every scratch buffer `GpuOps` writes during a step (argmax `ids`, attention partials, split-k, linear-attn temporaries), so lanes on two queues never share one; `ws.enc` is the lane's current encoder. Each lane owns its workspaces: prefill one (sized for the chunk), decode two (by step parity). ANE in/out are IOSurfaces read by Metal without a copy |
+| Step tables | the slot lists inside each work item | 2 `MTLBuffer`s per lane, alternated by step parity |
 
 Ops receive the workspace and read and write its named fields. That gives both languages the same call shape. Python's `ws.q = ...` becomes C++ writing into `ws.q`'s buffer.
 
@@ -121,14 +121,14 @@ step():
 ### Concurrency
 | | Python | C++ |
 |---|---|---|
-| Engine | caller's thread | one thread |
-| PrefillLane | runs inside `submit` | own thread (Core ML `predict` blocks) + own `MTLCommandQueue` for `attn` |
-| DecodeLane | runs inside `submit`, `mx.eval` per step | main `MTLCommandQueue`, one command buffer per step, `MTLSharedEvent` per step, at most one step ahead |
+| Engine | caller's thread | one thread (`engine.mm`); both GPU lanes live on it, no lane threads. A `step()` with nothing to poll or submit blocks on the oldest lane event (decode's if one runs) |
+| PrefillLane | runs inside `submit` | GPU: own `MTLCommandQueue`, one chunk in flight; `submit` encodes and commits, `poll` reads the lane's `MTLSharedEvent` (never blocks). The ANE lane adds a thread (Core ML `predict` blocks) |
+| DecodeLane | runs inside `submit`, `mx.eval` per step | own `MTLCommandQueue`, one command buffer per step, one `MTLSharedEvent` signaled with step + 1; up to 2 steps in flight, ordered by an `MTLFence` (defensive: a fed step already reads the previous step's tracked `ids`). Not while a sampled row decodes: then all rows step together, one step in flight. Greedy rows of step N + 1 take step N's argmax on the GPU (`GpuOps::feed_tokens`); sampled rows wait for the CPU |
 
 - The two lanes write disjoint units: a request is in one lane at a time. So the two GPU queues need no ordering between them.
 - A request moves PREFILL → DECODE only after `prefill.poll()` returns its last chunk, which means its GPU writes have completed.
 - Units freed by decode go through `pending` (memory-design), because the next step is already encoded. Prefill units are freed only after `poll()`: an aborted request waits for its chunk to finish.
-- In Python, prefill and decode do not overlap. The structure is there, and the overlap arrives with the C++ lanes.
+- In Python, prefill and decode do not overlap. In C++ they overlap on the GPU through the two queues.
 
 ## Files
 ```
@@ -143,6 +143,7 @@ Python reuses mlx-lm wherever it can: `mlx_lm.load` for weights and the GPU dens
 - `py/test_engine.py`: with GPU-only prefill, greedy 64 tokens on a fixed prompt must equal `mlx_lm.generate` on the same weights. The arena layout and the `prompt[:-1]` trick are then proven against a reference.
 - `py/test_ane.py [fp16|int8|lut6|lut4]`: ANE prefill and GPU prefill write the same prompt into separate units. Every full layer's K/V and every linear layer's conv and recurrent state must reach cosine ≥ 0.999 (fp16) or ≥ 0.99 (compressed formats). Then greedy decode after ANE prefill is compared with mlx-lm.
 - The arena bookkeeping gets its own unit test (memory-design build step 2). Python and C++ run the same test cases.
+- Greedy batched output equals solo only away from near-ties: at batch ≥ 2 the matmuls run other kernels (`qmv_wide` / split-k instead of `qmv_fast` at M=1) that round differently, so near-tied top-2 tokens can flip, as in MLX itself (QA: 11 divergences, all with MLX's top-2 within 0–2 bf16 ulps). The golden batched check passes because its prompts have no such tie.
 
 ## Build order
 1. `spec`, `tokenizer`, `engine`, both lanes GPU-only, `attn` over the numpy arena for both layer kinds of the first model: full attention (K/V pages) and Gated DeltaNet (state slot). Pass the mlx-lm match on Qwen3.5-0.8B. **Done (2026-11-22, `py/test_engine.py`): bit-exact with mlx-lm greedy for 3 prompts × 64 tokens, solo and batched, and with requests waiting on a one-request arena. Unit 384 KiB, state slot 50 units (~19.5 MiB per request).** The basic arena bookkeeping from step 2 (`admit` / `alloc` / `release`) is already in, without refcounts or `pending`.
@@ -173,7 +174,7 @@ Python reuses mlx-lm wherever it can: `mlx_lm.load` for weights and the GPU dens
 | Sliding-window `attn` kind (window pages) | Running Gemma 4 or another sliding-window model |
 | HTTP / OpenAI-style server | Something other than a function call needs to send prompts |
 | C++ tokenizer choice (HF `tokenizers` via tokenizers-cpp, or our own BPE + minja for templates) | C++ port reaches `tokenizer` |
-| GPU-side token feedback (decode encodes > 1 step ahead) | Per-token CPU round trip shows up in the decode profile |
+| ~~GPU-side token feedback~~ Done for greedy rows (one step ahead, g5). Sampled rows (temp > 0) still wait for the CPU each step: sampling on the GPU | Sampled decode is the hot path |
 
 ## First model
 **Qwen3.5 / 3.6.** Develop on Qwen3.5-0.8B or 2B, then run the target, Qwen3.6-27B. They share one architecture (mlx-lm `qwen3_5`):

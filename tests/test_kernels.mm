@@ -7,7 +7,7 @@
 #include <random>
 
 #include "golden.h"
-#include "gpu.h"
+#include "lanes.h"
 
 static float bf16(uint16_t b) {
     uint32_t u = (uint32_t)b << 16;
@@ -49,7 +49,9 @@ void mllm::GpuOpsTest::run() {
     id<MTLDevice> dev = MTLCreateSystemDefaultDevice();
     mllm::Weights w(s.path, dev);
     mllm::Memory mem(s, dev, 64 << 20);
-    mllm::GpuOps ops(mem, w, 1, 64);
+    mllm::GpuOps ops(mem, w);
+    mllm::Workspace ws = ops.workspace(1, 1, 64);
+    id<MTLCommandQueue> q = [dev newCommandQueue];
     std::mt19937 rng(0);
     std::normal_distribution<float> normal;
     const size_t big = (size_t)8224 * 1024;  // the largest x / y below, in elements
@@ -84,10 +86,11 @@ void mllm::GpuOpsTest::run() {
                 want[(size_t)r * dim + i] = v;
             }
         }
-        ops.begin();
-        if (gated) ops.gated_rms_norm(weight, {x}, {z}, {x}, rows, dim);
-        else ops.rms_norm(weight, {x}, {x}, rows, dim);
-        ops.commit_and_wait();
+        mllm::encode_and_wait(q, ws, [&] {
+            ops.use(ws);
+            if (gated) ops.gated_rms_norm(weight, {x}, {z}, {x}, rows, dim);
+            else ops.rms_norm(weight, {x}, {x}, rows, dim);
+        });
         assert(close(gated ? "gated_rms_norm" : "rms_norm", xs, want));
     }
 
@@ -123,9 +126,10 @@ void mllm::GpuOpsTest::run() {
     };
     for (const Case& c : cases) {
         fill(x, (size_t)c.M * c.l.K, 1);
-        ops.begin();
-        ops.linear(c.l, {x}, {y}, c.M);
-        ops.commit_and_wait();
+        mllm::encode_and_wait(q, ws, [&] {
+            ops.use(ws);
+            ops.linear(c.l, {x}, {y}, c.M);
+        });
         assert(close(c.kernel, ys, reference(c.l, c.M)));
     }
     printf("rms_norm, gated_rms_norm and %zu linear kernel paths match the CPU\n", std::size(cases));
@@ -144,9 +148,11 @@ void mllm::GpuOpsTest::run() {
                   {"gate/up_proj", &L::gate_proj}, {"down_proj", &L::down_proj}};
     fill(x, (size_t)512 * 3584, 1);
     @autoreleasepool {
-        ops.begin();  // ~0.2 s of work first, so the GPU clock has ramped up before the first timed shape
-        for (int r = 0; r < 200; r++) ops.linear(l0.in_proj_qkv, {x}, {y}, 512);
-        ops.commit_and_wait();
+        // ~0.2 s of work first, so the GPU clock has ramped up before the first timed shape
+        mllm::encode_and_wait(q, ws, [&] {
+            ops.use(ws);
+            for (int r = 0; r < 200; r++) ops.linear(l0.in_proj_qkv, {x}, {y}, 512);
+        });
     }
     printf("%-13s %5s %5s %4s %9s %9s %6s %7s\n", "proj", "N", "K", "M", "us", "bound us", "%bound", "GB/s");
     for (const Shape& sh : shapes) @autoreleasepool {
@@ -170,9 +176,10 @@ void mllm::GpuOpsTest::run() {
         for (int M : {1, 8, 16, 512}) {
             double best = 1e9;
             for (int trial = 0; trial < 3; trial++) @autoreleasepool {
-                ops.begin();
-                for (const mllm::QLinear& l : copies) ops.linear(l, {x}, {y}, M);
-                best = std::fmin(best, ops.commit_and_wait() / copies.size());
+                best = std::fmin(best, mllm::encode_and_wait(q, ws, [&] {
+                    ops.use(ws);
+                    for (const mllm::QLinear& l : copies) ops.linear(l, {x}, {y}, M);
+                }) / copies.size());
             }
             double bytes = (double)N * K * 4.5 / 8 + 2.0 * M * K + 2.0 * M * N;
             double bound = std::fmax(bytes / 210e9, 2.0 * M * N * K / 6e12), gbs = bytes / best / 1e9;

@@ -11,7 +11,7 @@
 #include <string>
 
 #include "golden.h"
-#include "gpu.h"
+#include "lanes.h"
 
 int main() {
     mllm::ModelSpec s = mllm::spec::load(golden::MODEL);
@@ -22,8 +22,9 @@ int main() {
     mllm::Weights w(s.path, dev);
     mllm::Memory mem(s, dev, 256 << 20);
     const int chunk = g["chunk"], max_batch = 4, rows_max = std::max(chunk, max_batch), max_ctx = 64, L = s.n_layers();
-    mllm::Workspace ws = mem.workspace(chunk, max_batch);
-    mllm::GpuOps ops(mem, w, rows_max, max_ctx);
+    mllm::GpuOps ops(mem, w);
+    mllm::Workspace ws = ops.workspace(chunk, max_batch, max_ctx);
+    id<MTLCommandQueue> q = [dev newCommandQueue];
     mllm::StepTables tables = mem.step_tables(rows_max);
     mem.freeze();
     id<MTLBuffer> table = ws.table = tables.copies[0];
@@ -57,14 +58,14 @@ int main() {
         memcpy(ws.tokens.contents, tokens, (size_t)ws.B * n * 4);
         const bool decode = n == 1;
         @autoreleasepool {
-            ops.begin();
-            for (int i = 0; i <= L; i++) {
-                if (i == L && !decode) break;  // prefill never runs dense(L)
-                ops.dense(i, ws);
-                if (i < L) ops.attn(i, ws);
-            }
-            if (decode) ops.lm_head(ws);
-            ops.commit_and_wait();
+            mllm::encode_and_wait(q, ws, [&] {
+                for (int i = 0; i <= L; i++) {
+                    if (i == L && !decode) break;  // prefill never runs dense(L)
+                    ops.dense(i, ws);
+                    if (i < L) ops.attn(i, ws);
+                }
+                if (decode) ops.lm_head(ws);
+            });
         }
         return decode ? ops.sample(ws, std::vector<mllm::SampleParams>(ws.B)) : std::vector<int>{};
     };

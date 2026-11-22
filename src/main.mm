@@ -1,4 +1,4 @@
-// mllm CLI. `mllm MODEL`: print the model spec. `mllm bench-ops MODEL`: GPU time per op and per decode step.
+// mllm CLI: print the model spec, generate (streams text), bench (mlx_lm.benchmark's fields), bench-ops (GPU time per op).
 #include <algorithm>
 #include <cassert>
 #include <chrono>
@@ -6,9 +6,12 @@
 #include <cstdio>
 #include <cstring>
 #include <exception>
+#include <map>
+#include <random>
 #include <string>
 
-#include "gpu.h"
+#include "engine.h"
+#include "lanes.h"
 #include "spec.h"
 
 namespace mllm {
@@ -35,8 +38,9 @@ void GpuOpsTest::bench_ops(const std::string& model) {
     Weights w(s.path, dev);
     const int chunk = 512, max_batch = 16, max_ctx = 8192, L = s.n_layers();
     Memory mem(s, dev, (size_t)2 << 30);
-    Workspace ws = mem.workspace(chunk, max_batch);
-    GpuOps ops(mem, w, chunk, max_ctx);
+    GpuOps ops(mem, w);
+    Workspace ws = ops.workspace(chunk, max_batch, max_ctx);
+    id<MTLCommandQueue> q = [dev newCommandQueue];
     StepTables tables = mem.step_tables(chunk);
     std::vector<id<MTLBuffer>> tabs;  // one per rotation set
     for (int i = 0; i < 16; i++) tabs.push_back(mem.buffer(tables.words * 4));
@@ -51,16 +55,18 @@ void GpuOpsTest::bench_ops(const std::string& model) {
     auto time = [&](auto&& encode) {
         double t1;
         @autoreleasepool {
-            ops.begin();
-            encode(0);
-            t1 = ops.commit_and_wait();
+            t1 = encode_and_wait(q, ws, [&] {
+                ops.use(ws);
+                encode(0);
+            });
         }
         const int reps = std::clamp((int)(0.02 / std::max(t1, 1e-6)), 3, 2000);
         double best = INFINITY;
         for (int k = 0; k < 3; k++) @autoreleasepool {
-                ops.begin();
-                for (int r = 0; r < reps; r++) encode(r);
-                best = std::min(best, ops.commit_and_wait() / reps);
+                best = std::min(best, encode_and_wait(q, ws, [&] {
+                    ops.use(ws);
+                    for (int r = 0; r < reps; r++) encode(r);
+                }) / reps);
             }
         return best;
     };
@@ -213,13 +219,13 @@ void GpuOpsTest::bench_ops(const std::string& model) {
         std::vector<double> ts, walls;  // GPU time; wall = encode + commit + wait
         for (int k = 0; k < 13; k++) @autoreleasepool {
                 const auto w0 = std::chrono::steady_clock::now();
-                ops.begin();
-                for (int i = 0; i <= L; i++) {
-                    ops.dense(i, ws);
-                    if (i < L) ops.attn(i, ws);
-                }
-                ops.lm_head(ws);
-                const double t = ops.commit_and_wait();
+                const double t = encode_and_wait(q, ws, [&] {
+                    for (int i = 0; i <= L; i++) {
+                        ops.dense(i, ws);
+                        if (i < L) ops.attn(i, ws);
+                    }
+                    ops.lm_head(ws);
+                });
                 const double wall = std::chrono::duration<double>(std::chrono::steady_clock::now() - w0).count();
                 if (k >= 3) ts.push_back(t), walls.push_back(wall);
             }
@@ -244,22 +250,112 @@ void GpuOpsTest::bench_ops(const std::string& model) {
 
 }  // namespace mllm
 
-int main(int argc, char** argv) {
-    const bool bench = argc == 3 && std::string(argv[1]) == "bench-ops";
-    if (argc != 2 && !bench) {
-        fprintf(stderr, "usage: mllm MODEL             print the model spec\n"
-                        "       mllm bench-ops MODEL   GPU time per op and per decode step, next to the roofline\n"
-                        "MODEL: repo id under $HF_HOME, or a local dir\n");
-        return 2;
-    }
-    try {
-        if (bench) {
-            mllm::GpuOpsTest::bench_ops(argv[2]);
-            return 0;
+// mllm generate: the prompt as one user message (chat template), text streamed to stdout
+static void generate(const std::string& model, const std::string& prompt, mllm::GenParams p) {
+    mllm::Engine e(model);
+    e.generate({{"user", prompt}}, p, [](const std::string& t) {
+        fputs(t.c_str(), stdout);
+        fflush(stdout);
+        return true;
+    });
+    printf("\n");
+}
+
+// mllm bench: mlx_lm.benchmark's protocol and fields. Random prompt tokens, EOS ignored, one warmup run, n trials.
+// prompt_tps = B * P / time until every request has its first token (prefill + first decode step, as mlx-lm);
+// generation_tps = tokens emitted after that / the time after it (B = 1: G - 1 tokens, mlx-lm counts G).
+// peak_memory = Metal allocations (weights, workspaces, the arena's peak in-use units; not its unused rest).
+static void bench(const std::string& model, int P, int G, int B, int n) {
+    mllm::Engine e(model);
+    e.tok.eos.clear();  // as mlx_lm.benchmark: never stop early
+    std::mt19937 rng(0);
+    std::uniform_int_distribution<int> tok(0, e.spec.vocab - 1);
+    std::vector<std::vector<int>> prompts(B, std::vector<int>(P));
+    for (auto& p : prompts)
+        for (int& t : p) t = tok(rng);
+    const mllm::Arena& a = e.mem.arena;
+    struct Trial {
+        double prompt_tps, generation_tps, peak_memory, total_time;
+    };
+    auto trial = [&] {
+        using clock = std::chrono::steady_clock;
+        const auto t0 = clock::now();
+        for (const auto& p : prompts) e.submit(p, {.max_tokens = G});
+        std::map<int, int> got;
+        uint32_t peak_units = 0;
+        clock::time_point t_prompt;
+        long after = 0;
+        while (!e.reqs.empty()) {
+            for (const mllm::Event& ev : e.step()) {
+                if (got[ev.req_id]++ == 0 && got.size() == (size_t)B) t_prompt = clock::now();
+                else if (got.size() == (size_t)B) after++;
+            }
+            peak_units = std::max(peak_units, a.n_units - a.free_units);
         }
-        mllm::ModelSpec s = mllm::spec::load(argv[1]);
-        printf("%s\n%d layers (%zu full, %zu linear), hidden %d, vocab %d\n", s.path.c_str(), s.n_layers(),
-               s.full_layers().size(), s.linear_layers().size(), s.hidden, s.vocab);
+        const auto t1 = clock::now();
+        auto sec = [](auto d) { return std::chrono::duration<double>(d).count(); };
+        const double mem = (double)e.device.currentAllocatedSize - e.mem.arena_buffer.length + peak_units * a.unit_bytes;
+        return Trial{(double)B * P / sec(t_prompt - t0), after / sec(t1 - t_prompt), mem / 1e9, sec(t1 - t0)};
+    };
+    printf("Running warmup..\n");
+    trial();
+    printf("Timing with prompt_tokens=%d, generation_tokens=%d, batch_size=%d.\n", P, G, B);
+    Trial sum{};
+    for (int i = 0; i < n; i++) {
+        Trial t = trial();
+        printf("Trial %d:  prompt_tps=%.3f, generation_tps=%.3f, peak_memory=%.3f, total_time=%.3f\n", i + 1,
+               t.prompt_tps, t.generation_tps, t.peak_memory, t.total_time);
+        fflush(stdout);
+        sum = {sum.prompt_tps + t.prompt_tps, sum.generation_tps + t.generation_tps, sum.peak_memory + t.peak_memory, 0};
+    }
+    printf("Averages: prompt_tps=%.3f, generation_tps=%.3f, peak_memory=%.3f\n", sum.prompt_tps / n,
+           sum.generation_tps / n, sum.peak_memory / n);
+}
+
+static int usage() {
+    fprintf(stderr,
+            "usage: mllm MODEL                                print the model spec\n"
+            "       mllm generate MODEL PROMPT [--max-tokens N] [--temp T] [--top-p P]\n"
+            "       mllm bench MODEL [-p 512] [-g 1024] [-b 1] [-n 5]   mlx_lm.benchmark's fields\n"
+            "       mllm bench-ops MODEL                      GPU time per op and per decode step, next to the roofline\n"
+            "MODEL: repo id under $HF_HOME, or a local dir\n");
+    return 2;
+}
+
+int main(int argc, char** argv) {
+    if (argc < 2) return usage();
+    const std::string cmd = argv[1];
+    // flags after the positional arguments: name -> value
+    std::map<std::string, std::string> flags;
+    const int npos = cmd == "generate" ? 4 : cmd == "bench" || cmd == "bench-ops" ? 3 : 2;
+    if (argc < npos || (argc - npos) % 2) return usage();
+    for (int i = npos; i < argc; i += 2) flags[argv[i]] = argv[i + 1];
+    auto flag = [&](const char* name, const char* def) {
+        auto it = flags.find(name);
+        std::string v = it == flags.end() ? def : it->second;
+        if (it != flags.end()) flags.erase(it);
+        return v;
+    };
+    try {
+        if (cmd == "generate") {
+            mllm::GenParams p{std::stoi(flag("--max-tokens", "256")), std::stof(flag("--temp", "0")),
+                              std::stof(flag("--top-p", "0"))};
+            if (!flags.empty()) return usage();
+            generate(argv[2], argv[3], p);
+        } else if (cmd == "bench") {
+            const int P = std::stoi(flag("-p", "512")), G = std::stoi(flag("-g", "1024")), B = std::stoi(flag("-b", "1"));
+            const int n = std::stoi(flag("-n", "5"));
+            if (!flags.empty() || P < 2 || G < 1 || B < 1 || n < 1) return usage();
+            bench(argv[2], P, G, B, n);
+        } else if (cmd == "bench-ops") {
+            if (!flags.empty()) return usage();
+            mllm::GpuOpsTest::bench_ops(argv[2]);
+        } else {
+            if (argc != 2) return usage();
+            mllm::ModelSpec s = mllm::spec::load(argv[1]);
+            printf("%s\n%d layers (%zu full, %zu linear), hidden %d, vocab %d\n", s.path.c_str(), s.n_layers(),
+                   s.full_layers().size(), s.linear_layers().size(), s.hidden, s.vocab);
+        }
     } catch (const std::exception& e) {
         fprintf(stderr, "mllm: %s\n", e.what());
         return 1;

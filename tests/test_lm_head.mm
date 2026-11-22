@@ -10,13 +10,15 @@
 #include <string>
 
 #include "golden.h"
-#include "gpu.h"
+#include "lanes.h"
 
 struct mllm::GpuOpsTest {
-    static void argmax(GpuOps& ops, id<MTLBuffer> x, id<MTLBuffer> out, int rows, int V) {
-        ops.begin();
-        ops.argmax({x}, {out}, rows, V);
-        ops.commit_and_wait();
+    static void argmax(GpuOps& ops, id<MTLCommandQueue> q, Workspace& ws, id<MTLBuffer> x, id<MTLBuffer> out, int rows,
+                       int V) {
+        mllm::encode_and_wait(q, ws, [&] {
+            ops.use(ws);
+            ops.argmax({x}, {out}, rows, V);
+        });
     }
 };
 
@@ -47,8 +49,9 @@ int main() {
     mllm::Weights w(s.path, dev);
     mllm::Memory mem(s, dev, 64 << 20);
     const int max_batch = 16, V = s.vocab;
-    mllm::Workspace ws = mem.workspace(1, max_batch);
-    mllm::GpuOps ops(mem, w, max_batch, 64);
+    mllm::GpuOps ops(mem, w);
+    mllm::Workspace ws = ops.workspace(1, max_batch, 64);
+    id<MTLCommandQueue> q = [dev newCommandQueue];
     id<MTLBuffer> ids = mem.buffer(max_batch * 4);
     mem.freeze();
     uint8_t* logits = (uint8_t*)ws.logits.contents;
@@ -61,9 +64,9 @@ int main() {
     auto run = [&](int B) {
         ws.B = B;
         @autoreleasepool {
-            ops.begin();
-            ops.lm_head(ws);
-            ops.commit_and_wait();
+            mllm::encode_and_wait(q, ws, [&] {
+                ops.lm_head(ws);
+            });
         }
         return ops.sample(ws, std::vector<mllm::SampleParams>(B));  // greedy
     };
@@ -100,7 +103,7 @@ int main() {
     L[(size_t)V + V - 1] = to_bf16(1);                      // row 1: the last index
     std::fill(L + 2 * (size_t)V, L + 3 * (size_t)V, ninf);  // row 2: all -inf (MLX: 0)
     L[3 * (size_t)V + 7] = L[3 * (size_t)V + 6] = to_bf16(-2.5);  // row 3: adjacent tie
-    mllm::GpuOpsTest::argmax(ops, ws.logits, ids, 4, V);
+    mllm::GpuOpsTest::argmax(ops, q, ws, ws.logits, ids, 4, V);
     const int32_t* id = (const int32_t*)ids.contents;
     assert(id[0] == 1000 && id[1] == V - 1 && id[2] == 0 && id[3] == 6);
 

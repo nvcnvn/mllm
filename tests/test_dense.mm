@@ -9,7 +9,7 @@
 #include <nlohmann/json.hpp>
 
 #include "golden.h"
-#include "gpu.h"
+#include "lanes.h"
 
 int main() {
     mllm::ModelSpec s = mllm::spec::load(golden::MODEL);
@@ -20,8 +20,9 @@ int main() {
     mllm::Weights w(s.path, dev);
     mllm::Memory mem(s, dev, 64 << 20);
     int chunk = g["chunk"].get<int>(), max_batch = 2;
-    mllm::Workspace ws = mem.workspace(chunk, max_batch);
-    mllm::GpuOps ops(mem, w, std::max(chunk, max_batch), 64);
+    mllm::GpuOps ops(mem, w);
+    mllm::Workspace ws = ops.workspace(chunk, max_batch, 64);
+    id<MTLCommandQueue> q = [dev newCommandQueue];
     mem.freeze();
 
     std::map<std::string, id<MTLBuffer>> field = {{"x", ws.x}, {"q", ws.q}, {"k", ws.k}, {"v", ws.v},
@@ -56,9 +57,9 @@ int main() {
                 load(c + "/" + lp + "/attn/o", ws.o);
             }
             @autoreleasepool {
-                ops.begin();
-                ops.dense(i, ws);
-                ops.commit_and_wait();
+                mllm::encode_and_wait(q, ws, [&] {
+                    ops.dense(i, ws);
+                });
             }
 
             std::string pre = c + "/" + li + "/dense/";

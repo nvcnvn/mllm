@@ -29,10 +29,12 @@ struct SampleParams {
 
 class GpuOps {
 public:
-    // max_rows: the workspace's rows (max of chunk and batch); max_ctx: the longest request (tokens). Both size
-    // GpuOps' own scratch buffers.
-    GpuOps(Memory& mem, const Weights& weights, int max_rows, int max_ctx);
+    GpuOps(Memory& mem, const Weights& weights);
 
+    // mem.workspace(chunk, max_batch) plus GpuOps' scratch, sized for max_ctx tokens per request. One per lane.
+    Workspace workspace(int chunk, int max_batch, int max_ctx);
+
+    // Every op below encodes into ws.enc and uses ws's scratch.
     // All the big matmuls between attn(i - 1) and attn(i), i = 0 .. n_layers, over ws.B * ws.S rows.
     // Fields as in gpu.py, except q, k, v are row-major [B, S, H, D] (gpu.py's [B, H, S, D] transpose is only
     // for MLX's SDPA).
@@ -52,11 +54,10 @@ public:
     void lm_head(Workspace& ws);
     std::vector<int> sample(const Workspace& ws, const std::vector<SampleParams>& params) const;
 
-    // ponytail: one command buffer per begin/commit_and_wait, waited on; g5 replaces this with lane-owned
-    // command buffers and events. Both autorelease Metal objects: a long-running caller (g5's step loop) wraps
-    // each step in @autoreleasepool.
-    void begin();
-    double commit_and_wait();  // GPU seconds the command buffer took
+    // Decode only, no Python counterpart (Python never runs ahead): ws.tokens[b] = prev_ids[src[b]] for src[b] >= 0,
+    // so a greedy row's next step is encoded before the CPU has seen its token. Encode it before dense(0).
+    void feed_tokens(Workspace& ws, id<MTLBuffer> prev_ids, const std::vector<int>& src);
+
 
 private:
     friend struct GpuOpsTest;  // tests and bench-ops reach the kernel helpers below (Metal types, rule 1)
@@ -96,15 +97,16 @@ private:
     Memory& mem;
     id<MTLDevice> device;
     id<MTLLibrary> library;
-    id<MTLCommandQueue> queue;
-    id<MTLCommandBuffer> cb;
+    // the current workspace's encoder and split-k scratch, for the helpers above (set by each public op)
+    void use(const Workspace& ws) { enc = ws.enc, splitk = ws.splitk; }
     id<MTLComputeCommandEncoder> enc;
+    id<MTLBuffer> splitk;
 
     id<MTLComputePipelineState> qmv_fast, qmv_wide[6], qmm_t[2], qmm_t_splitk[2], splitk_accum;
     id<MTLComputePipelineState> embed_ps, rms_ps, add_ps, swiglu_ps, precise_swiglu_ps, split_q_gate_ps;
     id<MTLComputePipelineState> rope_ps, write_kv_ps, sdpa_ps, sdpa_2pass_1[2], sdpa_2pass_2, sigmoid_gate_ps;
     id<MTLComputePipelineState> gather_kv_ps, causal_mask_ps, scale_ps, softmax_ps[2];
-    id<MTLComputePipelineState> conv1d_silu_ps, scale_qk_ps, gdn_gates_ps, gated_delta_ps, argmax_ps;
+    id<MTLComputePipelineState> conv1d_silu_ps, scale_qk_ps, gdn_gates_ps, gated_delta_ps, argmax_ps, feed_ps;
     // the fallback's matmul variants: gemv_wide [nv 4/5][k_lanes 16/32]; steel [nt/nn][align M][align N][align K]
     id<MTLComputePipelineState> gemv_wide_ps[2][2], steel_ps[2][2][2][2];
     id<MTLComputePipelineState> pipeline(NSString* name, std::initializer_list<std::pair<int, bool>> constants);
@@ -113,14 +115,7 @@ private:
     void matmul(bool transpose_b, Buf a, Buf b, Buf d, int M, int N, int K, int lda, int ldb, int ldd,
                 const int64_t a_bs[2], const int64_t b_bs[2], int64_t d_bs);
 
-    // scratch, [max_rows, ...] bf16: h (residual after attn), xn (normed), t (projection out), g / u (MLP), qg
-    // (q_proj out); splitk: qmm_t_splitk's fp32 partial sums
-    // attention: ao (attention out, MLX's [B, H, S, D]); partials / sums / maxs (sdpa 2-pass)
-    // kc / vc (prefill: the row's K/V gathered, [Hkv, max_ctx, D]); scores [H, max_rows, max_ctx]
-    // linear attention: nqkv (normed q / k, [max_rows, conv_dim]), gdn_g (fp32) / beta [max_rows, Hv], one (bf16 1)
-    // ids: lm_head's argmax per row (int32)
-    id<MTLBuffer> h, xn, t, g, u, qg, splitk, ao, partials, sums, maxs, kc, vc, scores, nqkv, gdn_g, beta, one, ids;
-    int max_rows, max_ctx;
+    id<MTLBuffer> one;  // bf16 1, read only
 };
 
 }  // namespace mllm

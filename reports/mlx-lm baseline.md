@@ -21,6 +21,31 @@ Each row is the average of 3 trials. Trials stayed within 3% of each other, exce
 | 512 | 256 | 8 | 4239 | 898 | 2.39 |
 | 512 | 256 | 16 | 4225 | 1064 | 2.63 |
 
+### C++ engine (this repo)
+
+```
+HF_HOME=/Volumes/T5/huggingface build/mllm bench mlx-community/Qwen3.5-0.8B-4bit -p P -g G -b B -n 3
+```
+Measured 2026-11-23 on the commit that adds this table (branch `port/g5-engine`), same fields and averaging as `mlx_lm.benchmark` (random
+prompt tokens, EOS ignored, greedy). Prefill chunk 512, decode up to 16 rows, one decode step in flight ahead of the
+CPU with greedy tokens fed on the GPU. The machine was **not** idle: a java process ran at ~400% CPU throughout.
+Trials stayed within 3%; across today's runs of this code decode moved 295–299 at B=1, 921–961 at B=8 and 1109–1115
+at B=16. Peak memory counts weights, workspaces and the arena units in use, not the
+arena's unused rest, so it isn't comparable to MLX's (which includes its buffer cache).
+
+| prompt | gen | batch | prefill tok/s | decode tok/s (all rows) | peak mem GB | ours / mlx-lm (prefill, decode) | what limits it |
+|---:|---:|---:|---:|---:|---:|---:|---|
+| 512 | 128 | 1 | 5333 | 299 | 1.04 | 1.06, 0.95 | Decode: GPU time per step is 3.23 ms (310 tok/s), ~400 dispatches of which ~0.5 ms is the small-dispatch floor; the measured 3.35 ms per token leaves ~0.12 ms between command buffers. Prefill: one 512 chunk, one command buffer. |
+| 2048 | 128 | 1 | 5272 | 288 | 1.06 | 1.04, 0.94 | Decode loses 11 tok/s to the longer K/V read (mlx-lm 8); the gap is the B=1 step overhead above. Prefill: 4 chunks of 512 (mlx-lm prefills 2048 at once). |
+| 8192 | 128 | 1 | 4471 | 260 | 1.13 | 1.04, 0.97 | Attention at long context (same sdpa kernels as MLX) in both prefill (16 chunks over a growing prefix) and decode. |
+| 512 | 256 | 1 | 5272 | 297 | 1.04 | 1.09, 0.97 | As the first row. |
+| 512 | 256 | 4 | 4708 | 782 | 1.13 | 1.09, 1.00 | Decode: same MLX kernels, the per-step overhead of B=1 spread over 4 rows. Prefill: one request's chunk at a time, decode of the earlier requests running alongside on the other queue. |
+| 512 | 256 | 8 | 4445 | 921 | 1.25 | 1.05, 1.03 | Decode: `qmv_wide` / `qmm_t_splitk` at M=8 run at ~35–45% of the bandwidth bound (MLX's kernels; faster ones would break bit-exactness). Prefill as B=4. |
+| 512 | 256 | 16 | 4145 | 1109 | 1.48 | 0.98, 1.04 | Decode: as B=8, at M=16. Prefill: the 16 chunks share the GPU with decode of the requests already prefilled (up to 15 rows by the last chunk), and prompt_tps runs until the last request's first token; mlx-lm prefills every prompt before decoding. |
+
+Targets: decode B=1 ≥ 300 tok/s **missed** (295–299; the GPU step alone allows 310), decode B=16 ≥ 1,064 met
+(1109–1115), GPU prefill at 512 ≥ 5,000 met (5272–5339).
+
 ## 2. Serving: `mlx_lm.server` under concurrent clients
 
 ```

@@ -50,8 +50,7 @@ id<MTLComputePipelineState> GpuOps::pipeline(NSString* name, std::initializer_li
     return pipeline(name, fc);
 }
 
-GpuOps::GpuOps(Memory& mem, const Weights& weights, int max_rows, int max_ctx)
-    : spec(mem.spec), mem(mem), device(mem.device), max_rows(max_rows), max_ctx(max_ctx) {
+GpuOps::GpuOps(Memory& mem, const Weights& weights) : spec(mem.spec), mem(mem), device(mem.device) {
     // MLX picks kernels and tile sizes by GPU generation. Only the M4 family's branch (gen 15/16, not a 'd' Max/Ultra
     // die) is copied below. ponytail: port the other branches of quantized.cpp when another GPU shows up.
     NSString* arch = device.architecture.name;
@@ -61,7 +60,6 @@ GpuOps::GpuOps(Memory& mem, const Weights& weights, int max_rows, int max_ctx)
     NSError* err = nil;
     library = [device newLibraryWithURL:[NSURL fileURLWithPath:@METALLIB] error:&err];
     if (!library) throw error(std::string("cannot load ") + METALLIB, err);
-    queue = [device newCommandQueue];
 
     qmv_fast = pipeline(@"affine_qmv_fast_bfloat16_t_gs_64_b_4_batch_0_pr_0_hgs_0_r_4");
     for (int nv = 2; nv <= 5; nv++)
@@ -98,6 +96,7 @@ GpuOps::GpuOps(Memory& mem, const Weights& weights, int max_rows, int max_ctx)
     gdn_gates_ps = pipeline(@"gdn_gates");
     gated_delta_ps = pipeline(@"gated_delta_paged_bfloat16_128_128_16_16");
     argmax_ps = pipeline(@"argmax_bf16");
+    feed_ps = pipeline(@"feed_tokens");
     gather_kv_ps = pipeline(@"gather_kv_bfloat16_256");
     causal_mask_ps = pipeline(@"causal_mask");
     scale_ps = pipeline(@"scale_bf16");
@@ -169,45 +168,38 @@ GpuOps::GpuOps(Memory& mem, const Weights& weights, int max_rows, int max_ctx)
         layers.push_back(l);
     }
 
-    size_t row = (size_t)max_rows * ELEM;
-    h = mem.buffer(row * spec.hidden);
-    xn = mem.buffer(row * spec.hidden);
-    t = mem.buffer(row * spec.hidden);
-    g = mem.buffer(row * layers[0].gate_proj.N);
-    u = mem.buffer(row * layers[0].gate_proj.N);
-    qg = mem.buffer(row * 2 * spec.n_heads * spec.head_dim);
-    splitk = mem.buffer(512 * 32 * 32 * sizeof(float));  // split_k * M * N <= 512 tiles of 32 x 32 (see linear)
-    const size_t H = spec.n_heads, D = spec.head_dim, gqa = H / spec.n_kv_heads;
-    ao = mem.buffer(row * H * D);
-    // 2-pass partials: decode (max_rows rows, 64 blocks) or one row of up to 8 queries at max_ctx keys
-    size_t q8 = std::min(8, max_rows), n_part = std::max(max_rows * H * 64, q8 * H * sdpa_blocks(max_ctx, gqa * q8));
-    partials = mem.buffer(n_part * D * ELEM);
-    sums = mem.buffer(n_part * sizeof(float));
-    maxs = mem.buffer(n_part * sizeof(float));
-    kc = mem.buffer(spec.n_kv_heads * (size_t)max_ctx * D * ELEM);
-    vc = mem.buffer(spec.n_kv_heads * (size_t)max_ctx * D * ELEM);
-    scores = mem.buffer(row * H * max_ctx);
-    nqkv = mem.buffer(row * spec.conv_dim());
-    gdn_g = mem.buffer((size_t)max_rows * spec.lin_v_heads * sizeof(float));
-    beta = mem.buffer(row * spec.lin_v_heads);
     one = mem.buffer(ELEM);
     *(uint16_t*)one.contents = 0x3F80;  // bf16 1.0
-    ids = mem.buffer((size_t)max_rows * sizeof(int32_t));
 }
 
-void GpuOps::begin() {
-    cb = [queue commandBuffer];
-    enc = [cb computeCommandEncoder];  // serial: each dispatch sees the previous one's writes
-}
-
-double GpuOps::commit_and_wait() {
-    [enc endEncoding];
-    [cb commit];
-    [cb waitUntilCompleted];
-    if (cb.status != MTLCommandBufferStatusCompleted) throw error("GpuOps: command buffer failed", cb.error);
-    double seconds = cb.GPUEndTime - cb.GPUStartTime;
-    enc = nil, cb = nil;
-    return seconds;
+Workspace GpuOps::workspace(int chunk, int max_batch, int max_ctx) {
+    Workspace ws = mem.workspace(chunk, max_batch);
+    ws.rows = std::max(chunk, max_batch), ws.max_ctx = max_ctx;
+    size_t row = (size_t)ws.rows * ELEM;
+    ws.h = mem.buffer(row * spec.hidden);
+    ws.xn = mem.buffer(row * spec.hidden);
+    ws.t = mem.buffer(row * spec.hidden);
+    ws.g = mem.buffer(row * layers[0].gate_proj.N);
+    ws.u = mem.buffer(row * layers[0].gate_proj.N);
+    ws.qg = mem.buffer(row * 2 * spec.n_heads * spec.head_dim);
+    ws.splitk = mem.buffer(512 * 32 * 32 * sizeof(float));  // split_k * M * N <= 512 tiles of 32 x 32 (see linear)
+    const size_t H = spec.n_heads, D = spec.head_dim, gqa = H / spec.n_kv_heads;
+    ws.ao = mem.buffer(row * H * D);
+    // 2-pass partials: decode (ws.rows rows, 64 blocks) or one row of up to 8 queries at ws.max_ctx keys
+    size_t q8 = std::min(8, ws.rows), n_part = std::max(ws.rows * H * 64, q8 * H * sdpa_blocks(ws.max_ctx, gqa * q8));
+    ws.partials = mem.buffer(n_part * D * ELEM);
+    ws.sums = mem.buffer(n_part * sizeof(float));
+    ws.maxs = mem.buffer(n_part * sizeof(float));
+    // the unfused fallback (> 8 queries) only: decode workspaces (chunk <= 8) never gather
+    const size_t kv_rows = chunk > 8 ? ws.max_ctx : 1;
+    ws.kc = mem.buffer(spec.n_kv_heads * kv_rows * D * ELEM);
+    ws.vc = mem.buffer(spec.n_kv_heads * kv_rows * D * ELEM);
+    ws.scores = mem.buffer((size_t)std::max(chunk, 1) * ELEM * H * kv_rows);
+    ws.nqkv = mem.buffer(row * spec.conv_dim());
+    ws.gdn_g = mem.buffer((size_t)ws.rows * spec.lin_v_heads * sizeof(float));
+    ws.beta = mem.buffer(row * spec.lin_v_heads);
+    ws.ids = mem.buffer((size_t)ws.rows * sizeof(int32_t));
+    return ws;
 }
 
 static void set(id<MTLComputeCommandEncoder> enc, Buf b, int i) { [enc setBuffer:b.buffer offset:b.offset atIndex:i]; }
@@ -300,43 +292,44 @@ void GpuOps::linear(const QLinear& l, Buf x, Buf y, int M) {
 }
 
 void GpuOps::dense(int i, Workspace& ws) {
+    use(ws);
     const int M = ws.B * ws.S, H = spec.hidden;
-    assert(M > 0 && M <= max_rows && i >= 0 && i <= spec.n_layers());
+    assert(M > 0 && M <= ws.rows && i >= 0 && i <= spec.n_layers());
     if (i == 0) {
         embed({ws.tokens}, {ws.x}, M);
     } else {  // the rest of layer i - 1: h = x + proj(o); x = h + mlp(post_attention_layernorm(h))
         const Layer& p = layers[i - 1];
-        linear(p.out, {ws.o}, {t}, M);
-        add({ws.x}, {t}, {h}, (size_t)M * H);
-        rms_norm(p.post_attention_layernorm, {h}, {xn}, M, H);
-        linear(p.gate_proj, {xn}, {g}, M);
-        linear(p.up_proj, {xn}, {u}, M);
-        swiglu({g}, {u}, {g}, (size_t)M * p.gate_proj.N);
-        linear(p.down_proj, {g}, {t}, M);
-        add({h}, {t}, {ws.x}, (size_t)M * H);
+        linear(p.out, {ws.o}, {ws.t}, M);
+        add({ws.x}, {ws.t}, {ws.h}, (size_t)M * H);
+        rms_norm(p.post_attention_layernorm, {ws.h}, {ws.xn}, M, H);
+        linear(p.gate_proj, {ws.xn}, {ws.g}, M);
+        linear(p.up_proj, {ws.xn}, {ws.u}, M);
+        swiglu({ws.g}, {ws.u}, {ws.g}, (size_t)M * p.gate_proj.N);
+        linear(p.down_proj, {ws.g}, {ws.t}, M);
+        add({ws.h}, {ws.t}, {ws.x}, (size_t)M * H);
     }
     if (i == spec.n_layers()) {
         rms_norm(norm, {ws.x}, {ws.x}, M, H);
         return;
     }
     const Layer& l = layers[i];
-    rms_norm(l.input_layernorm, {ws.x}, {xn}, M, H);
+    rms_norm(l.input_layernorm, {ws.x}, {ws.xn}, M, H);
     if (l.is_linear) {
-        linear(l.in_proj_qkv, {xn}, {ws.qkv}, M);
-        linear(l.in_proj_z, {xn}, {ws.z}, M);
-        linear(l.in_proj_b, {xn}, {ws.b}, M);
-        linear(l.in_proj_a, {xn}, {ws.a}, M);
+        linear(l.in_proj_qkv, {ws.xn}, {ws.qkv}, M);
+        linear(l.in_proj_z, {ws.xn}, {ws.z}, M);
+        linear(l.in_proj_b, {ws.xn}, {ws.b}, M);
+        linear(l.in_proj_a, {ws.xn}, {ws.a}, M);
         return;
     }
     const int D = spec.head_dim;
-    linear(l.q_proj, {xn}, {qg}, M);
+    linear(l.q_proj, {ws.xn}, {ws.qg}, M);
     [enc setComputePipelineState:split_q_gate_ps];
-    set(enc, {qg}, 0), set(enc, {ws.q}, 1), set(enc, {ws.gate}, 2);
+    set(enc, {ws.qg}, 0), set(enc, {ws.q}, 1), set(enc, {ws.gate}, 2);
     [enc dispatchThreads:MTLSizeMake(D, (size_t)M * spec.n_heads, 1) threadsPerThreadgroup:MTLSizeMake(D, 1, 1)];
     rms_norm(l.q_norm, {ws.q}, {ws.q}, M * spec.n_heads, D);
-    linear(l.k_proj, {xn}, {ws.k}, M);
+    linear(l.k_proj, {ws.xn}, {ws.k}, M);
     rms_norm(l.k_norm, {ws.k}, {ws.k}, M * spec.n_kv_heads, D);
-    linear(l.v_proj, {xn}, {ws.v}, M);
+    linear(l.v_proj, {ws.xn}, {ws.v}, M);
 }
 
 // mlx Matmul::eval_gpu for the fallback's two matmuls (matmul.cpp): batch [Hkv, gqa] never collapses (the repeat
@@ -373,6 +366,7 @@ void GpuOps::matmul(bool transpose_b, Buf a, Buf b, Buf d, int M, int N, int K, 
 }
 
 void GpuOps::attn(int i, Workspace& ws) {
+    use(ws);
     assert(i >= 0 && i < spec.n_layers());
     if (layers[i].is_linear)
         linear_attn(i, layers[i], ws);
@@ -389,7 +383,7 @@ void GpuOps::linear_attn(int i, const Layer& l, Workspace& ws) {
     id<MTLBuffer> table = ws.table;
     const uint32_t* tb = (const uint32_t*)table.contents;
     // the table must carry every row's state span: the kernels index it with n_state = mem.state_units
-    assert((int)tb[0] == B && tb[1] == mem.state_units && M <= max_rows && (B == 1 || S == 1));
+    assert((int)tb[0] == B && tb[1] == mem.state_units && M <= ws.rows && (B == 1 || S == 1));
     for (int b = 0; b < B; b++) assert(B == 1 ? (int)tb[2 + B + b] == S : (int)tb[2 + B + b] <= S);
     const uint64_t unit = mem.arena.unit_bytes, conv_off = mem.state_offset(i), delta_off = conv_off + mem.conv_bytes;
     const int n_state = (int)mem.state_units;
@@ -405,21 +399,21 @@ void GpuOps::linear_attn(int i, const Layer& l, Workspace& ws) {
     // normalize_qk: rms_norm without weight (eps scaled to the mean), then the scales. Rows of 128 over the whole
     // conv output (v too, into scratch; only q / k are used), as MLX norms the q / k slices.
     const double inv_scale = std::pow((double)Dk, -0.5);
-    rms_norm({one}, {ws.qkv}, {nqkv}, M * (C / Dk), Dk, (float)(1e-6 * inv_scale * inv_scale), 0);
+    rms_norm({one}, {ws.qkv}, {ws.nqkv}, M * (C / Dk), Dk, (float)(1e-6 * inv_scale * inv_scale), 0);
     [enc setComputePipelineState:scale_qk_ps];
-    set(enc, {nqkv}, 0), set_bytes(enc, (float)(inv_scale * inv_scale), 1), set_bytes(enc, (float)inv_scale, 2);
+    set(enc, {ws.nqkv}, 0), set_bytes(enc, (float)(inv_scale * inv_scale), 1), set_bytes(enc, (float)inv_scale, 2);
     set_bytes(enc, C, 3);
     [enc dispatchThreads:MTLSizeMake(2 * key_dim, M, 1) threadsPerThreadgroup:MTLSizeMake(256, 1, 1)];
 
     [enc setComputePipelineState:gdn_gates_ps];
-    set(enc, {ws.a}, 0), set(enc, {ws.b}, 1), set(enc, l.A_log, 2), set(enc, l.dt_bias, 3), set(enc, {gdn_g}, 4);
-    set(enc, {beta}, 5);
+    set(enc, {ws.a}, 0), set(enc, {ws.b}, 1), set(enc, l.A_log, 2), set(enc, l.dt_bias, 3), set(enc, {ws.gdn_g}, 4);
+    set(enc, {ws.beta}, 5);
     [enc dispatchThreads:MTLSizeMake(Hv, M, 1) threadsPerThreadgroup:MTLSizeMake(Hv, 1, 1)];
 
     // mlx-lm: grid (32, Dv / 8, B * Hv), threadgroup (32, 2, 1)
     [enc setComputePipelineState:gated_delta_ps];
-    set(enc, {nqkv}, 0), set(enc, {nqkv, (size_t)key_dim * ELEM}, 1), set(enc, {ws.qkv, 2 * (size_t)key_dim * ELEM}, 2);
-    set(enc, {gdn_g}, 3), set(enc, {beta}, 4), set(enc, {arena}, 5), set(enc, {ws.o}, 6), set(enc, {table}, 7);
+    set(enc, {ws.nqkv}, 0), set(enc, {ws.nqkv, (size_t)key_dim * ELEM}, 1), set(enc, {ws.qkv, 2 * (size_t)key_dim * ELEM}, 2);
+    set(enc, {ws.gdn_g}, 3), set(enc, {ws.beta}, 4), set(enc, {arena}, 5), set(enc, {ws.o}, 6), set(enc, {table}, 7);
     set_bytes(enc, S, 8), set_bytes(enc, C, 9), set_bytes(enc, unit, 10), set_bytes(enc, n_state, 11);
     set_bytes(enc, delta_off, 12);
     [enc dispatchThreads:MTLSizeMake(32, spec.lin_v_dim / 8, B * Hv) threadsPerThreadgroup:MTLSizeMake(32, 2, 1)];
@@ -436,11 +430,11 @@ void GpuOps::full_attn(const Layer& l, Workspace& ws) {
     const int B = ws.B, S = ws.S, H = spec.n_heads, Hkv = spec.n_kv_heads, D = spec.head_dim, gqa = H / Hkv;
     id<MTLBuffer> table = ws.table;
     const uint32_t* tb = (const uint32_t*)table.contents;  // the CPU wrote it this step
-    assert((int)tb[0] == B && B * S <= max_rows && (B == 1 || S == 1));
+    assert((int)tb[0] == B && B * S <= ws.rows && (B == 1 || S == 1));
     int min_N = INT_MAX, max_N = 0;
     for (int b = 0; b < B; b++) {
         int pos = tb[2 + b], n = tb[2 + B + b], N = pos + n;
-        assert((B == 1 ? n == S : n <= S) && N <= max_ctx && tb[3 + 2 * B + b] - tb[2 + 2 * B + b] >= mem.units_for(N));
+        assert((B == 1 ? n == S : n <= S) && N <= ws.max_ctx && tb[3 + 2 * B + b] - tb[2 + 2 * B + b] >= mem.units_for(N));
         if (n) min_N = std::min(min_N, N), max_N = std::max(max_N, N);
     }
     if (!max_N) return;
@@ -473,21 +467,21 @@ void GpuOps::full_attn(const Layer& l, Workspace& ws) {
     if (S <= 8) {  // MLX: sdpa_vector, 2-pass from SDPA_2PASS_KEYS keys. Rows pick their path by N = pos + n.
         if (max_N >= SDPA_2PASS_KEYS) {
             const int blocks = sdpa_blocks(max_N, gqa * S);
-            assert((size_t)B * H * S * blocks <= sums.length / sizeof(float));
+            assert((size_t)B * H * S * blocks <= ws.sums.length / sizeof(float));
             id<MTLComputePipelineState> ps = sdpa_2pass_1[32 * gqa * S > (int)sdpa_2pass_1[0].maxTotalThreadsPerThreadgroup];
             [enc setComputePipelineState:ps];
-            set(enc, {ws.q}, 0), set(enc, {arena}, 1), set(enc, {partials}, 3), set(enc, {sums}, 4), set(enc, {maxs}, 5);
+            set(enc, {ws.q}, 0), set(enc, {arena}, 1), set(enc, {ws.partials}, 3), set(enc, {ws.sums}, 4), set(enc, {ws.maxs}, 5);
             set(enc, {table}, 6), set_bytes(enc, L, 7), set_bytes(enc, SDPA_2PASS_KEYS, 8), set_bytes(enc, INT_MAX, 9);
             set_bytes(enc, blocks, 11), set_bytes(enc, scale, 12);
             [enc dispatchThreadgroups:MTLSizeMake(Hkv, B, blocks) threadsPerThreadgroup:MTLSizeMake(32, gqa, S)];
             // over every row; the 1-pass below then overwrites the rows that are not on this path
             [enc setComputePipelineState:sdpa_2pass_2];
-            set(enc, {partials}, 0), set(enc, {sums}, 1), set(enc, {maxs}, 2), set(enc, {ao}, 3), set_bytes(enc, blocks, 4);
+            set(enc, {ws.partials}, 0), set(enc, {ws.sums}, 1), set(enc, {ws.maxs}, 2), set(enc, {ws.ao}, 3), set_bytes(enc, blocks, 4);
             [enc dispatchThreadgroups:MTLSizeMake(B * H, S, 1) threadsPerThreadgroup:MTLSizeMake(1024, 1, 1)];
         }
         if (min_N < SDPA_2PASS_KEYS) {
             [enc setComputePipelineState:sdpa_ps];
-            set(enc, {ws.q}, 0), set(enc, {arena}, 1), set(enc, {ao}, 3), set_bytes(enc, gqa, 4), set(enc, {table}, 5);
+            set(enc, {ws.q}, 0), set(enc, {arena}, 1), set(enc, {ws.ao}, 3), set_bytes(enc, gqa, 4), set(enc, {table}, 5);
             set_bytes(enc, L, 6), set_bytes(enc, 0, 7), set_bytes(enc, SDPA_2PASS_KEYS, 8), set_bytes(enc, scale, 10);
             [enc dispatchThreadgroups:MTLSizeMake(B * H, S, 1) threadsPerThreadgroup:MTLSizeMake(1024, 1, 1)];
         }
@@ -497,17 +491,18 @@ void GpuOps::full_attn(const Layer& l, Workspace& ws) {
         // ponytail: MLX v0.32.4 runs fused steel attention for n >= 2048 == kL (no prefix); not ported (chunks are
         // <= 512). Port it if a lane sends such a chunk.
         assert(!(n >= 2048 && kL == n));
+        assert((size_t)n * H * kL * ELEM <= ws.scores.length && (size_t)Hkv * kL * D * ELEM <= ws.kc.length);
         [enc setComputePipelineState:gather_kv_ps];
-        set(enc, {arena}, 0), set(enc, {kc}, 1), set(enc, {vc}, 2), set(enc, {table}, 3), set_bytes(enc, L, 4);
+        set(enc, {arena}, 0), set(enc, {ws.kc}, 1), set(enc, {ws.vc}, 2), set(enc, {table}, 3), set_bytes(enc, L, 4);
         [enc dispatchThreads:MTLSizeMake(D, kL, Hkv) threadsPerThreadgroup:MTLSizeMake(D, 1, 1)];
         [enc setComputePipelineState:scale_ps];
         set(enc, {ws.q}, 0), set_bytes(enc, scale, 1);
         [enc dispatchThreads:MTLSizeMake((size_t)n * H * D, 1, 1) threadsPerThreadgroup:MTLSizeMake(256, 1, 1)];
         // scores [H, n, kL] = q kᵀ; q is our [n, H, D], (kv head, repeat) -> head kv * gqa + repeat
         const int64_t q_bs[2] = {(int64_t)gqa * D, D}, kv_bs[2] = {(int64_t)kL * D, 0};
-        matmul(true, {ws.q}, {kc}, {scores}, n, kL, D, H * D, D, kL, q_bs, kv_bs, (int64_t)n * kL);
+        matmul(true, {ws.q}, {ws.kc}, {ws.scores}, n, kL, D, H * D, D, kL, q_bs, kv_bs, (int64_t)n * kL);
         [enc setComputePipelineState:causal_mask_ps];
-        set(enc, {scores}, 0), set(enc, {table}, 1);
+        set(enc, {ws.scores}, 0), set(enc, {table}, 1);
         [enc dispatchThreads:MTLSizeMake(kL, n, H) threadsPerThreadgroup:MTLSizeMake(std::min(kL, 256), 1, 1)];
         // softmax(precise=True), in place (softmax.cpp)
         const bool looped = kL > 4096;
@@ -515,15 +510,15 @@ void GpuOps::full_attn(const Layer& l, Workspace& ws) {
         size_t tg = looped ? sm.maxTotalThreadsPerThreadgroup : 32 * (((kL + 3) / 4 + 31) / 32);
         assert(tg <= sm.maxTotalThreadsPerThreadgroup);
         [enc setComputePipelineState:sm];
-        set(enc, {scores}, 0), set(enc, {scores}, 1), set_bytes(enc, kL, 2);
+        set(enc, {ws.scores}, 0), set(enc, {ws.scores}, 1), set_bytes(enc, kL, 2);
         [enc dispatchThreads:MTLSizeMake((size_t)H * n * tg, 1, 1) threadsPerThreadgroup:MTLSizeMake(tg, 1, 1)];
         // ao [H, S, D] = p v
         const int64_t p_bs[2] = {(int64_t)gqa * n * kL, (int64_t)n * kL};
-        matmul(false, {scores}, {vc}, {ao}, n, D, kL, kL, D, D, p_bs, kv_bs, (int64_t)S * D);
+        matmul(false, {ws.scores}, {ws.vc}, {ws.ao}, n, D, kL, kL, D, D, p_bs, kv_bs, (int64_t)S * D);
     }
 
     [enc setComputePipelineState:sigmoid_gate_ps];
-    set(enc, {ao}, 0), set(enc, {ws.gate}, 1), set(enc, {ws.o}, 2), set_bytes(enc, S, 3);
+    set(enc, {ws.ao}, 0), set(enc, {ws.gate}, 1), set(enc, {ws.o}, 2), set_bytes(enc, S, 3);
     [enc dispatchThreads:MTLSizeMake(D, H, B * S) threadsPerThreadgroup:MTLSizeMake(D, 1, 1)];
 }
 
@@ -532,10 +527,20 @@ void GpuOps::full_attn(const Layer& l, Workspace& ws) {
 namespace mllm {
 
 void GpuOps::lm_head(Workspace& ws) {
+    use(ws);
     const int B = ws.B, V = embed_tokens.N;
-    assert(ws.S == 1 && B <= max_rows && ws.logits.length >= (size_t)B * V * ELEM);
+    assert(ws.S == 1 && B <= ws.rows && ws.logits.length >= (size_t)B * V * ELEM);
     linear(embed_tokens, {ws.x}, {ws.logits}, B);  // embed_tokens.as_linear: the same quantized matmul
-    argmax({ws.logits}, {ids}, B, V);
+    argmax({ws.logits}, {ws.ids}, B, V);
+}
+
+void GpuOps::feed_tokens(Workspace& ws, id<MTLBuffer> prev_ids, const std::vector<int>& src) {
+    use(ws);
+    assert((int)src.size() == ws.B && ws.S == 1);
+    [enc setComputePipelineState:feed_ps];
+    set(enc, {prev_ids}, 0), set(enc, {ws.tokens}, 1);
+    [enc setBytes:src.data() length:src.size() * sizeof(int) atIndex:2];
+    [enc dispatchThreads:MTLSizeMake(src.size(), 1, 1) threadsPerThreadgroup:MTLSizeMake(src.size(), 1, 1)];
 }
 
 void GpuOps::argmax(Buf x, Buf out, int rows, int V) {
@@ -612,7 +617,7 @@ std::vector<int> GpuOps::sample(const Workspace& ws, const std::vector<SamplePar
     for (int b = 0; b < ws.B; b++) {
         const SampleParams& p = params[b];
         assert(p.temp >= 0 && (p.temp == 0 || p.rng));
-        out[b] = p.temp == 0 ? ((const int32_t*)ids.contents)[b]
+        out[b] = p.temp == 0 ? ((const int32_t*)ws.ids.contents)[b]
                              : sample_row((const uint16_t*)ws.logits.contents + (size_t)b * V, V, p);
     }
     return out;

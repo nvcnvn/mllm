@@ -125,3 +125,9 @@ template [[host_name("conv1d_silu_4")]] [[kernel]] decltype(conv1d_silu<4>) conv
   bfloat16_t sp = LogAddExp{}(Add{}(a[j], dt_bias[i.x]), static_cast<bfloat16_t>(0));
   g[j] = Exp{}(Multiply{}(e, static_cast<float>(sp)));
 }
+
+// Decode token feedback: row b's input token is the previous step's argmax of row src[b] (src[b] < 0: the CPU wrote it).
+[[kernel]] void feed_tokens(const device int* ids [[buffer(0)]], device int* tokens [[buffer(1)]],
+                            const constant int* src [[buffer(2)]], uint b [[thread_position_in_grid]]) {
+    if (src[b] >= 0) tokens[b] = ids[src[b]];
+}

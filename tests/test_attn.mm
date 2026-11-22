@@ -18,7 +18,7 @@
 #include <nlohmann/json.hpp>
 
 #include "golden.h"
-#include "gpu.h"
+#include "lanes.h"
 
 // Metal buffer memory isn't mapped in a fork()ed child, so assert checks re-run this binary with a mode argument:
 // true when that run dies on SIGABRT (an assert)
@@ -54,8 +54,9 @@ int main(int argc, char** argv) {
     mllm::Weights w(s.path, dev);
     mllm::Memory mem(s, dev, 128 << 20);
     const int chunk = 128, max_batch = 4, rows_max = std::max(chunk, max_batch);  // the sweep's longest chunk
-    mllm::Workspace ws = mem.workspace(chunk, max_batch);
-    mllm::GpuOps ops(mem, w, rows_max, 9216);
+    mllm::GpuOps ops(mem, w);
+    mllm::Workspace ws = ops.workspace(chunk, max_batch, 9216);
+    id<MTLCommandQueue> q = [dev newCommandQueue];
     mllm::StepTables tables = mem.step_tables(rows_max);
     mem.freeze();
     id<MTLBuffer> table = ws.table = tables.copies[0];
@@ -64,14 +65,12 @@ int main(int argc, char** argv) {
         std::vector<uint32_t> sl = {0, 1, 2, 3, 4};
         ws.B = 1, ws.S = 9;
         tables.write(table, {{100, 5, sl}});
-        ops.begin();
         ops.attn(s.full_layers()[0], ws);
         return 0;
     }
     if (mode == "nostate") {  // a linear layer with a table written without state units
         tables.write(table, {{0, 1, std::vector<uint32_t>{0}}});
         ws.B = 1, ws.S = 1;
-        ops.begin();
         ops.attn(s.linear_layers()[0], ws);
         return 0;
     }
@@ -150,9 +149,9 @@ int main(int argc, char** argv) {
                 for (const char* f : {"q", "k", "v", "gate"})
                     load(pre + "dense/" + f, f[0] == 'q' ? ws.q : f[0] == 'k' ? ws.k : f[0] == 'v' ? ws.v : ws.gate, src);
                 @autoreleasepool {
-                    ops.begin();
-                    ops.attn(full[gi], ws);
-                    ops.commit_and_wait();
+                    mllm::encode_and_wait(q, ws, [&] {
+                        ops.attn(full[gi], ws);
+                    });
                 }
             };
             run(ident, req);
@@ -206,9 +205,9 @@ int main(int argc, char** argv) {
         }
         tables.write(table, trows);
         @autoreleasepool {
-            ops.begin();
-            ops.attn(full[gl], ws);
-            ops.commit_and_wait();
+            mllm::encode_and_wait(q, ws, [&] {
+                ops.attn(full[gl], ws);
+            });
         }
         at = 0;
         for (auto& [c, sl] : rows) {
