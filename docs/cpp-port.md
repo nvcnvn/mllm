@@ -48,7 +48,7 @@ Each item is checked against the golden data for its layer. The goal is matching
   - `dense(L)`: the final norm.
 
   **Check:** every workspace field after each `dense(i)`.
-- [ ] Full-attention `attn(i)`: RoPE at the right positions, K/V written into pages through the step table, then paged attention. Decode: one query per row over its pages (`sdpa_vector`-style). Prefill: causal attention over the prefix pages plus the chunk. Then the sigmoid gate. **Check:** golden K/V pages and `ws.o`.
+- [x] Full-attention `attn(i)`: RoPE at the right positions, K/V written into pages through the step table, then paged attention. Decode: one query per row over its pages (`sdpa_vector`-style). Prefill: causal attention over the prefix pages plus the chunk. Then the sigmoid gate. **Check:** golden K/V pages and `ws.o`.
 - [ ] Linear `attn(i)`: depthwise conv1d with the conv window updated in place, SiLU, q/k/v split, `normalize_qk`, the gated-delta update in place on the arena state, then the gated norm. **Check:** golden conv state, recurrent state and `ws.o`.
 - [ ] `lm_head` (tied embedding used as a quantized linear) and sampling. Greedy argmax runs on the GPU; temperature and top-p match `make_sampler`. **Check:** logits and greedy ids; a seeded sampling test gives the same distribution shape.
 - [ ] Batch decode in one dispatch per op for all B rows, with no loop over rows (this removes the Python version's ponytail). **Check:** golden decode for batch 2 matches row by row.
