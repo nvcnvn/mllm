@@ -73,12 +73,14 @@ Each item is checked against the golden data for its layer. The goal is matching
 *Result (g6):* `src/ane.{h,mm}`, ANE `PrefillLane` thread, `mllm bench|generate --prefill ane`. The 0.999 / 0.99 thresholds above don't hold on the golden prompts even for `ane.py` (fp16 0.9963–0.9995 at S = 512, int8 0.9934–0.9986): `test_ane` instead requires the worst K/V/state cos to match `ane.py`'s within 2e-5 per prompt (ours equals it to 6 digits, n = 1 … 626). No texture-view fallback was built: surfaces have always come page-aligned, and `Memory::surface` throws otherwise (`ponytail` in memory.mm). Speed and overlap: reports/mlx-lm baseline.md "ANE prefill".
 
 ## 7. Serving and the comparison
-- [ ] A minimal streaming `/v1/completions` server (vendored cpp-httplib), just enough for `tools/serve_bench.py`. Requests go through `Engine::submit`. *Load under concurrency is where the design should win, so this belongs to the port rather than being deferred.*
-- [ ] **Check:** `serve_bench.py` with the same parameters as the baseline report (1–32 clients, 512 and 2048 tokens). Add ours to the report. The target is time to first token under load clearly below mlx-lm's, which was 0.99 s with 8 clients and 4.0 s with 8 clients at 2048 tokens.
+- [x] A minimal streaming `/v1/completions` server (vendored cpp-httplib), just enough for `tools/serve_bench.py`. Requests go through `Engine::submit`. *Load under concurrency is where the design should win, so this belongs to the port rather than being deferred.*
+- [x] **Check:** `serve_bench.py` with the same parameters as the baseline report (1–32 clients, 512 and 2048 tokens). Add ours to the report. The target is time to first token under load clearly below mlx-lm's, which was 0.99 s with 8 clients and 4.0 s with 8 clients at 2048 tokens. *Result (`mllm serve`, report §2): GPU prefill met at the median (0.62 s at 8 × 512, 2.31 s at 8 × 2048; p90 0.94 / 3.60, only just below). ANE prefill missed at 512 (1.46 / 2.48 s) and at 2048's p90 (2.75 / 4.35 s): its chunks slow to 170–225 ms under decode and the tail chunk is padded to 512; it keeps per-client decode at 204–250 tok/s at every load. `tests/test_server` checks a streamed greedy completion against `mllm generate`, 400s and cancel on hang-up.*
 
 ## 8. Close out
-- [ ] `architecture.md`: fill the C++ column with what was actually built, and close the questions the port answered.
-- [ ] `py/` stays as the reference and the source of golden data; new engine features go into C++ only.
+- [x] `architecture.md`: fill the C++ column with what was actually built, and close the questions the port answered.
+- [x] `py/` stays as the reference and the source of golden data; new engine features go into C++ only.
+
+`py/` is frozen as the reference: it produces the golden data (`py/dump_golden.py`) and the Core ML blocks (`ane.py`); new engine features go into `src/` only.
 
 ## After the port (not in this checklist)
 These are triggered by the items in architecture.md's and memory-design.md's **Deferred** tables: prefix cache and SSD tier, 8-bit KV, more than one step encoded ahead, the Qwen3.6-27B target and its ANE weight format, `mlock`, a second model family with Jinja templates.

@@ -1,0 +1,1 @@
+cpp-httplib v0.67.0 (https://github.com/yhirose/cpp-httplib), MIT, see LICENSE. httplib.h + httplib.cpp copied verbatim from llama.cpp's vendor/cpp-httplib (no SSL, no compression).

@@ -73,14 +73,15 @@ Your `attn()` / `ffn()` split, cut where the hardware cuts:
 | `PrefillLane` | `lanes` | In-flight prefill chunk | `submit(PrefillWork)`, `poll() → [PrefillWork]`, `busy()` |
 | `DecodeLane` | `lanes` | In-flight decode step(s), step counter | `submit(DecodeWork)`, `poll() → [(req_id, token)]`, `can_submit()` |
 | `Engine` | `engine` | Requests, the loop | `submit(prompt, params) → req_id`, `step() → [(req_id, text, done)]`, `generate(prompt, params) → iterator[str]` |
+| `Server` (C++ only) | `server` | httplib server, the engine thread, one event queue per HTTP request | `listen(host, port)`, `stop()`; streaming `POST /v1/completions`, `GET /v1/models` (`mllm serve`) |
 
-`generate` is sugar: `submit`, then `step` until that request is done. `submit` + `step` is the real API, so many requests later need no new structure. No HTTP server: the caller is a function call.
+`generate` is sugar: `submit`, then `step` until that request is done. `submit` + `step` is the real API, so many requests later need no new structure. `mllm serve` (`server.mm`) is a thin HTTP layer over `submit` + `step` + `cancel`; the engine doesn't know about it.
 
 ### Memory
 | Region | Python (throwaway) | C++ |
 |---|---|---|
-| Weights | `mlx_lm.load()` modules; compiled Core ML model per dense block, cached under `/Volumes/T5/cache/mllm/ane/<model>/S<chunk>_<format>/` | `mmap` + `newBufferWithBytesNoCopy`, Core ML compiled models |
-| Arena storage | one numpy `uint8` array `[N, unit_bytes]`, with typed views per object: KV units as fp16 `[G, 2, kv_heads, T, head_dim]` (same bytes as `offset_in_unit`, so it checks the layout), state units as fp32 | one untracked `MTLBuffer` in a residency set |
+| Weights | `mlx_lm.load()` modules; compiled Core ML model per dense block, cached under `/Volumes/T5/cache/mllm/ane/<model>/S<chunk>_<format>/` | `mmap` + one `newBufferWithBytesNoCopy` per file (a header-padded copy under the cache when the data doesn't start 16-aligned; mlx-community files don't), in the residency set; the same cached `.mlmodelc` per block, loaded by `AneOps` |
+| Arena storage | one numpy `uint8` array `[N, unit_bytes]`, with typed views per object: KV units as fp16 `[G, 2, kv_heads, T, head_dim]` (same bytes as `offset_in_unit`, so it checks the layout), state units as fp32 | one shared, untracked `MTLBuffer`, pre-touched with `memset`, in a residency set (`requestResidency` again every 10 s); byte-identical layout to Python's, so golden K/V compares directly |
 | Arena bookkeeping | Python class with the exact API: `admit(n)`, `alloc()`, `release(slot)`, `retire(step)` | C++ class (memory-design build step 2), unit-tested on its own ([cpp-port.md](cpp-port.md) §3) |
 | Workspace | object with named fields (`x`, `q`, `k`, `v`, `a`, `logits`) holding MLX/numpy arrays; ops reassign them | fixed `MTLBuffer`s, plus every scratch buffer `GpuOps` writes during a step (argmax `ids`, attention partials, split-k, linear-attn temporaries), so lanes on two queues never share one; `ws.enc` is the lane's current encoder. Each lane owns its workspaces: prefill one (sized for the chunk), decode two (by step parity). ANE in/out are IOSurfaces read by Metal without a copy |
 | Step tables | the slot lists inside each work item | 2 `MTLBuffer`s per lane, alternated by step parity |
@@ -121,21 +122,25 @@ step():
 ### Concurrency
 | | Python | C++ |
 |---|---|---|
-| Engine | caller's thread | one thread (`engine.mm`) owns the bookkeeping and both lanes; the only other thread is the ANE prefill lane's (see PrefillLane), which never touches bookkeeping. A `step()` with nothing to poll or submit blocks on the oldest lane event (decode's if one runs) |
+| Engine | caller's thread | one thread (the caller's; in `mllm serve` the server's engine thread) owns the bookkeeping and both lanes; the only other thread is the ANE prefill lane's (see PrefillLane), which never touches bookkeeping. A `step()` with nothing to poll or submit blocks on the oldest lane event (decode's if one runs) |
 | PrefillLane | runs inside `submit` | GPU: own `MTLCommandQueue`, one chunk in flight; `submit` encodes and commits, `poll` reads the lane's `MTLSharedEvent` (never blocks). ANE (`AneOps`): a lane thread (Core ML `predict` blocks), per layer ANE `dense(i)` then GPU `attn(i)` on the lane's queue, CPU waits for each; it encodes with its own copy of `GpuOps` (GpuOps keeps the current encoder in members); the engine sees the same submit / poll / event |
+| Server | — | httplib handler threads (a pool of max(8, cores − 1), growing to 4× that: 52 here) only parse, queue `{prompt, params}` and stream their request's events; the engine thread (`Server::loop`) tokenizes, calls `submit` / `cancel` / `step` and fills per-request queues. It sleeps on a condition variable when no request is live. A client that hangs up is cancelled within ~100 ms, even before its first token (the stream wakes every 100 ms so httplib re-checks the peer). Bodies over 1 MiB get 413: the engine thread tokenizes, ~170 ms per MB, stalling every stream |
 | DecodeLane | runs inside `submit`, `mx.eval` per step | own `MTLCommandQueue`, one command buffer per step, one `MTLSharedEvent` signaled with step + 1; up to 2 steps in flight, ordered by an `MTLFence` (defensive: a fed step already reads the previous step's tracked `ids`). Not while a sampled row decodes: then all rows step together, one step in flight. Greedy rows of step N + 1 take step N's argmax on the GPU (`GpuOps::feed_tokens`); sampled rows wait for the CPU |
 
 - The two lanes write disjoint units: a request is in one lane at a time. So the two GPU queues need no ordering between them.
 - A request moves PREFILL → DECODE only after `prefill.poll()` returns its last chunk, which means its GPU writes have completed.
 - Units freed by decode go through `pending` (memory-design), because the next step is already encoded. Prefill units are freed only after `poll()`: an aborted request waits for its chunk to finish.
-- In Python, prefill and decode do not overlap. In C++ they overlap on the GPU through the two queues.
+- In Python, prefill and decode do not overlap. In C++ they overlap on the GPU through the two queues. Measured: a GPU prefill stream costs B=8 decode ~70%, an ANE one 7–9% ([report](../reports/mlx-lm%20baseline.md) §1, ANE prefill).
 
 ## Files
 ```
 py/mllm/spec.py  tokenizer.py  memory.py  gpu.py  ane.py  lanes.py  engine.py
 py/test_engine.py
-src/     spec  tokenizer  memory  gpu  ane  lanes  engine   (.h + .cpp/.mm), later
-src/kernels/*.metal
+src/     spec  safetensors  tokenizer  memory  gpu  ane  lanes  engine  server   (.h + .cpp/.mm)
+src/main.mm         mllm CLI: generate, bench, bench-ops, serve
+src/kernels/*.metal attention  elementwise  linear_attn  matmul  norm  quantized  rope  sample  softmax  smoke, table.h
+src/vendor/         mlx (kernel headers), nlohmann, llama-unicode, cpp-httplib
+tests/test_*        one executable per component + test_golden / test_stack / test_server; golden.h
 ```
 Python reuses mlx-lm wherever it can: `mlx_lm.load` for weights and the GPU dense modules, `TokenizerWrapper` and `StreamingDetokenizer` for the tokenizer, `mx.fast.scaled_dot_product_attention` over gathered pages for `attn`. *ponytail: the gather copies every page of a request into MLX every layer, every step. That is fine for checking correctness and useless for speed. The C++ paged kernel replaces it.*
 
@@ -172,8 +177,8 @@ Python reuses mlx-lm wherever it can: `mlx_lm.load` for weights and the GPU dens
 | Prefix cache (`match(ids) → (n_tokens, slots)` before chunking) | Step 2 is done; it plugs into `admit` and the chunk start |
 | Page-level sparse decode on full layers (Quest-style: a min/max key summary per page, attend to the top-k pages). Saves bandwidth. Saves RAM only if cold pages are spilled to the SSD tier | Full-layer K/V reads show up in decode time at long context |
 | Sliding-window `attn` kind (window pages) | Running Gemma 4 or another sliding-window model |
-| HTTP / OpenAI-style server | Something other than a function call needs to send prompts |
-| C++ tokenizer choice (HF `tokenizers` via tokenizers-cpp, or our own BPE + minja for templates) | C++ port reaches `tokenizer` |
+| ~~HTTP / OpenAI-style server~~ Done (cpp-port §7): `mllm serve`, streaming `/v1/completions` only | Non-streaming, chat completions, more params: a client that needs them |
+| ~~C++ tokenizer choice~~ Done: our own byte-level BPE with llama.cpp's unicode tables, ChatML hard-coded (cpp-port §2) | Jinja templates: a second model family |
 | ~~GPU-side token feedback~~ Done for greedy rows (one step ahead, g5). Sampled rows (temp > 0) still wait for the CPU each step: sampling on the GPU | Sampled decode is the hot path |
 
 ## First model
@@ -199,4 +204,5 @@ Before step 1: read the dev model's `config.json` for `layer_types` and the line
 |---|---|
 | ~~Does one Core ML model per dense block work on the ANE?~~ **Yes** (build step 3): every op on the ANE, one call per layer. Its speed at 27B shapes (needs the spike's splits?) is still unmeasured | Whether the ANE beats the GPU for 27B prefill |
 | Which ANE weight format for the 27B? fp16 = 54 GB (impossible); int8 = 27 GB; LUT6 ≈ 20 GB; LUT4 ≈ 14 GB, but LUT4 made from the 4-bit MLX weights fails (cos 0.93). Try LUT4 made from the **bf16 original** weights, and check whether the 27B tolerates LUT4 better than the 0.8B. Next to 15 GB of GPU 4-bit weights and ~12–16 GB for macOS, only LUT4 leaves room for a real arena | Whether ANE prefill fits in 64 GB next to the GPU weights at all |
+| ~~Does ANE prefill beat the GPU once C++ removes Python's copies?~~ **Alone, a little** (C++ port): 5,670 vs 5,300 tok/s at 512. **Under decode load, no**: a chunk slows to 170–225 ms (per-layer GPU round trips), but decode next to it loses 7–9% instead of ~70%. Served: GPU prefill gives the better TTFT (0.62 vs 1.46 s median at 8 × 512), ANE prefill the better per-client decode (218 vs 110 tok/s) ([report](../reports/mlx-lm%20baseline.md) §1, §2) | Default `--prefill`; whether to pipeline the ANE lane and send tail chunks to the GPU |
 | Where does the ANE's fp16 error come from (accumulation, `layer_norm`, `silu`)? | Whether fp32 or split ops are worth it for longer prompts |

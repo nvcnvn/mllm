@@ -12,6 +12,7 @@
 
 #include "engine.h"
 #include "lanes.h"
+#include "server.h"
 #include "spec.h"
 
 namespace mllm {
@@ -334,12 +335,24 @@ static void bench(const std::string& model, int P, int G, int B, int n, const st
     printf("\n");
 }
 
+// mllm serve: /v1/completions on 127.0.0.1 until killed. A 2 GiB arena: 32 requests of 512 + 256 tokens need 0.9.
+static int serve(const std::string& model, int port, const std::string& on, const std::string& ane_weights,
+                 int max_batch) {
+    mllm::Engine e(model, (size_t)2 << 30, 512, 32, max_batch, 16384, on, ane_weights);
+    mllm::Server s(e, model);
+    fprintf(stderr, "mllm serve: http://127.0.0.1:%d/v1/completions (prefill on %s, max batch %d)\n", port, on.c_str(),
+            max_batch);
+    if (!s.listen("127.0.0.1", port)) throw std::runtime_error("can't listen on port " + std::to_string(port));
+    return 0;
+}
+
 static int usage() {
     fprintf(stderr,
             "usage: mllm MODEL                                print the model spec\n"
             "       mllm generate MODEL PROMPT [--max-tokens N] [--temp T] [--top-p P] [PREFILL]\n"
             "       mllm bench MODEL [-p 512] [-g 1024] [-b 1] [-n 5] [--stream P] [PREFILL]   mlx_lm.benchmark's\n"
             "         fields; --stream P: a P-token prefill runs alongside throughout, its own tok/s reported\n"
+            "       mllm serve MODEL [--port 8080] [--max-batch 32] [PREFILL]   streaming /v1/completions on 127.0.0.1\n"
             "       mllm bench-ops MODEL                      GPU time per op and per decode step, next to the roofline\n"
             "MODEL: repo id under $HF_HOME, or a local dir\n"
             "PREFILL: [--prefill gpu|ane] [--ane-weights fp16|int8|lut6|lut4]: dense blocks of prefill on the Neural\n"
@@ -352,7 +365,7 @@ int main(int argc, char** argv) {
     const std::string cmd = argv[1];
     // flags after the positional arguments: name -> value
     std::map<std::string, std::string> flags;
-    const int npos = cmd == "generate" ? 4 : cmd == "bench" || cmd == "bench-ops" ? 3 : 2;
+    const int npos = cmd == "generate" ? 4 : cmd == "bench" || cmd == "bench-ops" || cmd == "serve" ? 3 : 2;
     if (argc < npos || (argc - npos) % 2) return usage();
     for (int i = npos; i < argc; i += 2) flags[argv[i]] = argv[i + 1];
     auto flag = [&](const char* name, const char* def) {
@@ -375,6 +388,11 @@ int main(int argc, char** argv) {
             const int stream = std::stoi(flag("--stream", "0"));
             if (!flags.empty() || P < 2 || G < 1 || B < 1 || n < 1 || stream < 0 || stream == 1) return usage();
             bench(argv[2], P, G, B, n, on, aw, stream);
+        } else if (cmd == "serve") {
+            const int port = std::stoi(flag("--port", "8080")), max_batch = std::stoi(flag("--max-batch", "32"));
+            const std::string on = flag("--prefill", "gpu"), aw = flag("--ane-weights", "fp16");
+            if (!flags.empty() || max_batch < 1) return usage();
+            return serve(argv[2], port, on, aw, max_batch);
         } else if (cmd == "bench-ops") {
             if (!flags.empty()) return usage();
             mllm::GpuOpsTest::bench_ops(argv[2]);

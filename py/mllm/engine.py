@@ -1,5 +1,7 @@
 """Engine: requests and the loop. submit() + step() + cancel() is the API; generate() is sugar over them.
 
+Reference only: the C++ engine (src/) is the one to extend; this stays the golden-data source (py/dump_golden.py).
+
     from mllm.engine import Engine
     e = Engine("mlx-community/Qwen3.5-0.8B-4bit")
     for text in e.generate([{"role": "user", "content": "hi"}]):

@@ -101,6 +101,58 @@ All C clients start together, each with its own prompt (no prompt-cache hits). E
 | 2048 | 1 | 0.49 / 0.49 | 245 | 127 |
 | 2048 | 8 | 4.01 / 4.01 | 94 | 191 |
 
+### C++ engine (`mllm serve`)
+
+```
+build/mllm serve mlx-community/Qwen3.5-0.8B-4bit [--prefill ane]   # defaults: port 8080, max batch 32, chunk 512, 2 GiB arena
+.venv/bin/python tools/serve_bench.py --clients 1 4 8 16 32 -p 512 -g 256 -n 3
+.venv/bin/python tools/serve_bench.py --clients 1 8 -p 2048 -g 128 -n 3
+```
+Measured 2026-11-23 (branch `port/g7-serve-close`, before its QA fixes: input limits and a 100 ms idle wake-up, off the token path; QA reproduced TTFT within 1–4% after them), serve_bench unchanged. GPU prefill, ANE
+prefill (fp16 blocks, S = 512) and `mlx_lm.server` were run back to back in one session, on the same port. The
+machine was **not** idle (java at ~400% CPU). mlx-lm's numbers that day match the table above to within its round-to-round spread,
+so the load didn't move the comparison. Each value is the median of 3 rounds. Greedy tokens are the same as mlx-lm's: the
+rounds that stop early on EOS (`g tok` 129 at 4 × 512, 7 at 1 × 2048) stop at the same token count in all three servers.
+
+| prompt | clients | ttft s (median / p90), GPU prefill | ANE prefill | mlx-lm (same session) | tok/s per client, GPU / ANE / mlx-lm | total tok/s, GPU / ANE / mlx-lm |
+|---:|---:|---:|---:|---:|---:|---:|
+| 512 | 1 | 0.11 / 0.11 | 0.17 / 0.17 | 0.13 / 0.13 | 298 / 294 / 227 | 266 / 248 / 205 |
+| 512 | 4 | 0.37 / 0.43 | 0.67 / 0.86 | 0.48 / 0.48 | 190 / 233 / 157 | 588 / 452 / 481 |
+| 512 | 8 | **0.62 / 0.94** | 1.46 / 2.48 | 1.00 / 1.00 | 110 / 218 / 94 | 683 / 526 / 548 |
+| 512 | 16 | 1.21 / 2.03 | 3.02 / 5.11 | 2.02 / 2.05 | 63 / 211 / 56 | 690 / 516 / 571 |
+| 512 | 32 | 2.56 / 4.60 | 6.53 / 11.34 | 3.85 / 4.46 | 42 / 204 / 38 | 857 / 556 / 738 |
+| 2048 | 1 | 0.45 / 0.45 | 0.45 / 0.45 | 0.50 / 0.50 | 287 / 289 / 225 | 143 / 144 / 117 |
+| 2048 | 8 | **2.31 / 3.60** | 2.75 / 4.35 | 4.45 / 4.45 | 50 / 250 / 87 | 183 / 165 / 173 |
+
+Targets (TTFT clearly below mlx-lm's 0.99 s at 8 × 512 and 4.0 s at 8 × 2048):
+- **GPU prefill: met at the median, p90 only just.** At 8 × 512 the median is 0.62 s against 0.99–1.00, the p90 0.94; at 8 × 2048 the median is 2.31 s against 4.0–4.45, the p90 3.60.
+- **ANE prefill: missed at 512** (1.46 / 2.48 s at 8 clients), **median met, p90 missed at 2048** (2.75 / 4.35 s).
+
+Why:
+- **We prefill FIFO, one chunk of one request at a time; mlx-lm prefills all waiting prompts in one batch.** So in each of
+  our rounds the first client gets its token after one prompt's prefill and the last after all of them, and the median
+  client sits in the middle. In mlx-lm everyone waits for the whole batch, so median = p90. The last client is
+  bounded by the same total prefill work in both (8 × ~536 tokens at ~4,500 tok/s ≈ 0.95 s), so our p90 can't go much
+  below mlx-lm's while prefill runs on the GPU at the same speed. Chunking only spreads that wait out. The median is where we win, and it keeps winning as
+  clients grow (2.56 vs 3.85 s at 32).
+- **GPU prefill and decode share the GPU.** The first clients start decoding while the others prefill, and decode next
+  to a GPU prefill stream loses ~70% (§1, ANE prefill). Hence the low per-client decode at 8 × 2048 (50 tok/s, mlx-lm 87):
+  most of each client's 128 tokens overlap someone's prefill. At 512 the prefills end sooner and we stay ahead (110 vs
+  94 at 8, 42 vs 38 at 32). With GPU prefill, total tok/s beats mlx-lm in every row (by 6% at 8 × 2048, up to 30% at 1 client).
+- **The server costs us nothing at one client:** 298 tok/s served, the same as offline `mllm bench` (295–299), where
+  `mlx_lm.server` loses 25–30% (227 vs 307). The handlers never touch the engine, and the engine thread runs `step()` back to back.
+- **ANE prefill slows under decode load, and pads the tail chunk.** Alone a 512 chunk takes ~90 ms, but with decode
+  running it takes 170–225 ms, because the lane waits for the GPU after each of the 24 layers. On top of that, the
+  ANE models are compiled for S = 512, so a ~536-token prompt (serve_bench's 512 random tokens, retokenized) costs two full chunks, one of which is ~23 tokens of
+  real work (even at 1 client, TTFT is 0.17 s against 0.11 on the GPU). The GPU prefills the 25-token tail in a few ms.
+  So 8 × 512 is ~16 slow ANE chunks in series, about 2.5 s for the last client. The payoff is decode: the ANE leaves
+  the GPU to decode, so each client gets 204–250 tok/s at every load (GPU prefill: 42–110), but total tok/s is lower
+  because new clients wait longer to join the batch.
+- **Ways to close it** (not done): tail chunks below about half a chunk on the GPU, not padded on the ANE; pipeline the ANE
+  lane (ANE `dense(i + 1)` of one chunk while the GPU runs `attn(i)` of another) so it stops waiting for the GPU each
+  layer; and for p90, prefill several waiting prompts per GPU submission as mlx-lm does, or give the first chunk of
+  each waiting prompt priority over later chunks (shortest-first scheduling instead of FIFO).
+
 ## What it says
 - **Time to first token grows linearly with the number of clients.** In each round, all prompts are prefilled before any client gets its first token. TTFT ≈ C × prompt / ~4.2k tok/s, so 8 clients with 2k prompts wait 4 s each. The design targets exactly this: prefill on the ANE, decode on the GPU, and chunked prefill so decode never waits on a whole batch.
 - **Single-stream decode is already close to memory bandwidth.** The weights are 625 MB, and nearly all of them are read per token (the tied lm_head included). So 310 tok/s ≈ 190 GB/s, against the 211–238 GB/s we measured as the practical ceiling for GPU 4-bit decode. A C++ loop can gain at most about 15–25% at batch 1. Batching is where the headroom is: 16 rows reach 1064 tok/s total (3.4× one row), because they share each weight read.
