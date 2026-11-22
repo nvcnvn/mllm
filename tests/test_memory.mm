@@ -173,13 +173,21 @@ int main() {
         if (a.admit(1)) held.push_back(a.alloc());
         tables.write(w, {{0, 1, held}});  // one row holding every unit allocated so far
         const uint32_t* t = (const uint32_t*)w.contents;
-        assert(t[0] == 1 && t[3] == 0 && t[4] == held.size() && std::equal(held.begin(), held.end(), t + 5));
+        assert(t[0] == 1 && t[1] == 0 && t[4] == 0 && t[5] == held.size() && std::equal(held.begin(), held.end(), t + 6));
         if (step % 10 == 0) {
             a.committed = step;
             a.release(held);
             held.clear();
         }
         mem.request_residency();
+    }
+    // two rows with pages and state units: [R][n_state][pos][n][R + 1 offsets][pages][state x R]
+    {
+        std::vector<uint32_t> p0 = {4, 9}, p1 = {7}, s0 = {1, 3}, s1 = {8, 2};
+        tables.write(tables.copies[0], {{5, 1, p0, s0}, {0, 3, p1, s1}});
+        const uint32_t want[] = {2, 2, 5, 0, 1, 3, 0, 2, 3, 4, 9, 7, 1, 3, 8, 2};
+        assert(!memcmp(tables.copies[0].contents, want, sizeof want));
+        assert(aborts([&] { tables.write(tables.copies[0], {{5, 1, p0, s0}, {0, 3, p1, {}}}); }));  // state count differs
     }
     assert(mem.allocations == n_alloc);
     assert(aborts([&] { mem.buffer(16); }));              // allocation after startup

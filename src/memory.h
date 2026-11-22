@@ -66,13 +66,15 @@ struct Workspace {
 };
 
 // Per-step uint32 slot lists the GPU reads, 2 copies by step parity (memory-design "Step tables").
-// Layout (uint32 words, R rows): [R][pos x R][n x R][R + 1 offsets][slots...]; row b's pages are
-// slots[off[b] .. off[b + 1]). pos: the row's first token position, n: its valid tokens this step. The attention
-// kernels read it as is (src/kernels/attention.metal Table); rope reads the pos words as its int offsets.
+// Layout (uint32 words, R rows): [R][n_state][pos x R][n x R][R + 1 offsets][slots...][state x R]; row b's pages are
+// slots[off[b] .. off[b + 1]), its state units (linear layers; every row the same count, 0 or state_units) follow
+// all pages: state[b * count .. (b + 1) * count). pos: the row's first token position, n: its valid tokens this
+// step. The kernels read it as is (src/kernels/table.h Table); rope reads the pos words as its int offsets.
 struct StepTables {
     struct Row {
         int pos, n;
         std::span<const uint32_t> slots;
+        std::span<const uint32_t> state = {};  // the request's state units, in span order
     };
     id<MTLBuffer> copies[2];
     size_t words;      // capacity of each copy, in uint32

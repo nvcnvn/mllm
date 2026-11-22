@@ -5,7 +5,7 @@
 // equal the B = 2 run. Then attn.safetensors (py/dump_golden.py SWEEP): one row per (n, pos) around MLX's SDPA
 // switch points (1-pass / 2-pass and its blocks, vector / unfused, gemv_wide / steel, block / looped softmax), and
 // a 1-pass and a 2-pass decode row in one B = 2 call. Pass: everything bit-exact. Also: a padded prefill row
-// (n < ws.S) and a slot past the arena assert.
+// (n < ws.S), a slot past the arena and a linear layer on a table without state units assert.
 #include <fcntl.h>
 #include <spawn.h>
 #include <sys/wait.h>
@@ -66,6 +66,13 @@ int main(int argc, char** argv) {
         tables.write(table, {{100, 5, sl}});
         ops.begin();
         ops.attn(s.full_layers()[0], ws);
+        return 0;
+    }
+    if (mode == "nostate") {  // a linear layer with a table written without state units
+        tables.write(table, {{0, 1, std::vector<uint32_t>{0}}});
+        ws.B = 1, ws.S = 1;
+        ops.begin();
+        ops.attn(s.linear_layers()[0], ws);
         return 0;
     }
     if (mode == "slot") {  // a slot past the arena
@@ -221,7 +228,7 @@ int main(int argc, char** argv) {
     sweep({{"1_1023", &up}, {"1_4200", &down}});  // 1-pass row and 2-pass row in one decode call
     sweep({{"1_4200", &up}, {"1_0", &down}});
 
-    assert(aborts(argv[0], "padded") && aborts(argv[0], "slot"));
+    assert(aborts(argv[0], "padded") && aborts(argv[0], "slot") && aborts(argv[0], "nostate"));
 
     bool ok = true;
     for (const auto& [name, st] : stats) {

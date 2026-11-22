@@ -125,19 +125,23 @@ id<MTLBuffer> StepTables::begin(uint64_t step, uint64_t signaled) {
 
 void StepTables::write(id<MTLBuffer> table, const std::vector<Row>& rows) const {
     const uint32_t R = (uint32_t)rows.size();
-    size_t n_slots = 0;
-    for (const Row& r : rows) n_slots += r.slots.size();
-    assert(2 + 3 * R + n_slots <= words && table.length >= words * 4);
+    size_t n_slots = 0, n_state = R ? rows[0].state.size() : 0;
+    for (const Row& r : rows) n_slots += r.slots.size() + r.state.size(), assert(r.state.size() == n_state);
+    assert(3 + 3 * R + n_slots <= words && table.length >= words * 4);
     uint32_t* t = (uint32_t*)table.contents;
-    t[0] = R;
-    uint32_t* off = t + 1 + 2 * R;
+    t[0] = R, t[1] = (uint32_t)n_state;
+    uint32_t* off = t + 2 + 2 * R;
     off[0] = 0;
     for (uint32_t b = 0; b < R; b++) {
         assert(rows[b].pos >= 0 && rows[b].n >= 0);
         for (uint32_t s : rows[b].slots) assert(s < n_units);
-        t[1 + b] = rows[b].pos, t[1 + R + b] = rows[b].n;
+        t[2 + b] = rows[b].pos, t[2 + R + b] = rows[b].n;
         off[b + 1] = off[b] + (uint32_t)rows[b].slots.size();
         std::copy(rows[b].slots.begin(), rows[b].slots.end(), off + R + 1 + off[b]);
+    }
+    for (uint32_t b = 0; b < R; b++) {
+        for (uint32_t s : rows[b].state) assert(s < n_units);
+        std::copy(rows[b].state.begin(), rows[b].state.end(), off + R + 1 + off[R] + b * n_state);
     }
 }
 
@@ -210,7 +214,7 @@ Workspace Memory::workspace(int chunk, int max_batch) {
 StepTables Memory::step_tables(int max_rows) {
     // ponytail: slot words <= n_units while no unit is shared; the prefix cache lets rows share units, then size
     // by the sum of the rows' slot counts.
-    size_t words = 2 + 3 * (size_t)max_rows + arena.n_units;
+    size_t words = 3 + 3 * (size_t)max_rows + arena.n_units;
     return {{buffer(words * 4), buffer(words * 4)}, words, arena.n_units};
 }
 

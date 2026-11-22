@@ -9,7 +9,7 @@ METALFLAGS := -Wall -Wextra -fno-fast-math -Wno-c++17-extensions -Wno-c++20-exte
 LDLIBS := -framework Metal -framework Foundation
 export HF_HOME ?= /Volumes/T5/huggingface
 
-LIB_SRC := $(filter-out src/main.cpp,$(wildcard src/*.cpp src/*.mm src/vendor/*/*.cpp))
+LIB_SRC := $(filter-out src/main.mm,$(wildcard src/*.cpp src/*.mm src/vendor/*/*.cpp))
 LIB_OBJ := $(LIB_SRC:src/%=$(B)/obj/%.o)
 TESTS := $(patsubst tests/%,$(B)/tests/%,$(basename $(wildcard tests/*.cpp tests/*.mm)))
 AIR := $(patsubst src/kernels/%.metal,$(B)/air/%.air,$(wildcard src/kernels/*.metal))
@@ -29,7 +29,7 @@ $(B)/libmllm.a: $(LIB_OBJ)
 	@rm -f $@
 	ar rcs $@ $^
 
-$(B)/mllm: $(B)/obj/main.cpp.o $(B)/libmllm.a
+$(B)/mllm: $(B)/obj/main.mm.o $(B)/libmllm.a
 	$(CXX) $^ $(LDLIBS) -o $@
 
 $(B)/tests/%: tests/%.cpp $(B)/libmllm.a

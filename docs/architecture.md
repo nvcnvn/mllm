@@ -68,7 +68,7 @@ Your `attn()` / `ffn()` split, cut where the hardware cuts:
 | `Detokenizer` | `tokenizer` | Bytes not yet valid UTF-8 | `push(id) → str`, `flush() → str` |
 | `Memory` | `memory` | Weights, Arena, Workspace, StepTables | see below |
 | `Request` | `engine` | ids, state, `pos` (tokens with K/V), slot lists, sampling params, output ids, detokenizer | plain struct |
-| `GpuOps` | `gpu` | GPU kernels / MLX calls | `dense(i, ws)`, `attn(i, ws, table)`, `lm_head_sample(ws, params) → ids` |
+| `GpuOps` | `gpu` | GPU kernels / MLX calls | `dense(i, ws)`, `attn(i, ws)` (step table in `ws.table`), `lm_head(ws)` (GPU: logits + argmax, encoded), `sample(ws, params) → ids` (CPU, after the command buffer completed) |
 | `AneOps` | `ane` | One compiled Core ML model per dense block and chunk size | `dense(i, ws)` |
 | `PrefillLane` | `lanes` | In-flight prefill chunk | `submit(PrefillWork)`, `poll() → [PrefillWork]`, `busy()` |
 | `DecodeLane` | `lanes` | In-flight decode step(s), step counter | `submit(DecodeWork)`, `poll() → [(req_id, token)]`, `can_submit()` |

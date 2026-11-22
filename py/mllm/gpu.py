@@ -1,4 +1,4 @@
-"""GpuOps: dense(i), attn(i), lm_head_sample. Python runs them through MLX with mlx-lm's modules,
+"""GpuOps: dense(i), attn(i), lm_head, sample. Python runs them through MLX with mlx-lm's modules,
 so the results match mlx-lm bit for bit. C++ replaces this file with Metal kernels.
 
 Workspace fields:
@@ -101,8 +101,11 @@ class GpuOps:
         out = la.norm(out, ws.z[b:b + 1])
         return out.reshape(1, S, -1)
 
-    def lm_head_sample(self, ws, samplers):
+    def lm_head(self, ws):
+        """ws.x's last position -> ws.logits [B, vocab]. C++ splits here: lm_head is GPU work, sample runs after."""
         h = ws.x[:, -1, :]
-        logits = self.lm.embed_tokens.as_linear(h) if self.tied else self.mem.weights.lm_head(h)
-        logprobs = logits - mx.logsumexp(logits, axis=-1, keepdims=True)
+        ws.logits = self.lm.embed_tokens.as_linear(h) if self.tied else self.mem.weights.lm_head(h)
+
+    def sample(self, ws, samplers):
+        logprobs = ws.logits - mx.logsumexp(ws.logits, axis=-1, keepdims=True)
         return [samplers[b](logprobs[b:b + 1]).item() for b in range(len(samplers))]

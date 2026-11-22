@@ -28,6 +28,8 @@ Files and keys (bf16 stays bf16, ints are int32):
                       N_POS/q, k, v [n, heads, dim] (the C++ row-major layout), N_POS/gate [n, heads*dim]
                       N_POS/o [n, heads*dim]; N_POS/kv_k, kv_v [kv_heads, pos + n, dim] the pages after the call
                       (the first pos tokens are the random prefix the call read)
+  lm_head.safetensors x [16, hidden] random bf16; M/logits [M, vocab] the tied lm_head (as GpuOps) of x[:M],
+                      M = 1..16 (MLX's quantized matmul switches kernels by M)
 """
 import hashlib
 import json
@@ -147,19 +149,17 @@ def trace(e):
     ops.dense, ops.attn = wrap("dense", ops.dense), wrap("attn", ops.attn)
     e.prefill.dense = ops.dense
 
-    lm_head = ops.lm_head_sample
+    sample = ops.sample
 
-    def lm_head_sample(ws, samplers):
-        h = ws.x[:, -1, :]
-        logits = ops.lm.embed_tokens.as_linear(h) if ops.tied else mem.weights.lm_head(h)  # as GpuOps
-        toks = lm_head(ws, samplers)
-        argmax = np.array(mx.argmax(logits, axis=-1))
-        assert argmax.tolist() == toks, "recomputed logits drifted from what GpuOps sampled (greedy)"
-        out[f"{cur['name']}/logits"] = logits
+    def sample_rec(ws, samplers):
+        toks = sample(ws, samplers)
+        argmax = np.array(mx.argmax(ws.logits, axis=-1))
+        assert argmax.tolist() == toks, "greedy sample differs from argmax(logits)"
+        out[f"{cur['name']}/logits"] = ws.logits
         out[f"{cur['name']}/argmax"] = i32(argmax)
         out[f"{cur['name']}/sampled"] = i32(toks)
         return toks
-    ops.lm_head_sample = lm_head_sample
+    ops.sample = sample_rec
 
     def after(rows):
         """rows: [(req, n_tokens)] -> K/V and state of each request."""
@@ -233,6 +233,16 @@ def attn_sweep(eng):
     return out
 
 
+def lm_head_sweep(eng):
+    ops = eng.prefill.ops
+    mx.random.seed(1)
+    x = mx.random.normal((16, eng.spec.hidden)).astype(mx.bfloat16)
+    out = {"x": x}
+    for M in range(1, 17):
+        out[f"{M}/logits"] = ops.lm.embed_tokens.as_linear(x[:M]) if ops.tied else eng.mem.weights.lm_head(x[:M])
+    return out
+
+
 def main():
     model = sys.argv[1]
     eng = Engine(model, arena_bytes=ARENA, chunk=CHUNK)
@@ -254,6 +264,7 @@ def main():
     mx.save_safetensors(str(dst / "tokens.safetensors"), tokens)
 
     mx.save_safetensors(str(dst / "attn.safetensors"), attn_sweep(eng))
+    mx.save_safetensors(str(dst / "lm_head.safetensors"), lm_head_sweep(eng))
     tr, calls = trace(Engine(model, arena_bytes=ARENA, chunk=CHUNK))
     mx.save_safetensors(str(dst / "trace.safetensors"), tr)
 

@@ -6,13 +6,7 @@
 #include "mlx/backend/metal/kernels/utils.h"
 #include "mlx/backend/metal/kernels/sdpa_vector.h"
 
-// memory.h StepTables: [R][pos x R][n x R][R + 1 offsets][slots...]
-struct Table {
-  const device uint* t;
-  int pos(int b) const { return t[1 + b]; }
-  int n(int b) const { return t[1 + t[0] + b]; }
-  uint slot(int b, int page) const { return t[2 + 3 * t[0] + t[1 + 2 * t[0] + b] + page]; }
-};
+#include "table.h"
 
 // The arena's K/V layout for one full layer (memory.h kv_offset), in elements.
 struct KVLayout {

@@ -79,7 +79,8 @@ class DecodeLane:
         ws.tokens = mx.array([[r.token] for r in w.rows])
         _layers(self.ops.dense, self.ops, self.mem, ws, [(r.pos, r.slots) for r in w.rows], [r.state_slots for r in w.rows])
         self.ops.dense(self.ops.spec.n_layers, ws)
-        toks = self.ops.lm_head_sample(ws, [r.sampler for r in w.rows])
+        self.ops.lm_head(ws)
+        toks = self.ops.sample(ws, [r.sampler for r in w.rows])
         self.done.extend((r.req_id, t) for r, t in zip(w.rows, toks))
 
     def poll(self):

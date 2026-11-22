@@ -10,9 +10,6 @@
 
 namespace mllm {
 
-// ponytail: mlx-lm reads rms_norm_eps from config.json; every Qwen3.5 uses 1e-6. Add it to ModelSpec when a model
-// differs.
-constexpr float EPS = 1e-6f;
 // ponytail: Qwen3.5's RoPE (mlx-lm nn.RoPE(64, traditional=False, base=1e7); mrope is a no-op for text). spec.py has
 // no rope fields yet; add them when a model differs.
 constexpr int ROPE_DIMS = 64;
@@ -92,6 +89,15 @@ GpuOps::GpuOps(Memory& mem, const Weights& weights, int max_rows, int max_ctx)
     sdpa_2pass_1[1] = pipeline(@"sdpa_vector_2pass_1_paged_bfloat16_256_tk1");
     sdpa_2pass_2 = pipeline(@"sdpa_vector_2pass_2_bfloat16_256");
     sigmoid_gate_ps = pipeline(@"sigmoid_gate");
+    // linear attention: kernel names fix the conv kernel and head shapes
+    if (!spec.linear_layers().empty() && (spec.conv_kernel != 4 || spec.lin_k_heads != 16 || spec.lin_v_heads != 16 ||
+                                          spec.lin_k_dim != 128 || spec.lin_v_dim != 128))
+        throw std::runtime_error("GpuOps: linear attention kernels instantiated for Qwen3.5-0.8B's shapes only");
+    conv1d_silu_ps = pipeline(@"conv1d_silu_4");
+    scale_qk_ps = pipeline(@"scale_qk");
+    gdn_gates_ps = pipeline(@"gdn_gates");
+    gated_delta_ps = pipeline(@"gated_delta_paged_bfloat16_128_128_16_16");
+    argmax_ps = pipeline(@"argmax_bf16");
     gather_kv_ps = pipeline(@"gather_kv_bfloat16_256");
     causal_mask_ps = pipeline(@"causal_mask");
     scale_ps = pipeline(@"scale_bf16");
@@ -126,6 +132,9 @@ GpuOps::GpuOps(Memory& mem, const Weights& weights, int max_rows, int max_ctx)
     };
     const std::string P = "language_model.model.";
     embed_tokens = qlinear(P + "embed_tokens");
+    // ponytail: tied lm_head only (Qwen3.5 <= 9B); load language_model.lm_head as a QLinear for untied models
+    if (weights.st.tensors.count("language_model.lm_head.weight"))
+        throw std::runtime_error("GpuOps: untied lm_head not ported");
     norm = buf(P + "norm.weight");
     for (int i = 0, n_full = 0; i < spec.n_layers(); i++) {
         std::string p = P + "layers." + std::to_string(i) + ".";
@@ -143,6 +152,12 @@ GpuOps::GpuOps(Memory& mem, const Weights& weights, int max_rows, int max_ctx)
             l.in_proj_z = qlinear(p + "linear_attn.in_proj_z");
             l.in_proj_b = qlinear(p + "linear_attn.in_proj_b");
             l.in_proj_a = qlinear(p + "linear_attn.in_proj_a");
+            l.conv1d = buf(p + "linear_attn.conv1d.weight");
+            l.A_log = buf(p + "linear_attn.A_log");
+            l.dt_bias = buf(p + "linear_attn.dt_bias");
+            l.gated_norm = buf(p + "linear_attn.norm.weight");
+            if (weights[p + "linear_attn.A_log"].t.dtype != "F32" || weights[p + "linear_attn.conv1d.weight"].t.dtype != "BF16")
+                throw std::runtime_error(p + "linear_attn: A_log F32 and conv1d BF16 expected");
         } else {
             l.out = qlinear(p + "self_attn.o_proj");
             l.q_proj = qlinear(p + "self_attn.q_proj");
@@ -172,6 +187,12 @@ GpuOps::GpuOps(Memory& mem, const Weights& weights, int max_rows, int max_ctx)
     kc = mem.buffer(spec.n_kv_heads * (size_t)max_ctx * D * ELEM);
     vc = mem.buffer(spec.n_kv_heads * (size_t)max_ctx * D * ELEM);
     scores = mem.buffer(row * H * max_ctx);
+    nqkv = mem.buffer(row * spec.conv_dim());
+    gdn_g = mem.buffer((size_t)max_rows * spec.lin_v_heads * sizeof(float));
+    beta = mem.buffer(row * spec.lin_v_heads);
+    one = mem.buffer(ELEM);
+    *(uint16_t*)one.contents = 0x3F80;  // bf16 1.0
+    ids = mem.buffer((size_t)max_rows * sizeof(int32_t));
 }
 
 void GpuOps::begin() {
@@ -202,13 +223,13 @@ void GpuOps::embed(Buf tokens, Buf out, int rows) {
 }
 
 // mlx RMSNorm::eval_gpu, rms_single_row branch
-void GpuOps::rms_norm(Buf weight, Buf x, Buf out, int rows, int dim) {
+void GpuOps::rms_norm(Buf weight, Buf x, Buf out, int rows, int dim, float eps, uint32_t w_stride) {
     assert(dim <= 4096);  // RMS_LOOPED_LIMIT; wider rows need rms_looped
-    uint32_t tg = 32 * (((dim + 3) / 4 + 31) / 32), axis = dim, w_stride = 1;
+    uint32_t tg = 32 * (((dim + 3) / 4 + 31) / 32), axis = dim;
     assert(tg <= rms_ps.maxTotalThreadsPerThreadgroup);
     [enc setComputePipelineState:rms_ps];
     set(enc, x, 0), set(enc, weight, 1), set(enc, out, 2);
-    set_bytes(enc, EPS, 3), set_bytes(enc, axis, 4), set_bytes(enc, w_stride, 5);
+    set_bytes(enc, eps, 3), set_bytes(enc, axis, 4), set_bytes(enc, w_stride, 5);
     [enc dispatchThreads:MTLSizeMake((size_t)rows * tg, 1, 1) threadsPerThreadgroup:MTLSizeMake(tg, 1, 1)];
 }
 
@@ -353,8 +374,57 @@ void GpuOps::matmul(bool transpose_b, Buf a, Buf b, Buf d, int M, int N, int K, 
 
 void GpuOps::attn(int i, Workspace& ws) {
     assert(i >= 0 && i < spec.n_layers());
-    if (layers[i].is_linear) throw std::logic_error("GpuOps::attn: linear layers not ported yet");
-    full_attn(layers[i], ws);
+    if (layers[i].is_linear)
+        linear_attn(i, layers[i], ws);
+    else
+        full_attn(layers[i], ws);
+}
+
+// gpu.py _linear, batched: one dispatch per op over all rows (MLX runs them one row at a time; every kernel here
+// computes a row the same way regardless of B). Same lane contract as full_attn: B == 1 is a prefill row with
+// ws.S == n, B > 1 is decode (S == 1, rows with n == 0 skipped).
+void GpuOps::linear_attn(int i, const Layer& l, Workspace& ws) {
+    const int B = ws.B, S = ws.S, M = B * S, C = spec.conv_dim(), Hv = spec.lin_v_heads, Dk = spec.lin_k_dim;
+    const int key_dim = spec.lin_k_heads * Dk;
+    id<MTLBuffer> table = ws.table;
+    const uint32_t* tb = (const uint32_t*)table.contents;
+    // the table must carry every row's state span: the kernels index it with n_state = mem.state_units
+    assert((int)tb[0] == B && tb[1] == mem.state_units && M <= max_rows && (B == 1 || S == 1));
+    for (int b = 0; b < B; b++) assert(B == 1 ? (int)tb[2 + B + b] == S : (int)tb[2 + B + b] <= S);
+    const uint64_t unit = mem.arena.unit_bytes, conv_off = mem.state_offset(i), delta_off = conv_off + mem.conv_bytes;
+    const int n_state = (int)mem.state_units;
+    // gated_delta_paged reads each lane's 32 floats as one run: runs must not cross a unit
+    assert(unit % 128 == 0 && delta_off % 128 == 0);
+    id<MTLBuffer> arena = mem.arena_buffer;
+
+    [enc setComputePipelineState:conv1d_silu_ps];
+    set(enc, {ws.qkv}, 0), set(enc, l.conv1d, 1), set(enc, {arena}, 2), set(enc, {table}, 3);
+    set_bytes(enc, unit, 4), set_bytes(enc, n_state, 5), set_bytes(enc, conv_off, 6), set_bytes(enc, S, 7);
+    [enc dispatchThreads:MTLSizeMake(C, B, 1) threadsPerThreadgroup:MTLSizeMake(256, 1, 1)];
+
+    // normalize_qk: rms_norm without weight (eps scaled to the mean), then the scales. Rows of 128 over the whole
+    // conv output (v too, into scratch; only q / k are used), as MLX norms the q / k slices.
+    const double inv_scale = std::pow((double)Dk, -0.5);
+    rms_norm({one}, {ws.qkv}, {nqkv}, M * (C / Dk), Dk, (float)(1e-6 * inv_scale * inv_scale), 0);
+    [enc setComputePipelineState:scale_qk_ps];
+    set(enc, {nqkv}, 0), set_bytes(enc, (float)(inv_scale * inv_scale), 1), set_bytes(enc, (float)inv_scale, 2);
+    set_bytes(enc, C, 3);
+    [enc dispatchThreads:MTLSizeMake(2 * key_dim, M, 1) threadsPerThreadgroup:MTLSizeMake(256, 1, 1)];
+
+    [enc setComputePipelineState:gdn_gates_ps];
+    set(enc, {ws.a}, 0), set(enc, {ws.b}, 1), set(enc, l.A_log, 2), set(enc, l.dt_bias, 3), set(enc, {gdn_g}, 4);
+    set(enc, {beta}, 5);
+    [enc dispatchThreads:MTLSizeMake(Hv, M, 1) threadsPerThreadgroup:MTLSizeMake(Hv, 1, 1)];
+
+    // mlx-lm: grid (32, Dv / 8, B * Hv), threadgroup (32, 2, 1)
+    [enc setComputePipelineState:gated_delta_ps];
+    set(enc, {nqkv}, 0), set(enc, {nqkv, (size_t)key_dim * ELEM}, 1), set(enc, {ws.qkv, 2 * (size_t)key_dim * ELEM}, 2);
+    set(enc, {gdn_g}, 3), set(enc, {beta}, 4), set(enc, {arena}, 5), set(enc, {ws.o}, 6), set(enc, {table}, 7);
+    set_bytes(enc, S, 8), set_bytes(enc, C, 9), set_bytes(enc, unit, 10), set_bytes(enc, n_state, 11);
+    set_bytes(enc, delta_off, 12);
+    [enc dispatchThreads:MTLSizeMake(32, spec.lin_v_dim / 8, B * Hv) threadsPerThreadgroup:MTLSizeMake(32, 2, 1)];
+
+    gated_rms_norm(l.gated_norm, {ws.o}, {ws.z}, {ws.o}, M * Hv, spec.lin_v_dim);
 }
 
 // gpu.py _full, batched: one dispatch per op over all rows. MLX v0.32.4 ops in Python's order: fast::rope on q and k,
@@ -369,8 +439,8 @@ void GpuOps::full_attn(const Layer& l, Workspace& ws) {
     assert((int)tb[0] == B && B * S <= max_rows && (B == 1 || S == 1));
     int min_N = INT_MAX, max_N = 0;
     for (int b = 0; b < B; b++) {
-        int pos = tb[1 + b], n = tb[1 + B + b], N = pos + n;
-        assert((B == 1 ? n == S : n <= S) && N <= max_ctx && tb[2 + 2 * B + b] - tb[1 + 2 * B + b] >= mem.units_for(N));
+        int pos = tb[2 + b], n = tb[2 + B + b], N = pos + n;
+        assert((B == 1 ? n == S : n <= S) && N <= max_ctx && tb[3 + 2 * B + b] - tb[2 + 2 * B + b] >= mem.units_for(N));
         if (n) min_N = std::min(min_N, N), max_N = std::max(max_N, N);
     }
     if (!max_N) return;
@@ -379,7 +449,7 @@ void GpuOps::full_attn(const Layer& l, Workspace& ws) {
     // Batched kernel "rope_bfloat16", per-row offsets = the table's pos words.
     auto rope = [&](id<MTLBuffer> x, int heads) {
         [enc setComputePipelineState:rope_ps];
-        set(enc, {x}, 0), set(enc, {x}, 1), set(enc, {table, 4}, 2), set_bytes(enc, 1.0f, 3);
+        set(enc, {x}, 0), set(enc, {x}, 1), set(enc, {table, 8}, 2), set_bytes(enc, 1.0f, 3);
         int64_t strides[3] = {D, (int64_t)heads * D, 1};
         [enc setBytes:strides length:sizeof strides atIndex:4];
         [enc setBytes:strides length:sizeof strides atIndex:5];
@@ -455,6 +525,97 @@ void GpuOps::full_attn(const Layer& l, Workspace& ws) {
     [enc setComputePipelineState:sigmoid_gate_ps];
     set(enc, {ao}, 0), set(enc, {ws.gate}, 1), set(enc, {ws.o}, 2), set_bytes(enc, S, 3);
     [enc dispatchThreads:MTLSizeMake(D, H, B * S) threadsPerThreadgroup:MTLSizeMake(D, 1, 1)];
+}
+
+}  // namespace mllm
+
+namespace mllm {
+
+void GpuOps::lm_head(Workspace& ws) {
+    const int B = ws.B, V = embed_tokens.N;
+    assert(ws.S == 1 && B <= max_rows && ws.logits.length >= (size_t)B * V * ELEM);
+    linear(embed_tokens, {ws.x}, {ws.logits}, B);  // embed_tokens.as_linear: the same quantized matmul
+    argmax({ws.logits}, {ids}, B, V);
+}
+
+void GpuOps::argmax(Buf x, Buf out, int rows, int V) {
+    [enc setComputePipelineState:argmax_ps];
+    set(enc, x, 0), set(enc, out, 1), set_bytes(enc, V, 2);
+    [enc dispatchThreadgroups:MTLSizeMake(rows, 1, 1) threadsPerThreadgroup:MTLSizeMake(1024, 1, 1)];
+}
+
+// make_sampler(temp, top_p) on one logits row: apply_top_p on the temperature-1 probabilities (keep every token
+// >= the smallest value whose strictly larger tokens hold < top_p of the mass), then categorical(logits / temp).
+// Python feeds it logprobs (logits - logsumexp, in bf16) and draws with Gumbel-max; this draws the same
+// distribution from the logits (shift-invariant) by inverse CDF, in double.
+// bf16 has 65536 values: count each one (keys ordered by value), then walk the keys from the top, so the cost is
+// one counting pass over the row (~0.1 ms at vocab 248k) instead of an exp and a sort per token.
+// ponytail: CPU; sample on the GPU when it shows up in the decode profile.
+static int sample_row(const uint16_t* row, int V, const SampleParams& p) {
+    auto key = [](uint16_t b) { return b & 0x8000 ? (int)(uint16_t)~b : (int)(b | 0x8000); };
+    auto value = [](int k) {
+        uint32_t u = (uint32_t)(k & 0x8000 ? k & 0x7FFF : ~k & 0xFFFF) << 16;
+        float f;
+        memcpy(&f, &u, 4);
+        return (double)f;
+    };
+    static thread_local std::vector<uint32_t> count(65536);  // all zero between calls: re-zeroed over [kmin, kmax]
+    for (int i = 0; i < V; i++) count[key(row[i])]++;
+    int kmin = 0, kmax = 65535;  // the touched range (cheaper to find here than per token)
+    while (!count[kmin]) kmin++;
+    while (!count[kmax]) kmax--;
+    const int bottom = std::max(kmin, key(0xFF80));  // +inf .. -inf: NaNs never drawn
+    int top = std::min(kmax, key(0x7F80));
+    while (top > bottom && !count[top]) top--;
+    int k = -1;      // the drawn value's key
+    uint32_t j = 0;  // which of its tokens (equal values are equally likely)
+    if (top >= bottom && count[top] && std::isfinite(value(top))) {
+        const double m = value(top);
+        int thr = bottom;
+        if (p.top_p > 0 && p.top_p < 1) {
+            double total = 0, above = 0;
+            for (int i = top; i >= bottom; i--)
+                if (count[i]) total += count[i] * std::exp(value(i) - m);
+            for (int i = top; i >= bottom && above < p.top_p * total; i--)
+                if (count[i]) thr = i, above += count[i] * std::exp(value(i) - m);
+        }
+        auto weight = [&](int i) { return std::exp((value(i) - m) / p.temp); };
+        double sum = 0;
+        for (int i = top; i >= thr; i--)
+            if (count[i]) sum += count[i] * weight(i);
+        double u = std::uniform_real_distribution<double>(0, sum)(*p.rng);
+        // weights fall with the key: past a zero weight (-inf, underflow) nothing has mass. A rounding edge that
+        // walks off the end keeps the last bucket with weight.
+        for (int i = top; i >= thr; i--) {
+            if (!count[i]) continue;
+            const double w = weight(i);
+            if (w == 0) break;
+            k = i, j = count[i] - 1;
+            if (u < count[i] * w) {
+                j = std::min(j, (uint32_t)(u / w));
+                break;
+            }
+            u -= count[i] * w;
+        }
+    }
+    std::fill(count.begin() + kmin, count.begin() + kmax + 1, 0);
+    if (k < 0) return 0;  // no finite logit: garbage in (argmax answers 0 too)
+    for (int i = 0; i < V; i++)
+        if (key(row[i]) == k && !j--) return i;
+    return 0;  // unreachable
+}
+
+std::vector<int> GpuOps::sample(const Workspace& ws, const std::vector<SampleParams>& params) const {
+    const int V = embed_tokens.N;
+    assert((int)params.size() == ws.B);
+    std::vector<int> out(ws.B);
+    for (int b = 0; b < ws.B; b++) {
+        const SampleParams& p = params[b];
+        assert(p.temp >= 0 && (p.temp == 0 || p.rng));
+        out[b] = p.temp == 0 ? ((const int32_t*)ids.contents)[b]
+                             : sample_row((const uint16_t*)ws.logits.contents + (size_t)b * V, V, p);
+    }
+    return out;
 }
 
 }  // namespace mllm

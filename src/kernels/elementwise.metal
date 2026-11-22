@@ -4,6 +4,8 @@
 #include "mlx/backend/metal/kernels/binary_ops.h"
 #include "mlx/backend/metal/kernels/unary_ops.h"
 
+#include "table.h"
+
 // x + y (residual adds)
 [[kernel]] void add(const device bfloat16_t* x [[buffer(0)]], const device bfloat16_t* y [[buffer(1)]],
                     device bfloat16_t* out [[buffer(2)]], uint i [[thread_position_in_grid]]) {
@@ -59,4 +61,67 @@
 [[kernel]] void scale_bf16(device bfloat16_t* x [[buffer(0)]], const constant float& scale [[buffer(1)]],
                            uint i [[thread_position_in_grid]]) {
   x[i] = Multiply{}(static_cast<bfloat16_t>(scale), x[i]);
+}
+
+// --- linear attention (gpu.py _linear); the MLX-generated gated delta kernel is in linear_attn.metal ---
+
+// conv_in = concat(conv state [K - 1, C], the row's n qkv rows); conv state = conv_in's last K - 1 rows;
+// out = silu(depthwise conv1d(conv_in)): MLX's depthwise_conv_1d (float acc over the taps in order) then the compiled
+// nn.silu (x * sigmoid(x), bf16). In place: qkv row t becomes out row t. The conv state sits in the row's state
+// span at conv_off. One thread per (channel, row), grid (C, B).
+template <int K>
+[[kernel]] void conv1d_silu(
+    device bfloat16_t* qkv [[buffer(0)]],
+    const device bfloat16_t* w [[buffer(1)]],  // [C, K]
+    device uchar* arena [[buffer(2)]],
+    const device uint* table [[buffer(3)]],
+    const constant ulong& unit [[buffer(4)]],
+    const constant int& n_state [[buffer(5)]],
+    const constant ulong& conv_off [[buffer(6)]],
+    const constant int& S [[buffer(7)]],
+    uint2 i [[thread_position_in_grid]],
+    uint2 grid [[threads_per_grid]]) {
+  Table tb{table};
+  const int b = i.y, n = tb.n(b), C = grid.x;
+  if (!n) return;
+  device bfloat16_t* st[K - 1];
+  bfloat16_t win[K];
+  for (int r = 0; r < K - 1; r++) {
+    st[r] = (device bfloat16_t*)(arena + tb.state_byte(b, n_state, unit, conv_off + (ulong(r) * C + i.x) * 2));
+    win[r] = *st[r];
+  }
+  device bfloat16_t* x = qkv + ulong(b) * S * C + i.x;
+  w += i.x * K;
+  for (int t = 0; t < n; t++, x += C) {
+    win[K - 1] = *x;
+    float acc = 0.0;
+    for (int k = 0; k < K; ++k) acc += static_cast<float>(win[k]) * w[k];
+    bfloat16_t y = static_cast<bfloat16_t>(acc);
+    *x = Multiply{}(y, Sigmoid{}(y));
+    for (int k = 0; k < K - 1; k++) win[k] = win[k + 1];
+  }
+  for (int r = 0; r < K - 1; r++) *st[r] = win[r];
+}
+template [[host_name("conv1d_silu_4")]] [[kernel]] decltype(conv1d_silu<4>) conv1d_silu<4>;
+
+// normalize_qk's scales after rms_norm: q * bf16(inv_scale ** 2), k * bf16(inv_scale), in place. x rows hold
+// [q | k | ...] with stride ld; grid (2 * key_dim, rows).
+[[kernel]] void scale_qk(device bfloat16_t* x [[buffer(0)]], const constant float& q_scale [[buffer(1)]],
+                         const constant float& k_scale [[buffer(2)]], const constant int& ld [[buffer(3)]],
+                         uint2 i [[thread_position_in_grid]], uint2 grid [[threads_per_grid]]) {
+  device bfloat16_t* p = x + ulong(i.y) * ld + i.x;
+  *p = Multiply{}(static_cast<bfloat16_t>(i.x < grid.x / 2 ? q_scale : k_scale), *p);
+}
+
+// gated_delta_update's gates: beta = sigmoid(b) (bf16); g = compute_g, compiled: exp(-exp(A_log) * float(softplus(a +
+// dt_bias))), softplus = logaddexp(x, 0) in bf16. Grid (Hv, rows).
+[[kernel]] void gdn_gates(const device bfloat16_t* a [[buffer(0)]], const device bfloat16_t* b [[buffer(1)]],
+                          const device float* A_log [[buffer(2)]], const device bfloat16_t* dt_bias [[buffer(3)]],
+                          device float* g [[buffer(4)]], device bfloat16_t* beta [[buffer(5)]],
+                          uint2 i [[thread_position_in_grid]], uint2 grid [[threads_per_grid]]) {
+  ulong j = ulong(i.y) * grid.x + i.x;
+  beta[j] = Sigmoid{}(b[j]);
+  float e = Negative{}(Exp{}(A_log[i.x]));
+  bfloat16_t sp = LogAddExp{}(Add{}(a[j], dt_bias[i.x]), static_cast<bfloat16_t>(0));
+  g[j] = Exp{}(Multiply{}(e, static_cast<float>(sp)));
 }
