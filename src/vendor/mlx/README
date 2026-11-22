@@ -1,0 +1,3 @@
+MLX v0.32.4 (https://github.com/ml-explore/mlx, tag v0.32.4, commit 36969c0), MIT, see LICENSE.
+Metal kernel headers copied verbatim, only those the files in src/kernels/ include (transitively).
+v0.32.4 is the mlx wheel the golden data was made with; keep both on the same version for bit-exact results.

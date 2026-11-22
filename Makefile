@@ -1,17 +1,18 @@
 # make: build/libmllm.a, build/mllm (CLI), build/tests/*, build/mllm.metallib.  make test: run every test.
 CXX := clang++
-CXXFLAGS := -std=c++20 -O2 -Wall -Wextra -MMD -MP -Isrc -isystem src/vendor
-OBJCFLAGS := -fobjc-arc
-LDLIBS := -framework Metal -framework Foundation
 B := build
+CXXFLAGS := -std=c++20 -O2 -Wall -Wextra -MMD -MP -Isrc -isystem src/vendor
+METALLIB := $(abspath $(B)/mllm.metallib)
+OBJCFLAGS := -fobjc-arc -DMETALLIB='"$(METALLIB)"'
+# MLX's own kernel flags (mlx/backend/metal/kernels/CMakeLists.txt): no fast math, or results drift from MLX's
+METALFLAGS := -Wall -Wextra -fno-fast-math -Wno-c++17-extensions -Wno-c++20-extensions -Isrc/vendor/mlx
+LDLIBS := -framework Metal -framework Foundation
 export HF_HOME ?= /Volumes/T5/huggingface
 
 LIB_SRC := $(filter-out src/main.cpp,$(wildcard src/*.cpp src/*.mm src/vendor/*/*.cpp))
 LIB_OBJ := $(LIB_SRC:src/%=$(B)/obj/%.o)
 TESTS := $(patsubst tests/%,$(B)/tests/%,$(basename $(wildcard tests/*.cpp tests/*.mm)))
 AIR := $(patsubst src/kernels/%.metal,$(B)/air/%.air,$(wildcard src/kernels/*.metal))
-
-METALLIB := $(abspath $(B)/mllm.metallib)
 
 # needs the Metal Toolchain (xcodebuild -downloadComponent MetalToolchain)
 all: $(B)/libmllm.a $(B)/mllm $(TESTS) $(B)/mllm.metallib
@@ -37,11 +38,11 @@ $(B)/tests/%: tests/%.cpp $(B)/libmllm.a
 
 $(B)/tests/%: tests/%.mm $(B)/libmllm.a
 	@mkdir -p $(@D)
-	$(CXX) $(CXXFLAGS) $(OBJCFLAGS) -Itests -DMETALLIB='"$(METALLIB)"' $< $(B)/libmllm.a $(LDLIBS) -o $@
+	$(CXX) $(CXXFLAGS) $(OBJCFLAGS) -Itests $< $(B)/libmllm.a $(LDLIBS) -o $@
 
 $(B)/air/%.air: src/kernels/%.metal
 	@mkdir -p $(@D)
-	xcrun -sdk macosx metal -Wall -MMD -MP -MF $(@:.air=.d) -c $< -o $@
+	xcrun -sdk macosx metal $(METALFLAGS) -MMD -MP -MF $(@:.air=.d) -c $< -o $@
 
 $(B)/mllm.metallib: $(AIR)
 	xcrun -sdk macosx metallib $^ -o $@

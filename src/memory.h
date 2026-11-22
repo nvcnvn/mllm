@@ -60,6 +60,7 @@ public:
 struct Workspace {
     id<MTLBuffer> tokens, x, o, q, k, v, gate, qkv, z, b, a;
     id<MTLBuffer> logits;  // [max_batch, vocab]
+    int B = 0, S = 0;      // tokens' shape this step (the lane sets it); dense ops work on B * S rows
 };
 
 // Per-step uint32 slot lists the GPU reads, 2 copies by step parity (memory-design "Step tables").
