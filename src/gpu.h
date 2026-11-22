@@ -3,7 +3,9 @@
 #pragma once
 #import <Metal/Metal.h>
 
+#include <cassert>
 #include <random>
+#include <thread>
 
 #include "memory.h"
 
@@ -61,6 +63,7 @@ public:
 
 private:
     friend struct GpuOpsTest;  // tests and bench-ops reach the kernel helpers below (Metal types, rule 1)
+    friend class AneOps;       // embed and pipeline() for the ANE path
 
     // The kernels dense() is made of. Encoded into the current command buffer.
     void embed(Buf tokens, Buf out, int rows);
@@ -98,7 +101,13 @@ private:
     id<MTLDevice> device;
     id<MTLLibrary> library;
     // the current workspace's encoder and split-k scratch, for the helpers above (set by each public op)
-    void use(const Workspace& ws) { enc = ws.enc, splitk = ws.splitk; }
+    // One thread per GpuOps: these members are per call (the ANE lane's thread has its own copy, AneOps::gpu)
+    void use(const Workspace& ws) {
+        if (owner == std::thread::id()) owner = std::this_thread::get_id();
+        assert(owner == std::this_thread::get_id() && "GpuOps used from two threads");
+        enc = ws.enc, splitk = ws.splitk;
+    }
+    std::thread::id owner;  // the first thread that encoded with this object
     id<MTLComputeCommandEncoder> enc;
     id<MTLBuffer> splitk;
 

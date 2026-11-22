@@ -1,5 +1,8 @@
 #include "memory.h"
 
+#import <CoreVideo/CoreVideo.h>
+#import <IOSurface/IOSurface.h>
+
 #include <unistd.h>
 
 #include <cassert>
@@ -188,6 +191,28 @@ id<MTLBuffer> Memory::buffer(size_t bytes, MTLResourceOptions options) {
     if (!b) throw std::runtime_error("newBufferWithLength failed: " + std::to_string(bytes) + " bytes");
     allocations++;
     return b;
+}
+
+Memory::Surface Memory::surface(int rows, int cols) {
+    assert(!frozen && "allocation after startup");
+    NSDictionary* attrs = @{(id)kCVPixelBufferIOSurfacePropertiesKey : @{}, (id)kCVPixelBufferMetalCompatibilityKey : @YES};
+    CVPixelBufferRef pb = nullptr;
+    if (CVPixelBufferCreate(nullptr, cols, rows, kCVPixelFormatType_OneComponent16Half, (__bridge CFDictionaryRef)attrs,
+                            &pb) != kCVReturnSuccess)
+        throw std::runtime_error("CVPixelBufferCreate failed: " + std::to_string(rows) + " x " + std::to_string(cols));
+    id owner = (__bridge_transfer id)pb;
+    IOSurfaceRef s = CVPixelBufferGetIOSurface(pb);
+    // allocSize has a small tail: wrap just the rows, rounded up to a page
+    const size_t page = getpagesize(), bpr = IOSurfaceGetBytesPerRow(s), len = (bpr * rows + page - 1) / page * page;
+    void* base = IOSurfaceGetBaseAddress(s);
+    // ponytail: no fallback to a texture view (tools/ane_iosurface.swift); add one if a surface ever comes unaligned
+    if ((uintptr_t)base % page || len > (IOSurfaceGetAllocSize(s) + page - 1) / page * page || bpr % 2)
+        throw std::runtime_error("IOSurface base or size not page-aligned: no MTLBuffer view");
+    id<MTLBuffer> b = [device newBufferWithBytesNoCopy:base length:len options:MTLResourceStorageModeShared
+                                           deallocator:nil];
+    if (!b) throw std::runtime_error("newBufferWithBytesNoCopy over an IOSurface failed");
+    allocations++;
+    return {owner, b, (uint32_t)(bpr / 2)};
 }
 
 Workspace Memory::workspace(int chunk, int max_batch) {

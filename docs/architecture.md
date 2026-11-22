@@ -57,7 +57,7 @@ Your `attn()` / `ffn()` split, cut where the hardware cuts:
 
 | Phase | `dense` | `attn` | Sampling |
 |---|---|---|---|
-| Prefill | ANE, 4-bit LUT weights (GPU fallback, same interface) | GPU | — |
+| Prefill | ANE (`--prefill ane`; fp16 or int8 blocks, LUT4 fails on the 0.8B) or GPU (default), same interface | GPU | — |
 | Decode | GPU, 4-bit affine (MLX format) | GPU, paged | GPU |
 
 ## Components
@@ -121,8 +121,8 @@ step():
 ### Concurrency
 | | Python | C++ |
 |---|---|---|
-| Engine | caller's thread | one thread (`engine.mm`); both GPU lanes live on it, no lane threads. A `step()` with nothing to poll or submit blocks on the oldest lane event (decode's if one runs) |
-| PrefillLane | runs inside `submit` | GPU: own `MTLCommandQueue`, one chunk in flight; `submit` encodes and commits, `poll` reads the lane's `MTLSharedEvent` (never blocks). The ANE lane adds a thread (Core ML `predict` blocks) |
+| Engine | caller's thread | one thread (`engine.mm`) owns the bookkeeping and both lanes; the only other thread is the ANE prefill lane's (see PrefillLane), which never touches bookkeeping. A `step()` with nothing to poll or submit blocks on the oldest lane event (decode's if one runs) |
+| PrefillLane | runs inside `submit` | GPU: own `MTLCommandQueue`, one chunk in flight; `submit` encodes and commits, `poll` reads the lane's `MTLSharedEvent` (never blocks). ANE (`AneOps`): a lane thread (Core ML `predict` blocks), per layer ANE `dense(i)` then GPU `attn(i)` on the lane's queue, CPU waits for each; it encodes with its own copy of `GpuOps` (GpuOps keeps the current encoder in members); the engine sees the same submit / poll / event |
 | DecodeLane | runs inside `submit`, `mx.eval` per step | own `MTLCommandQueue`, one command buffer per step, one `MTLSharedEvent` signaled with step + 1; up to 2 steps in flight, ordered by an `MTLFence` (defensive: a fed step already reads the previous step's tracked `ids`). Not while a sampled row decodes: then all rows step together, one step in flight. Greedy rows of step N + 1 take step N's argmax on the GPU (`GpuOps::feed_tokens`); sampled rows wait for the CPU |
 
 - The two lanes write disjoint units: a request is in one lane at a time. So the two GPU queues need no ordering between them.

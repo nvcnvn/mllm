@@ -46,6 +46,39 @@ arena's unused rest, so it isn't comparable to MLX's (which includes its buffer 
 Targets: decode B=1 ≥ 300 tok/s **missed** (295–299; the GPU step alone allows 310), decode B=16 ≥ 1,064 met
 (1109–1115), GPU prefill at 512 ≥ 5,000 met (5272–5339).
 
+#### ANE prefill (C++, `--prefill ane`, fp16 blocks at S = 512)
+
+```
+build/mllm bench mlx-community/Qwen3.5-0.8B-4bit -p P -g G -b B -n 3 [--prefill ane] [--stream 512]
+```
+Same day and load (java ~400% CPU), interleaved GPU/ANE runs, 2 rounds. `--stream 512`: one more 512-token request
+(max_tokens 1) prefills throughout, a new one as each finishes; `stream_tps` is its prefill rate.
+
+| run | prefill tok/s | decode tok/s | stream prefill tok/s |
+|---|---:|---:|---:|
+| P=512 G=128 B=1, GPU prefill | 5221–5338 | 297–298 | |
+| P=512 G=128 B=1, ANE prefill | 5667–5688 | 295–298 | |
+| P=2048 G=128 B=1, GPU prefill | 4963–5341 | 290 | |
+| P=2048 G=128 B=1, ANE prefill | 5558–5585 | 289 | |
+| P=512 G=512 B=8, no stream (GPU / ANE prefill) | 4139–4511 / 2348 | 851–921 / 840 | |
+| P=512 G=512 B=8, stream on the GPU | 3930–4022 | 263–268 | 3190–3250 |
+| P=512 G=512 B=8, stream on the ANE | 2356 | 810 | 1136 |
+| P=512 G=2048 B=8, no stream, GPU prefill (pure decode) | 4480 | 882 (QA: 877) | |
+| P=512 G=2048 B=8, no stream, ANE prefill | 2252 | 805 (QA: 856) | |
+| P=512 G=2048 B=8, stream on the ANE | 2279 | 800 (QA: 816) | 1204 |
+
+- One 512 chunk alone: 24 `predict`s 56–59 ms + GPU attn/conversions 17 ms, ~86–93 ms wall (~5,700 tok/s).
+- With decode running, an ANE chunk takes 170–225 ms: the lane waits for the GPU after every layer (24 round trips),
+  and each of its small command buffers queues behind decode steps. So B=8's prompt_tps (prefills overlapping the
+  earlier requests' decode) is lower on the ANE (2,350) than on the GPU (4,100–4,500).
+- Overlap: against pure decode (GPU prefill, long G=2048 run) a concurrent ANE prefill stream costs B=8 decode
+  7–9% (882 → 800; QA's run 877 → 816), at the edge of the spike's −2…−12%; a GPU prefill stream costs it ~70%
+  (→ 265). Don't read the "no stream, ANE prefill" rows as the baseline: its decode is depressed by staggered
+  starts (the slower ANE prefill under decode load leaves fewer rows decoding in the tail), not by the ANE. The ANE
+  stream's own rate (1,136–1,204 tok/s) is limited by the per-layer GPU round trips; pipelining two chunks (ANE dense
+  of one while the GPU runs attn of the other) is the next step.
+
+
 ## 2. Serving: `mlx_lm.server` under concurrent clients
 
 ```

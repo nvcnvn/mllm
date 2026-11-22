@@ -110,6 +110,14 @@ public:
     void request_residency() { [residency requestResidency]; }
 
     id<MTLBuffer> buffer(size_t bytes, MTLResourceOptions options = MTLResourceStorageModeShared);  // every allocation
+    // ANE I/O: an IOSurface-backed fp16 [rows, cols] CVPixelBuffer (Core ML reads / writes it) and a no-copy MTLBuffer
+    // over the same bytes (tools/ane_iosurface.swift). Element (r, c) at r * row + c.
+    struct Surface {
+        id pixel_buffer;  // CVPixelBufferRef, owned
+        id<MTLBuffer> buffer;
+        uint32_t row;  // elements per row (bytesPerRow / 2)
+    };
+    Surface surface(int rows, int cols);
     void freeze() { frozen = true; }  // after startup: any further buffer() asserts
 
     ModelSpec spec;

@@ -15,7 +15,13 @@ double encode_and_wait(id<MTLCommandQueue> q, Workspace& ws, const std::function
     @autoreleasepool {
         id<MTLCommandBuffer> cb = [q commandBuffer];
         ws.enc = [cb computeCommandEncoder];
-        f();
+        try {
+            f();
+        } catch (...) {  // the ANE's predict failed midway: close the encoder, drop the command buffer
+            [ws.enc endEncoding];
+            ws.enc = nil;
+            throw;
+        }
         [ws.enc endEncoding];
         ws.enc = nil;
         [cb commit];
@@ -39,9 +45,54 @@ static void layers(GpuOps& ops, Workspace& ws, int L) {
     }
 }
 
-PrefillLane::PrefillLane(GpuOps& ops, Memory& mem, int chunk, int max_ctx)
-    : queue(lane_queue(mem)), event([mem.device newSharedEvent]), ops(ops), mem(mem),
-      ws(ops.workspace(chunk, 1, max_ctx)), tables(mem.step_tables(1)) {}
+PrefillLane::PrefillLane(GpuOps& ops, Memory& mem, int chunk, int max_ctx, AneOps* ane)
+    : queue(lane_queue(mem)), event([mem.device newSharedEvent]), ops(ane ? ane->gpu : ops), mem(mem),
+      ws(ops.workspace(chunk, 1, max_ctx)), tables(mem.step_tables(1)), ane(ane) {
+    if (ane && ane->S != chunk) throw std::invalid_argument("ANE prefill: chunk must equal the blocks' compiled S");
+    if (ane) thread = std::thread(&PrefillLane::run, this);
+}
+
+PrefillLane::~PrefillLane() {
+    if (!thread.joinable()) return;
+    {
+        std::lock_guard l(m);
+        stop = true;
+    }
+    cv.notify_one();
+    thread.join();  // after the chunk in flight, if any
+}
+
+// The ANE thread. ponytail: the CPU waits for the GPU every layer and for the ANE every block; pipelining
+// ANE dense(i + 1) with GPU attn(i) (two chunks in flight) is the next step if prefill speed matters.
+void PrefillLane::run() {
+    for (;;) {
+        uint64_t k;
+        {
+            std::unique_lock l(m);
+            cv.wait(l, [&] { return stop || todo; });
+            if (stop) return;
+            k = std::exchange(todo, 0);
+        }
+        try {
+            encode_and_wait(queue, ws, [&] { ane->inputs(0, ws); });
+            const int L = mem.spec.n_layers();
+            for (int i = 0; i < L; i++)  // K/V and state only: the last layer's o_proj + FFN never run
+                encode_and_wait(queue, ws, [&] {
+                    ane->dense(i, ws);
+                    ops.attn(i, ws);
+                    if (i + 1 < L) ane->inputs(i + 1, ws);
+                });
+        } catch (...) {
+            std::lock_guard l(m);
+            err = std::current_exception();
+        }
+        {
+            std::lock_guard l(m);
+            done = k;
+        }
+        event.signaledValue = k;  // wakes wait_oldest; poll trusts done
+    }
+}
 
 void PrefillLane::submit(PrefillWork work) {
     @autoreleasepool {
@@ -50,6 +101,15 @@ void PrefillLane::submit(PrefillWork work) {
         std::copy(work.tokens.begin(), work.tokens.end(), (int32_t*)ws.tokens.contents);
         ws.table = tables.begin(n + 1, event.signaledValue);
         tables.write(ws.table, {{work.start_pos, work.n_valid(), work.slots, work.state_slots}});
+        if (ane) {
+            w = std::move(work);
+            {
+                std::lock_guard l(m);
+                todo = ++n;
+            }
+            cv.notify_one();
+            return;
+        }
         cb = [queue commandBuffer];
         ws.enc = [cb computeCommandEncoder];
         // K/V and state only: the last layer's o_proj + FFN and lm_head never run
@@ -65,16 +125,28 @@ void PrefillLane::submit(PrefillWork work) {
 std::vector<PrefillWork> PrefillLane::poll() {
     @autoreleasepool {
         if (!busy()) return {};
+        if (ane) {
+            std::exception_ptr e;
+            {
+                std::lock_guard l(m);
+                if (done < n) return {};
+                e = std::exchange(err, nullptr);
+            }
+            if (e) {
+                w.reset();
+                std::rethrow_exception(e);
+            }
+        }
         if (cb.status == MTLCommandBufferStatusError) {
             auto e = failed("PrefillLane", cb);
             cb = nil, w.reset();
             throw e;
         }
         if (event.signaledValue < n) return {};
-        std::vector<PrefillWork> done;
-        done.push_back(std::move(*w));
+        std::vector<PrefillWork> out;
+        out.push_back(std::move(*w));
         cb = nil, w.reset();
-        return done;
+        return out;
     }
 }
 

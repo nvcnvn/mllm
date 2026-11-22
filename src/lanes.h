@@ -2,15 +2,22 @@
 // the lane's own MTLCommandQueue, commits it and returns; poll checks the lane's MTLSharedEvent (never blocks) and
 // returns finished work. Both lanes live on the engine thread; prefill and decode overlap on the GPU through the two
 // queues. Lanes never touch the allocator: every unit a work item needs is allocated before submit.
+// With AneOps, PrefillLane runs each chunk on a thread of its own (Core ML's predict blocks): per layer, ANE dense(i)
+// then GPU attn(i) on the lane's queue; the engine sees the same submit / poll / event as on the GPU.
 #pragma once
 #import <Metal/Metal.h>
 
+#include <condition_variable>
 #include <deque>
+#include <exception>
 #include <functional>
+#include <mutex>
 #include <optional>
+#include <thread>
 #include <utility>
 #include <vector>
 
+#include "ane.h"
 #include "gpu.h"
 
 namespace mllm {
@@ -40,7 +47,9 @@ double encode_and_wait(id<MTLCommandQueue> q, Workspace& ws, const std::function
 
 class PrefillLane {
 public:
-    PrefillLane(GpuOps& ops, Memory& mem, int chunk, int max_ctx);
+    // ane: dense on the Neural Engine (chunk must be its compiled S), attn with ane->gpu; nullptr: all on the GPU
+    PrefillLane(GpuOps& ops, Memory& mem, int chunk, int max_ctx, AneOps* ane = nullptr);
+    ~PrefillLane();
     bool busy() const { return w.has_value(); }  // one chunk in flight at a time
     void submit(PrefillWork work);
     std::vector<PrefillWork> poll();  // throws if the chunk's command buffer failed (the lane is free again)
@@ -57,6 +66,17 @@ private:
     uint64_t n = 0;  // chunks committed
     id<MTLCommandBuffer> cb;
     std::optional<PrefillWork> w;
+
+    // ANE: the engine hands chunk number `todo` to the thread; the thread signals `event` with it when done (or
+    // failed: err set first)
+    AneOps* ane;
+    std::mutex m;
+    std::condition_variable cv;
+    uint64_t todo = 0, done = 0;  // done: the last chunk the thread finished (read under m: memory ordering)
+    bool stop = false;
+    std::exception_ptr err;
+    std::thread thread;
+    void run();
 };
 
 class DecodeLane {

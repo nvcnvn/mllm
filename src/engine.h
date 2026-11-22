@@ -7,6 +7,7 @@
 #include <deque>
 #include <functional>
 #include <map>
+#include <memory>
 #include <random>
 #include <string>
 #include <vector>
@@ -50,8 +51,11 @@ class Engine {
 public:
     // chunk: prefill tokens per submit (a multiple of page_tokens, so chunks start on a page). max_batch: decode rows
     // per step. max_ctx: the longest request (prompt + max_tokens); sizes the prefill attention scratch.
+    // prefill_on: "gpu" or "ane" (dense blocks on the Neural Engine, built by Python for S = chunk; ane_weights:
+    // fp16, int8, lut6, lut4 as ane.py _compress). Decode always runs on the GPU.
     explicit Engine(const std::string& model, size_t arena_bytes = (size_t)1 << 30, int chunk = 512,
-                    int page_tokens = 32, int max_batch = 16, int max_ctx = 16384);
+                    int page_tokens = 32, int max_batch = 16, int max_ctx = 16384, const std::string& prefill_on = "gpu",
+                    const std::string& ane_weights = "fp16");
 
     int submit(std::vector<int> ids, GenParams p = {});  // throws std::invalid_argument
     int submit(const std::vector<Message>& chat, GenParams p = {});
@@ -67,6 +71,7 @@ public:
     Weights weights;
     Memory mem;
     GpuOps ops;
+    std::unique_ptr<AneOps> ane;  // prefill_on == "ane"
     PrefillLane prefill;
     DecodeLane decode;
     std::map<int, Request> reqs;  // live requests by id = arrival order

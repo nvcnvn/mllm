@@ -131,3 +131,18 @@ template [[host_name("conv1d_silu_4")]] [[kernel]] decltype(conv1d_silu<4>) conv
                             const constant int* src [[buffer(2)]], uint b [[thread_position_in_grid]]) {
     if (src[b] >= 0) tokens[b] = ids[src[b]];
 }
+
+// ANE output, fp16 channels-first [C, row] (an IOSurface; columns past n are padding) -> workspace bf16 [n, C],
+// rounded to nearest even like mx.astype(bfloat16). Grid: (C, n).
+[[kernel]] void from_ane(const device half* src [[buffer(0)]], device bfloat16_t* dst [[buffer(1)]],
+                         constant uint& row [[buffer(2)]], uint2 i [[thread_position_in_grid]],
+                         uint2 n [[threads_per_grid]]) {
+  dst[size_t(i.y) * n.x + i.x] = static_cast<bfloat16_t>(static_cast<float>(src[size_t(i.x) * row + i.y]));
+}
+
+// Workspace bf16 [n, C] -> ANE input, fp16 channels-first [C, row], zero in columns n .. S. Grid: (C, S).
+[[kernel]] void to_ane(const device bfloat16_t* src [[buffer(0)]], device half* dst [[buffer(1)]],
+                       constant uint& row [[buffer(2)]], constant uint& n [[buffer(3)]],
+                       uint2 i [[thread_position_in_grid]], uint2 g [[threads_per_grid]]) {
+  dst[size_t(i.x) * row + i.y] = i.y < n ? static_cast<half>(static_cast<float>(src[size_t(i.y) * g.x + i.x])) : 0.0h;
+}

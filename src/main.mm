@@ -251,8 +251,9 @@ void GpuOpsTest::bench_ops(const std::string& model) {
 }  // namespace mllm
 
 // mllm generate: the prompt as one user message (chat template), text streamed to stdout
-static void generate(const std::string& model, const std::string& prompt, mllm::GenParams p) {
-    mllm::Engine e(model);
+static void generate(const std::string& model, const std::string& prompt, mllm::GenParams p, const std::string& on,
+                     const std::string& ane_weights) {
+    mllm::Engine e(model, (size_t)1 << 30, 512, 32, 16, 16384, on, ane_weights);
     e.generate({{"user", prompt}}, p, [](const std::string& t) {
         fputs(t.c_str(), stdout);
         fflush(stdout);
@@ -265,37 +266,53 @@ static void generate(const std::string& model, const std::string& prompt, mllm::
 // prompt_tps = B * P / time until every request has its first token (prefill + first decode step, as mlx-lm);
 // generation_tps = tokens emitted after that / the time after it (B = 1: G - 1 tokens, mlx-lm counts G).
 // peak_memory = Metal allocations (weights, workspaces, the arena's peak in-use units; not its unused rest).
-static void bench(const std::string& model, int P, int G, int B, int n) {
-    mllm::Engine e(model);
+// stream > 0 (not in mlx-lm): meanwhile keep one more request of `stream` random tokens prefilling (max_tokens 1, a new
+// one as each finishes), left out of the fields above; stream_tps = its prompt tokens done / the trial's time. Measures
+// what a concurrent prefill costs decode (architecture.md "Concurrency").
+static void bench(const std::string& model, int P, int G, int B, int n, const std::string& on,
+                  const std::string& ane_weights, int stream) {
+    mllm::Engine e(model, (size_t)1 << 30, 512, 32, 16, 16384, on, ane_weights);
     e.tok.eos.clear();  // as mlx_lm.benchmark: never stop early
     std::mt19937 rng(0);
     std::uniform_int_distribution<int> tok(0, e.spec.vocab - 1);
     std::vector<std::vector<int>> prompts(B, std::vector<int>(P));
     for (auto& p : prompts)
         for (int& t : p) t = tok(rng);
+    std::vector<int> stream_prompt(stream);
+    for (int& t : stream_prompt) t = tok(rng);
     const mllm::Arena& a = e.mem.arena;
     struct Trial {
-        double prompt_tps, generation_tps, peak_memory, total_time;
+        double prompt_tps, generation_tps, peak_memory, total_time, stream_tps;
     };
     auto trial = [&] {
         using clock = std::chrono::steady_clock;
         const auto t0 = clock::now();
-        for (const auto& p : prompts) e.submit(p, {.max_tokens = G});
         std::map<int, int> got;
+        for (const auto& p : prompts) got[e.submit(p, {.max_tokens = G})] = 0;
+        int sid = -1;
+        long streamed = 0;
         uint32_t peak_units = 0;
         clock::time_point t_prompt;
-        long after = 0;
-        while (!e.reqs.empty()) {
+        long after = 0, started = 0;
+        while (std::any_of(got.begin(), got.end(), [&](auto& kv) { return e.reqs.count(kv.first); })) {
+            if (stream && !e.reqs.count(sid)) {
+                streamed += sid < 0 ? 0 : stream;
+                sid = e.submit(stream_prompt, {.max_tokens = 1});
+            }
             for (const mllm::Event& ev : e.step()) {
-                if (got[ev.req_id]++ == 0 && got.size() == (size_t)B) t_prompt = clock::now();
-                else if (got.size() == (size_t)B) after++;
+                if (!got.count(ev.req_id)) continue;
+                if (got[ev.req_id]++ == 0 && ++started == B) t_prompt = clock::now();
+                else if (started == B) after++;
             }
             peak_units = std::max(peak_units, a.n_units - a.free_units);
         }
         const auto t1 = clock::now();
+        if (sid >= 0) e.cancel(sid);
+        while (!e.reqs.empty()) e.step();
         auto sec = [](auto d) { return std::chrono::duration<double>(d).count(); };
         const double mem = (double)e.device.currentAllocatedSize - e.mem.arena_buffer.length + peak_units * a.unit_bytes;
-        return Trial{(double)B * P / sec(t_prompt - t0), after / sec(t1 - t_prompt), mem / 1e9, sec(t1 - t0)};
+        return Trial{(double)B * P / sec(t_prompt - t0), after / sec(t1 - t_prompt), mem / 1e9, sec(t1 - t0),
+                     streamed / sec(t1 - t0)};
     };
     printf("Running warmup..\n");
     trial();
@@ -303,22 +320,30 @@ static void bench(const std::string& model, int P, int G, int B, int n) {
     Trial sum{};
     for (int i = 0; i < n; i++) {
         Trial t = trial();
-        printf("Trial %d:  prompt_tps=%.3f, generation_tps=%.3f, peak_memory=%.3f, total_time=%.3f\n", i + 1,
+        printf("Trial %d:  prompt_tps=%.3f, generation_tps=%.3f, peak_memory=%.3f, total_time=%.3f", i + 1,
                t.prompt_tps, t.generation_tps, t.peak_memory, t.total_time);
+        if (stream) printf(", stream_tps=%.1f", t.stream_tps);
+        printf("\n");
         fflush(stdout);
-        sum = {sum.prompt_tps + t.prompt_tps, sum.generation_tps + t.generation_tps, sum.peak_memory + t.peak_memory, 0};
+        sum = {sum.prompt_tps + t.prompt_tps, sum.generation_tps + t.generation_tps, sum.peak_memory + t.peak_memory, 0,
+               sum.stream_tps + t.stream_tps};
     }
-    printf("Averages: prompt_tps=%.3f, generation_tps=%.3f, peak_memory=%.3f\n", sum.prompt_tps / n,
+    printf("Averages: prompt_tps=%.3f, generation_tps=%.3f, peak_memory=%.3f", sum.prompt_tps / n,
            sum.generation_tps / n, sum.peak_memory / n);
+    if (stream) printf(", stream_tps=%.1f", sum.stream_tps / n);
+    printf("\n");
 }
 
 static int usage() {
     fprintf(stderr,
             "usage: mllm MODEL                                print the model spec\n"
-            "       mllm generate MODEL PROMPT [--max-tokens N] [--temp T] [--top-p P]\n"
-            "       mllm bench MODEL [-p 512] [-g 1024] [-b 1] [-n 5]   mlx_lm.benchmark's fields\n"
+            "       mllm generate MODEL PROMPT [--max-tokens N] [--temp T] [--top-p P] [PREFILL]\n"
+            "       mllm bench MODEL [-p 512] [-g 1024] [-b 1] [-n 5] [--stream P] [PREFILL]   mlx_lm.benchmark's\n"
+            "         fields; --stream P: a P-token prefill runs alongside throughout, its own tok/s reported\n"
             "       mllm bench-ops MODEL                      GPU time per op and per decode step, next to the roofline\n"
-            "MODEL: repo id under $HF_HOME, or a local dir\n");
+            "MODEL: repo id under $HF_HOME, or a local dir\n"
+            "PREFILL: [--prefill gpu|ane] [--ane-weights fp16|int8|lut6|lut4]: dense blocks of prefill on the Neural\n"
+            "         Engine (Core ML models built by py/mllm/ane.py for S = 512)\n");
     return 2;
 }
 
@@ -340,13 +365,16 @@ int main(int argc, char** argv) {
         if (cmd == "generate") {
             mllm::GenParams p{std::stoi(flag("--max-tokens", "256")), std::stof(flag("--temp", "0")),
                               std::stof(flag("--top-p", "0"))};
+            const std::string on = flag("--prefill", "gpu"), aw = flag("--ane-weights", "fp16");
             if (!flags.empty()) return usage();
-            generate(argv[2], argv[3], p);
+            generate(argv[2], argv[3], p, on, aw);
         } else if (cmd == "bench") {
             const int P = std::stoi(flag("-p", "512")), G = std::stoi(flag("-g", "1024")), B = std::stoi(flag("-b", "1"));
             const int n = std::stoi(flag("-n", "5"));
-            if (!flags.empty() || P < 2 || G < 1 || B < 1 || n < 1) return usage();
-            bench(argv[2], P, G, B, n);
+            const std::string on = flag("--prefill", "gpu"), aw = flag("--ane-weights", "fp16");
+            const int stream = std::stoi(flag("--stream", "0"));
+            if (!flags.empty() || P < 2 || G < 1 || B < 1 || n < 1 || stream < 0 || stream == 1) return usage();
+            bench(argv[2], P, G, B, n, on, aw, stream);
         } else if (cmd == "bench-ops") {
             if (!flags.empty()) return usage();
             mllm::GpuOpsTest::bench_ops(argv[2]);
