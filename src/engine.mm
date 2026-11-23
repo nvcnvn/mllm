@@ -17,11 +17,12 @@ static std::unique_ptr<AneOps> ane_ops(const std::string& on, GpuOps& ops, Memor
 }
 
 Engine::Engine(const std::string& model, size_t arena_bytes, int chunk, int page_tokens, int max_batch, int max_ctx,
-               const std::string& prefill_on, const std::string& ane_weights)
+               const std::string& prefill_on, const std::string& ane_weights, bool prefix_cache)
     : spec(spec::load(model)), tok(spec.path), device(MTLCreateSystemDefaultDevice()), weights(spec.path, device),
       mem(spec, device, arena_bytes, page_tokens), ops(mem, weights), ane(ane_ops(prefill_on, ops, mem, chunk, ane_weights)),
       prefill(ops, mem, chunk, max_ctx, ane.get()),
-      decode(ops, mem, max_batch, max_ctx), chunk(chunk), max_batch(max_batch), max_ctx(max_ctx),
+      decode(ops, mem, max_batch, max_ctx), cache(prefix_cache ? std::make_unique<PrefixCache>(mem.arena, page_tokens) : nullptr),
+      chunk(chunk), max_batch(max_batch), max_ctx(max_ctx),
       residency_at(std::chrono::steady_clock::now()) {
     if (chunk % page_tokens) throw std::invalid_argument("chunks start on a page boundary: chunk % page_tokens != 0");
     // ponytail: full_attn has no steel attention (MLX's path for a first chunk >= 2048); lift when it's ported
@@ -91,6 +92,11 @@ std::vector<Event> Engine::step() {
                 continue;
             }
             r.pos += w.n_valid();
+            // ponytail: only completed snapshot points are cached; a cancelled or aborted request's later pages aren't
+            if (!r.snaps.empty() && r.pos == r.snaps.front()) {
+                snapshot(r);
+                r.snaps.erase(r.snaps.begin());
+            }
             if (r.pos == (int)r.ids.size() - 1) r.state = State::DECODE;
         }
         std::vector<std::pair<int, int>> toks;
@@ -119,17 +125,13 @@ std::vector<Event> Engine::step() {
                 text += r.detok.flush();
                 finish(r);
             }
-            emit({req_id, t, std::move(text), done});
+            emit({req_id, t, std::move(text), done, r.cached});
         }
 
         for (auto& [_, r] : reqs) {
             if (r.state != State::WAITING) continue;
-            if (!mem.arena.admit(demand(r))) break;  // arrival order: later requests never overtake the oldest waiter
-            r.reserved = demand(r), progress = true;
-            for (uint32_t j = 0; j < mem.state_units; j++) r.state_slots.push_back(alloc(r));
-            for (uint32_t u : r.state_slots)  // reused units hold an old request's state
-                memset((uint8_t*)mem.arena_buffer.contents + u * mem.arena.unit_bytes, 0, mem.arena.unit_bytes);
-            r.state = r.ids.size() > 1 ? State::PREFILL : State::DECODE;
+            if (!admit(r)) break;  // arrival order: later requests never overtake the oldest waiter
+            progress = true;
         }
 
         if (!prefill.busy()) {
@@ -137,7 +139,9 @@ std::vector<Event> Engine::step() {
                                    [](auto& kv) { return kv.second.state == State::PREFILL && !kv.second.in_flight; });
             if (it != reqs.end()) {
                 Request& r = it->second;
-                const int n = std::min(chunk, (int)r.ids.size() - 1 - r.pos);
+                int end = std::min(r.pos + chunk, (int)r.ids.size() - 1);
+                if (!r.snaps.empty()) end = std::min(end, r.snaps.front());
+                const int n = end - r.pos;
                 ensure_pages(r, r.pos + n);
                 r.in_flight = 1, progress = true;
                 try {
@@ -237,6 +241,69 @@ uint32_t Engine::alloc(Request& r) {
     }
     r.reserved--;
     return a.alloc();
+}
+
+// Reserve the request's units and give it its state; with the prefix cache, start at the deepest cached snapshot.
+bool Engine::admit(Request& r) {
+    Arena& a = mem.arena;
+    const int T = mem.T, last = (int)r.ids.size() - 1;  // the last prompt token is fed by decode
+    PrefixCache::Match m;
+    std::vector<int> snaps;
+    if (cache) {
+        m = cache->match(r.ids);
+        // the branch point (the next request with this prefix resumes there: shared system prompts) and the
+        // prompt's last full page (multi-turn: the next turn extends this prompt)
+        if (m.L > m.S) snaps.push_back(m.L * T);
+        if (const int p = last / T * T; p > m.S * T && (snaps.empty() || p > snaps[0])) snaps.push_back(p);
+        // While admitting, a hit holds its S pages and its snapshot: units neither free nor cache-only. ponytail: a
+        // request that can't fit with all that drops its copies (the branch point's first), then its hit (cold
+        // always fits: submit checks demand), instead of waiting forever
+        const auto need = [&] { return demand(r) - m.S + snaps.size() * mem.state_units + m.S + m.snapshot.size(); };
+        while (need() > a.n_units && !snaps.empty()) snaps.erase(snaps.begin());
+        if (need() > a.n_units) m = {};
+    }
+    // hold what the match returned, so admit's evictions can't free it
+    for (uint32_t u : m.pages) a.ref(u);
+    for (uint32_t u : m.snapshot) a.ref(u);
+    const uint32_t n = demand(r) - m.S + (uint32_t)snaps.size() * mem.state_units;
+    if (!a.admit(n, [&] { return cache && cache->evict(); })) {
+        a.release(m.pages), a.release(m.snapshot);
+        return false;
+    }
+    r.reserved = n, r.pages = m.pages, r.pos = r.cached = m.S * T, r.snaps = std::move(snaps);
+    for (uint32_t j = 0; j < mem.state_units; j++) r.state_slots.push_back(alloc(r));
+    if (m.S) {
+        copy_units(r.state_slots, m.snapshot);  // requests update their state in place
+        a.release(m.snapshot);
+    } else {
+        for (uint32_t u : r.state_slots)  // reused units hold an old request's state
+            memset((uint8_t*)mem.arena_buffer.contents + u * mem.arena.unit_bytes, 0, mem.arena.unit_bytes);
+    }
+    r.state = r.pos < last ? State::PREFILL : State::DECODE;
+    return true;
+}
+
+// r.pos is a snapshot point and its chunk has completed (the next one isn't submitted): copy its state into fresh
+// units and cache its pages up to here. Its pages from pos on stay its own.
+void Engine::snapshot(Request& r) {
+    const int n_pages = r.pos / mem.T;
+    if (cache->has_snapshot(r.ids, n_pages)) {  // another request got here first: return the copy's reservation
+        mem.arena.unreserve(mem.state_units);
+        r.reserved -= mem.state_units;
+        return;
+    }
+    std::vector<uint32_t> snap;
+    for (uint32_t j = 0; j < mem.state_units; j++) snap.push_back(alloc(r));
+    copy_units(snap, r.state_slots);
+    cache->insert(r.ids, n_pages, r.pages, snap);
+    mem.arena.release(snap);  // the cache's refs keep them
+}
+
+// CPU copy on the shared arena (~19 MB for Qwen3.5-0.8B's state): no GPU work reads or writes either side now
+void Engine::copy_units(const std::vector<uint32_t>& dst, const std::vector<uint32_t>& src) {
+    uint8_t* base = (uint8_t*)mem.arena_buffer.contents;
+    const size_t ub = mem.arena.unit_bytes;
+    for (size_t j = 0; j < dst.size(); j++) memcpy(base + dst[j] * ub, base + src[j] * ub, ub);
 }
 
 void Engine::ensure_pages(Request& r, int n_tokens) {

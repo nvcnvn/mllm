@@ -83,4 +83,4 @@ Each item is checked against the golden data for its layer. The goal is matching
 `py/` is frozen as the reference: it produces the golden data (`py/dump_golden.py`) and the Core ML blocks (`ane.py`); new engine features go into `src/` only.
 
 ## After the port (not in this checklist)
-These are triggered by the items in architecture.md's and memory-design.md's **Deferred** tables: prefix cache and SSD tier, 8-bit KV, more than one step encoded ahead, the Qwen3.6-27B target and its ANE weight format, `mlock`, a second model family with Jinja templates.
+These are triggered by the items in architecture.md's and memory-design.md's **Deferred** tables: prefix cache (done, g8: `src/prefix_cache`) and SSD tier, 8-bit KV, more than one step encoded ahead, the Qwen3.6-27B target and its ANE weight format, `mlock`, a second model family with Jinja templates.

@@ -47,7 +47,7 @@ static void layers(GpuOps& ops, Workspace& ws, int L) {
 
 PrefillLane::PrefillLane(GpuOps& ops, Memory& mem, int chunk, int max_ctx, AneOps* ane)
     : queue(lane_queue(mem)), event([mem.device newSharedEvent]), ops(ane ? ane->gpu : ops), mem(mem),
-      ws(ops.workspace(chunk, 1, max_ctx)), tables(mem.step_tables(1)), ane(ane) {
+      ws(ops.workspace(chunk, 1, max_ctx)), tables(mem.step_tables(1, max_ctx)), ane(ane) {
     if (ane && ane->S != chunk) throw std::invalid_argument("ANE prefill: chunk must equal the blocks' compiled S");
     if (ane) thread = std::thread(&PrefillLane::run, this);
 }
@@ -153,7 +153,7 @@ std::vector<PrefillWork> PrefillLane::poll() {
 DecodeLane::DecodeLane(GpuOps& ops, Memory& mem, int max_batch, int max_ctx)
     : queue(lane_queue(mem)), event([mem.device newSharedEvent]), fence([mem.device newFence]), ops(ops), mem(mem),
       ws{ops.workspace(1, max_batch, max_ctx), ops.workspace(1, max_batch, max_ctx)},
-      tables(mem.step_tables(max_batch)) {}
+      tables(mem.step_tables(max_batch, max_ctx)) {}
 
 void DecodeLane::submit(DecodeWork work) {
     @autoreleasepool {

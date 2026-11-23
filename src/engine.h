@@ -13,6 +13,7 @@
 #include <vector>
 
 #include "lanes.h"
+#include "prefix_cache.h"
 #include "tokenizer.h"
 
 namespace mllm {
@@ -27,6 +28,7 @@ struct Event {
     int req_id, token;
     std::string text;
     bool done;
+    int cached = 0;  // prompt tokens the prefix cache supplied (Request::cached)
 };
 
 enum class State { WAITING, PREFILL, DECODE, DONE };
@@ -40,6 +42,8 @@ struct Request {
     Detokenizer detok;
     State state = State::WAITING;
     int pos = 0;  // tokens whose K/V (and state) are in the arena
+    int cached = 0;          // prompt tokens taken from the prefix cache (its first pos)
+    std::vector<int> snaps;  // prefix cache: positions still ahead where the state is copied into the cache
     std::vector<uint32_t> pages, state_slots;
     uint32_t reserved = 0;  // units promised to this request, not yet allocated
     std::vector<int> out;
@@ -53,9 +57,10 @@ public:
     // per step. max_ctx: the longest request (prompt + max_tokens); sizes the prefill attention scratch.
     // prefill_on: "gpu" or "ane" (dense blocks on the Neural Engine, built by Python for S = chunk; ane_weights:
     // fp16, int8, lut6, lut4 as ane.py _compress). Decode always runs on the GPU.
+    // prefix_cache: reuse prompt pages and linear state across requests (prefix_cache.h); off = no lookups, no splits.
     explicit Engine(const std::string& model, size_t arena_bytes = (size_t)1 << 30, int chunk = 512,
                     int page_tokens = 32, int max_batch = 16, int max_ctx = 16384, const std::string& prefill_on = "gpu",
-                    const std::string& ane_weights = "fp16");
+                    const std::string& ane_weights = "fp16", bool prefix_cache = true);
 
     int submit(std::vector<int> ids, GenParams p = {});  // throws std::invalid_argument
     int submit(const std::vector<Message>& chat, GenParams p = {});
@@ -75,11 +80,15 @@ public:
     PrefillLane prefill;
     DecodeLane decode;
     std::map<int, Request> reqs;  // live requests by id = arrival order
+    std::unique_ptr<PrefixCache> cache;  // nullptr = off
 
 private:
     uint32_t demand(const Request& r) const;
     uint32_t alloc(Request& r);
     void ensure_pages(Request& r, int n_tokens);
+    bool admit(Request& r);
+    void snapshot(Request& r);
+    void copy_units(const std::vector<uint32_t>& dst, const std::vector<uint32_t>& src);
     void emit(Event ev);
     void abort(const std::vector<Request*>& rows);
     void finish(Request& r);

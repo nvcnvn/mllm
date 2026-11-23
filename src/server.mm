@@ -128,7 +128,8 @@ Server::Server(Engine& e, std::string model_name)
                         j = head;
                         j["choices"] = json::array();
                         j["usage"] = {{"prompt_tokens", s->prompt_tokens}, {"completion_tokens", *completion_tokens},
-                                      {"total_tokens", s->prompt_tokens + *completion_tokens}};
+                                      {"total_tokens", s->prompt_tokens + *completion_tokens},
+                                      {"prompt_tokens_details", {{"cached_tokens", ev.cached}}}};
                         if (!send(j)) return false;
                     }
                     const std::string end = "data: [DONE]\n\n";

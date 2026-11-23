@@ -4,6 +4,7 @@
 #import <Metal/Metal.h>
 
 #include <deque>
+#include <functional>
 #include <span>
 #include <string>
 #include <vector>
@@ -39,10 +40,15 @@ public:
     // memory-design's form; reserved <= free_units always holds, so neither side wraps
     bool fits(uint32_t n) const { return n <= free_units - reserved; }
     bool can_ever(uint32_t n) const { return n <= free_units + cache_only_units - reserved; }
-    bool admit(uint32_t n);  // reserve n units; false = wait (the engine rejects n > n_units on arrival)
+    // reserve n units; false = wait (the engine rejects n > n_units on arrival). evict: the prefix cache's next
+    // victim (false = nothing left), called while !fits(n); can_ever(n) means it gets there.
+    bool admit(uint32_t n, const std::function<bool()>& evict = {});
     uint32_t alloc();        // one unit out of the caller's reservation; needs a free (retired) unit
     void unreserve(uint32_t n);
     void release(const std::vector<uint32_t>& slots);  // drop one request ref per slot
+    void ref(uint32_t s);            // one more request ref on a held unit (a cached page or snapshot)
+    void cache_ref(uint32_t s);      // the prefix cache takes a unit a request holds
+    void cache_release(uint32_t s);  // the prefix cache drops it
     void retire(uint64_t signaled);  // pending units whose step <= signaled (GPU event value) become free
 
     size_t unit_bytes;
@@ -50,10 +56,13 @@ public:
     uint64_t committed = 0;  // last committed step: released units stay pending until the GPU passes it (lanes set it, g5)
 
     std::vector<uint64_t> free;  // bitmap, bit set = reusable now
-    std::vector<uint16_t> req_refs, cache_refs;  // cache_refs: nothing sets it until the prefix cache exists
+    std::vector<uint16_t> req_refs, cache_refs;
     std::deque<std::pair<uint32_t, uint64_t>> pending;  // (slot, step), steps non-decreasing
     uint32_t free_units;  // no references: free or pending
     uint32_t cache_only_units = 0, reserved = 0;
+
+private:
+    void drop(uint32_t s);  // no refs left: pending until the GPU passes committed
 };
 
 // Activation buffers, sized once for rows = max(chunk, max_batch) (py/mllm/gpu.py docstring has the fields).
@@ -105,7 +114,8 @@ public:
     size_t state_offset(int layer) const;
 
     Workspace workspace(int chunk, int max_batch);
-    StepTables step_tables(int max_rows);
+    // max_ctx bounds a row's pages (default: only the arena does)
+    StepTables step_tables(int max_rows, size_t max_ctx = SIZE_MAX / 2);
     // The engine calls this periodically so the OS keeps the arena and weights wired.
     void request_residency() { [residency requestResidency]; }
 

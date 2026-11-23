@@ -72,6 +72,7 @@ Your `attn()` / `ffn()` split, cut where the hardware cuts:
 | `AneOps` | `ane` | One compiled Core ML model per dense block and chunk size | `dense(i, ws)` |
 | `PrefillLane` | `lanes` | In-flight prefill chunk | `submit(PrefillWork)`, `poll() → [PrefillWork]`, `busy()` |
 | `DecodeLane` | `lanes` | In-flight decode step(s), step counter | `submit(DecodeWork)`, `poll() → [(req_id, token)]`, `can_submit()` |
+| `PrefixCache` (C++ only) | `prefix_cache` | A page-level trie of prompt pages by chained hashes; linear-state snapshots on some nodes | `match(ids) → {L, S, pages, snapshot}` at admission, `insert(ids, n_pages, pages, snapshot)` at a snapshot point, `evict()` from `Arena::admit` |
 | `Engine` | `engine` | Requests, the loop | `submit(prompt, params) → req_id`, `step() → [(req_id, text, done)]`, `generate(prompt, params) → iterator[str]` |
 | `Server` (C++ only) | `server` | httplib server, the engine thread, one event queue per HTTP request | `listen(host, port)`, `stop()`; streaming `POST /v1/completions`, `GET /v1/models` (`mllm serve`) |
 
@@ -136,11 +137,11 @@ step():
 ```
 py/mllm/spec.py  tokenizer.py  memory.py  gpu.py  ane.py  lanes.py  engine.py
 py/test_engine.py
-src/     spec  safetensors  tokenizer  memory  gpu  ane  lanes  engine  server   (.h + .cpp/.mm)
+src/     spec  safetensors  tokenizer  memory  gpu  ane  lanes  prefix_cache  engine  server   (.h + .cpp/.mm)
 src/main.mm         mllm CLI: generate, bench, bench-ops, serve
 src/kernels/*.metal attention  elementwise  linear_attn  matmul  norm  quantized  rope  sample  softmax  smoke, table.h
 src/vendor/         mlx (kernel headers), nlohmann, llama-unicode, cpp-httplib
-tests/test_*        one executable per component + test_golden / test_stack / test_server; golden.h
+tests/test_*        one executable per component + test_golden / test_stack / test_server / test_engine_cache; golden.h
 ```
 Python reuses mlx-lm wherever it can: `mlx_lm.load` for weights and the GPU dense modules, `TokenizerWrapper` and `StreamingDetokenizer` for the tokenizer, `mx.fast.scaled_dot_product_attention` over gathered pages for `attn`. *ponytail: the gather copies every page of a request into MLX every layer, every step. That is fine for checking correctness and useless for speed. The C++ paged kernel replaces it.*
 
@@ -174,7 +175,7 @@ Python reuses mlx-lm wherever it can: `mlx_lm.load` for weights and the GPU dens
 ## Deferred, with triggers
 | Item | Add when |
 |---|---|
-| Prefix cache (`match(ids) → (n_tokens, slots)` before chunking) | Step 2 is done; it plugs into `admit` and the chunk start |
+| ~~Prefix cache~~ Done (g8): `PrefixCache`, on by default (`--prefix-cache on|off`; off for `bench`). Resumes only at a state snapshot (the prompt's last full page, or a branch point) | Generated tokens cached (multi-turn without resending), or requests waiting for a snapshot an in-flight request is about to take |
 | Page-level sparse decode on full layers (Quest-style: a min/max key summary per page, attend to the top-k pages). Saves bandwidth. Saves RAM only if cold pages are spilled to the SSD tier | Full-layer K/V reads show up in decode time at long context |
 | Sliding-window `attn` kind (window pages) | Running Gemma 4 or another sliding-window model |
 | ~~HTTP / OpenAI-style server~~ Done (cpp-port §7): `mllm serve`, streaming `/v1/completions` only | Non-streaming, chat completions, more params: a client that needs them |

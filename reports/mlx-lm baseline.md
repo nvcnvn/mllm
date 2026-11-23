@@ -153,6 +153,44 @@ Why:
   layer; and for p90, prefill several waiting prompts per GPU submission as mlx-lm does, or give the first chunk of
   each waiting prompt priority over later chunks (shortest-first scheduling instead of FIFO).
 
+### Prefix cache (g8)
+
+```
+build/mllm serve mlx-community/Qwen3.5-0.8B-4bit --port 18008 --prefix-cache on|off   # on is the default
+.venv/bin/python tools/serve_bench.py --url http://127.0.0.1:18008/v1/completions --clients 8 -p 2048 -g 128 --shared-prefix 1536 -n 3
+.venv/bin/python tools/serve_bench.py --url http://127.0.0.1:18008/v1/completions --clients 1 -p 2048 -g 128 --shared-prefix 2048 -n 3
+```
+Measured 2026-11-23 (branch `g8-prefix-cache`), GPU prefill, off then on, back to back; java at ~400% CPU again.
+`--shared-prefix N`: every prompt starts with the same N random tokens (the same for the whole run), then its own;
+N = -p repeats one prompt. `cached` is the usage's `prompt_tokens_details.cached_tokens` (mean over clients).
+
+| run | trial | ttft s (median / p90), off | on | tok/s per client, off / on | total tok/s, off / on | cached (on) |
+|---|---:|---:|---:|---:|---:|---:|
+| 8 × 2048, 1536 shared | 1 | 2.37 / 3.69 | 2.23 / 3.54 | 50 / 50 | 202 / 191 | 0 |
+| | 2 | 2.30 / 3.60 | **0.75 / 1.16** | 51 / 93 | 206 / 462 | 1600 of 2156 |
+| | 3 | 2.28 / 3.57 | **0.76 / 1.16** | 51 / 93 | 207 / 461 | 1600 |
+| 1 × 2048, the same prompt again | 1–3 | 0.435–0.441 | **0.019** | 288–290 / 287–289 | 146 / 278 | 2144 of 2161 |
+
+- **Shared prefix: TTFT 3× lower (median and p90), total 2.2×** once the prefix is cached. Each client then prefills
+  ~556 tokens instead of ~2156, and decode has less prefill to share the GPU with (93 tok/s per client vs 51).
+- **Trial 1 doesn't hit**, by design: the warmup left only each prompt's last full page (past the shared part), so the
+  first 8 clients match the 1536 shared tokens' K/V but find no state snapshot on them. The linear layers' state can
+  only be resumed where a copy was taken. They all take the branch-point copy; the first to get there inserts it, and
+  every later request resumes there. Requests admitted together don't wait for each other's copy (deferred).
+- **A repeated prompt costs one chunk of 17 tokens** (2144 of 2161 from the cache; the last prompt token is always fed
+  by decode): TTFT 19 ms against 435 ms.
+- **When nothing hits** (trial 1, which also pays the extra chunk split and a 19 MB state copy per request), TTFT
+  (2.23 / 3.54 s vs 2.28–2.37 / 3.57–3.69) and per-client decode (50 vs 50–51) match the cache-off rounds. Total tok/s
+  is lower, 191 vs 202–207: that round produced fewer tokens, 112 per client on average against 128 (serve_bench's
+  `g tok` column, not in the table above), in a shorter wall time (4.7 vs 5.0 s), because some clients hit EOS early
+  (see the next point). One round can't separate a small cost from that. `mllm bench` defaults to off (its trials
+  reuse their prompts); with it, B = 1 and B = 8 at 512 / 256 measured 282–296 and 877–958 tok/s, interleaved with
+  the parent commit's 284–296 and 843–870.
+- Greedy tokens: equal to cache off when chunk boundaries don't move (bit-exact K/V and state in `test_engine_cache`);
+  when they do (a hit resumes mid-chunk, or the last-full-page split), K/V cosine is ≥ 0.99997, state ≥ 0.9999, and
+  greedy can flip at a near-tie, as it does with the cache off between chunk 64 and 512. Trial 1's early EOS comes
+  from such flips.
+
 ## What it says
 - **Time to first token grows linearly with the number of clients.** In each round, all prompts are prefilled before any client gets its first token. TTFT ≈ C × prompt / ~4.2k tok/s, so 8 clients with 2k prompts wait 4 s each. The design targets exactly this: prefill on the ANE, decode on the GPU, and chunked prefill so decode never waits on a whole batch.
 - **Single-stream decode is already close to memory bandwidth.** The weights are 625 MB, and nearly all of them are read per token (the tied lm_head included). So 310 tok/s ≈ 190 GB/s, against the 211–238 GB/s we measured as the practical ceiling for GPU 4-bit decode. A C++ loop can gain at most about 15–25% at batch 1. Batching is where the headroom is: 16 rows reach 1064 tok/s total (3.4× one row), because they share each weight read.

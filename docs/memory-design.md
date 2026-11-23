@@ -93,8 +93,9 @@ offset_in_unit(l, kv, head, token, dim) =
 ### Sharing
 The prefix cache and live requests share pages by reference count.
 - Each slot has two counts: `req_refs` (live requests) and `cache_refs` (prefix-cache entries). A unit is free when both are 0.
-- **Cache entries end on a page boundary.** Shared pages are therefore full and never written again, so there is no copy-on-write. A cache hit recomputes at most 31 tokens.
-- A cache entry holds: every full-attention page up to its end; the window pages covering the last window before its end; and, for linear-attention models, a **copy** of the state slot (requests update state in place).
+- **Cache entries end on a page boundary.** Shared pages are therefore full and never written again, so there is no copy-on-write.
+- The cache is a trie of pages (one node per full prompt page, keyed by a chained hash, tokens verified). A node holds its full-attention page; the window pages covering the last window before it (sliding-window models, not built yet); and, for linear-attention models, optionally a **copy** of the state slot (requests update state in place).
+- A request can only resume at a node with a state copy, so a hit recomputes from the deepest such node (any amount, not just ≤ 31 tokens). Copies are taken at two points per request: the prompt's last full page (the next turn of a conversation extends it), and the **branch point** where its match ended (the next request with that shared prefix resumes there). Pages between the copy and the branch point are recomputed into the request's own pages.
 
 ### Bookkeeping (CPU only, plain arrays, one scheduler thread, no locks)
 | Field | Type | Meaning |
@@ -119,11 +120,11 @@ admit(n):
     while not fits(n): evict the cache's next victim
     reserved += n
 ```
-- `n` comes from one demand function: pages for the uncached part of the prompt, rounded up, plus a generation allowance (config, in tokens), plus the request's bounded state (window ring with one page in transit, or one state slot).
+- `n` comes from one demand function: pages for the uncached part of the prompt, rounded up, plus a generation allowance (config, in tokens), plus the request's bounded state (window ring with one page in transit, or one state slot), plus a state slot for each copy it will hand the prefix cache. While it is admitted, a cache hit also holds its matched pages and its snapshot (neither free nor cache-only), so a hit that can't fit next to them is admitted without its copies, or cold.
 - Each later `alloc()` takes one unit out of the request's reservation. `reserved ≤ free_units` always holds, so an admitted request's `alloc()` cannot fail. Unused reservation is returned when the request ends.
 - Top-up: when a request has used its allowance it calls `admit` for another. On `WAIT` it pauses and keeps its pages until units free up. If every live request is paused, the newest one ends with stop reason `length`.
 - A request that would not fit in an empty arena is rejected on arrival.
-- The prefix cache picks victims in its own order. Evicting an entry frees only the units no one else holds.
+- The prefix cache picks victims in its own order (least recently used leaf node). Evicting an entry frees only the units no one else holds.
 
 ### Free now, reuse later
 A step is one command buffer: one decode token for every active request, plus any prefill chunk. The CPU builds step N+1 while the GPU runs step N, so a unit released now may still be read.

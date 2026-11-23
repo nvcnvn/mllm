@@ -42,7 +42,7 @@ void GpuOpsTest::bench_ops(const std::string& model) {
     GpuOps ops(mem, w);
     Workspace ws = ops.workspace(chunk, max_batch, max_ctx);
     id<MTLCommandQueue> q = [dev newCommandQueue];
-    StepTables tables = mem.step_tables(chunk);
+    StepTables tables = mem.step_tables(chunk, max_ctx);
     std::vector<id<MTLBuffer>> tabs;  // one per rotation set
     for (int i = 0; i < 16; i++) tabs.push_back(mem.buffer(tables.words * 4));
     const GpuOps::Layer &fl = ops.layers[s.full_layers()[0]], &ll = ops.layers[s.linear_layers()[0]];
@@ -253,8 +253,8 @@ void GpuOpsTest::bench_ops(const std::string& model) {
 
 // mllm generate: the prompt as one user message (chat template), text streamed to stdout
 static void generate(const std::string& model, const std::string& prompt, mllm::GenParams p, const std::string& on,
-                     const std::string& ane_weights) {
-    mllm::Engine e(model, (size_t)1 << 30, 512, 32, 16, 16384, on, ane_weights);
+                     const std::string& ane_weights, bool prefix_cache) {
+    mllm::Engine e(model, (size_t)1 << 30, 512, 32, 16, 16384, on, ane_weights, prefix_cache);
     e.generate({{"user", prompt}}, p, [](const std::string& t) {
         fputs(t.c_str(), stdout);
         fflush(stdout);
@@ -271,8 +271,8 @@ static void generate(const std::string& model, const std::string& prompt, mllm::
 // one as each finishes), left out of the fields above; stream_tps = its prompt tokens done / the trial's time. Measures
 // what a concurrent prefill costs decode (architecture.md "Concurrency").
 static void bench(const std::string& model, int P, int G, int B, int n, const std::string& on,
-                  const std::string& ane_weights, int stream) {
-    mllm::Engine e(model, (size_t)1 << 30, 512, 32, 16, 16384, on, ane_weights);
+                  const std::string& ane_weights, int stream, bool prefix_cache) {
+    mllm::Engine e(model, (size_t)1 << 30, 512, 32, 16, 16384, on, ane_weights, prefix_cache);
     e.tok.eos.clear();  // as mlx_lm.benchmark: never stop early
     std::mt19937 rng(0);
     std::uniform_int_distribution<int> tok(0, e.spec.vocab - 1);
@@ -337,11 +337,11 @@ static void bench(const std::string& model, int P, int G, int B, int n, const st
 
 // mllm serve: /v1/completions on 127.0.0.1 until killed. A 2 GiB arena: 32 requests of 512 + 256 tokens need 0.9.
 static int serve(const std::string& model, int port, const std::string& on, const std::string& ane_weights,
-                 int max_batch) {
-    mllm::Engine e(model, (size_t)2 << 30, 512, 32, max_batch, 16384, on, ane_weights);
+                 int max_batch, bool prefix_cache) {
+    mllm::Engine e(model, (size_t)2 << 30, 512, 32, max_batch, 16384, on, ane_weights, prefix_cache);
     mllm::Server s(e, model);
-    fprintf(stderr, "mllm serve: http://127.0.0.1:%d/v1/completions (prefill on %s, max batch %d)\n", port, on.c_str(),
-            max_batch);
+    fprintf(stderr, "mllm serve: http://127.0.0.1:%d/v1/completions (prefill on %s, max batch %d, prefix cache %s)\n",
+            port, on.c_str(), max_batch, prefix_cache ? "on" : "off");
     if (!s.listen("127.0.0.1", port)) throw std::runtime_error("can't listen on port " + std::to_string(port));
     return 0;
 }
@@ -356,7 +356,9 @@ static int usage() {
             "       mllm bench-ops MODEL                      GPU time per op and per decode step, next to the roofline\n"
             "MODEL: repo id under $HF_HOME, or a local dir\n"
             "PREFILL: [--prefill gpu|ane] [--ane-weights fp16|int8|lut6|lut4]: dense blocks of prefill on the Neural\n"
-            "         Engine (Core ML models built by py/mllm/ane.py for S = 512)\n");
+            "         Engine (Core ML models built by py/mllm/ane.py for S = 512)\n"
+            "         [--prefix-cache on|off]: reuse prompt prefixes across requests (default on; off for bench, whose\n"
+            "         trials repeat the same prompts)\n");
     return 2;
 }
 
@@ -374,25 +376,33 @@ int main(int argc, char** argv) {
         if (it != flags.end()) flags.erase(it);
         return v;
     };
+    auto prefix_cache = [&](const char* def) {
+        const std::string v = flag("--prefix-cache", def);
+        if (v != "on" && v != "off") throw std::invalid_argument("--prefix-cache: on or off, not " + v);
+        return v == "on";
+    };
     try {
         if (cmd == "generate") {
             mllm::GenParams p{std::stoi(flag("--max-tokens", "256")), std::stof(flag("--temp", "0")),
                               std::stof(flag("--top-p", "0"))};
             const std::string on = flag("--prefill", "gpu"), aw = flag("--ane-weights", "fp16");
+            const bool pc = prefix_cache("on");
             if (!flags.empty()) return usage();
-            generate(argv[2], argv[3], p, on, aw);
+            generate(argv[2], argv[3], p, on, aw, pc);
         } else if (cmd == "bench") {
             const int P = std::stoi(flag("-p", "512")), G = std::stoi(flag("-g", "1024")), B = std::stoi(flag("-b", "1"));
             const int n = std::stoi(flag("-n", "5"));
             const std::string on = flag("--prefill", "gpu"), aw = flag("--ane-weights", "fp16");
             const int stream = std::stoi(flag("--stream", "0"));
+            const bool pc = prefix_cache("off");
             if (!flags.empty() || P < 2 || G < 1 || B < 1 || n < 1 || stream < 0 || stream == 1) return usage();
-            bench(argv[2], P, G, B, n, on, aw, stream);
+            bench(argv[2], P, G, B, n, on, aw, stream, pc);
         } else if (cmd == "serve") {
             const int port = std::stoi(flag("--port", "8080")), max_batch = std::stoi(flag("--max-batch", "32"));
             const std::string on = flag("--prefill", "gpu"), aw = flag("--ane-weights", "fp16");
+            const bool pc = prefix_cache("on");
             if (!flags.empty() || max_batch < 1) return usage();
-            return serve(argv[2], port, on, aw, max_batch);
+            return serve(argv[2], port, on, aw, max_batch, pc);
         } else if (cmd == "bench-ops") {
             if (!flags.empty()) return usage();
             mllm::GpuOpsTest::bench_ops(argv[2]);

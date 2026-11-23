@@ -88,6 +88,23 @@ int main() {
     assert(done && text == want);
     assert(finish == "length" ? completion == 48 : finish == "stop" && completion > 0 && completion < 48);
 
+    // a repeated prompt: usage reports the prefix cache's tokens (its last full page) the second time
+    std::string longp;
+    for (int i = 0; i < 20; i++) longp += "The tide comes in and the tide goes out. ";
+    const int P = ((int)e.tok.encode(longp).size() - 1) / 32 * 32;
+    for (int want_cached : {0, P}) {
+        auto u = c.Post("/v1/completions",
+                        json({{"prompt", longp}, {"max_tokens", 2}, {"stream", true},
+                              {"stream_options", {{"include_usage", true}}}}).dump(), "application/json");
+        assert(u && u->status == 200);
+        const size_t at = u->body.find("\"usage\"");
+        assert(at != std::string::npos);
+        const size_t from = u->body.rfind("data: ", at) + 6;
+        const json d = json::parse(u->body.substr(from, u->body.find('\n', from) - from));
+        assert(P > 0 && d["usage"]["prompt_tokens_details"]["cached_tokens"] == want_cached);
+    }
+    printf("usage: cached_tokens 0, then %d\n", P);
+
     for (const std::string& bad : {std::string("{\"prompt\": "), std::string("[1]"),
                                    json({{"prompt", "hi"}, {"max_tokens", 16384}, {"stream", true}}).dump(),
                                    json({{"prompt", "hi"}, {"temperature", "hot"}, {"stream", true}}).dump(),

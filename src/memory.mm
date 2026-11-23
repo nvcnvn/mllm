@@ -73,11 +73,12 @@ Arena::Arena(size_t unit_bytes, uint32_t n_units)
     if (n_units % 64) free.back() = (1ull << (n_units % 64)) - 1;
 }
 
-bool Arena::admit(uint32_t n) {
+bool Arena::admit(uint32_t n, const std::function<bool()>& evict) {
     if (!can_ever(n)) return false;
-    // ponytail: no prefix cache yet, so cache_only_units == 0 and can_ever == fits. With the cache, the eviction
-    // loop goes here: while (!fits(n)) evict the cache's next victim.
-    assert(fits(n));
+    while (!fits(n)) {
+        [[maybe_unused]] const bool evicted = evict && evict();
+        assert(evicted && "can_ever counted cache-only units nothing evicts");
+    }
     reserved += n;
     return true;
 }
@@ -105,14 +106,32 @@ void Arena::release(const std::vector<uint32_t>& slots) {
     for (uint32_t s : slots) {
         assert(req_refs[s] > 0);
         if (--req_refs[s]) continue;
-        if (cache_refs[s]) {
-            cache_only_units++;
-            continue;
-        }
-        assert(pending.empty() || pending.back().second <= committed);
-        pending.emplace_back(s, committed);
-        free_units++;
+        if (cache_refs[s]) cache_only_units++;
+        else drop(s);
     }
+}
+
+void Arena::ref(uint32_t s) {
+    assert((req_refs[s] || cache_refs[s]) && "ref on a free unit");
+    if (!req_refs[s]++) cache_only_units--;
+}
+
+void Arena::cache_ref(uint32_t s) {
+    assert(req_refs[s] && "the cache takes units from a request");
+    cache_refs[s]++;
+}
+
+void Arena::cache_release(uint32_t s) {
+    assert(cache_refs[s] > 0);
+    if (--cache_refs[s] || req_refs[s]) return;
+    cache_only_units--;
+    drop(s);
+}
+
+void Arena::drop(uint32_t s) {
+    assert(pending.empty() || pending.back().second <= committed);
+    pending.emplace_back(s, committed);
+    free_units++;
 }
 
 void Arena::retire(uint64_t signaled) {
@@ -236,10 +255,10 @@ Workspace Memory::workspace(int chunk, int max_batch) {
     };
 }
 
-StepTables Memory::step_tables(int max_rows) {
-    // ponytail: slot words <= n_units while no unit is shared; the prefix cache lets rows share units, then size
-    // by the sum of the rows' slot counts.
-    size_t words = 3 + 3 * (size_t)max_rows + arena.n_units;
+StepTables Memory::step_tables(int max_rows, size_t max_ctx) {
+    // Rows share units (prefix cache), so size by rows: a row lists its pages and state units, each at most once
+    const size_t per_row = std::min<size_t>(arena.n_units, units_for(max_ctx) + state_units);
+    size_t words = 3 + (size_t)max_rows * (3 + per_row);
     return {{buffer(words * 4), buffer(words * 4)}, words, arena.n_units};
 }
 

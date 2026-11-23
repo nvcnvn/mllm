@@ -36,16 +36,16 @@ int main() {
     assert(again == std::set<uint32_t>({3, 4, 5}) && a.reserved == 0);
 
     // refcounts: a unit shared by two requests frees on the second release; one the cache holds becomes cache-only
-    a.req_refs[7] = 2;  // no sharing API yet: take the second ref by hand
+    a.ref(7);
     a.committed = 11;
     a.release({7});
     assert(a.req_refs[7] == 1 && a.pending.empty() && a.free_units == 0);
     a.release({7});
     assert(a.pending.size() == 1 && a.free_units == 1);
-    a.cache_refs[8] = 1;
+    a.cache_ref(8);
     a.release({8});
     assert(a.free_units == 1 && a.cache_only_units == 1 && a.pending.size() == 1);
-    a.cache_only_units = 0, a.cache_refs[8] = 0;  // undo by hand (no cache API either)
+    a.ref(8), a.cache_release(8), a.release({8});  // cache-only -> held -> uncached -> pending
     a.retire(11);
 
     // unreserve returns an unused reservation
@@ -56,7 +56,7 @@ int main() {
     // no starvation: a big request is refused while a small one fits. The arena alone would let small requests
     // overtake the big one forever; the engine's FIFO admission (g5) stops at the first refusal, so the oldest
     // waiter gets the units as they free up.
-    a.release({10, 11, 12, 13, 14});  // free_units = 1 + 5
+    a.release({10, 11, 12, 13});  // free_units = 2 + 4
     a.retire(a.committed);
     assert(a.free_units == 6);
     assert(!a.admit(7) && a.admit(2) && !a.admit(5));

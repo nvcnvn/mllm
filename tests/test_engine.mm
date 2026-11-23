@@ -14,7 +14,7 @@ constexpr int N = 64, CHUNK = 32;  // small chunks, so a prompt spans several ch
 
 static void check_arena(const mllm::Engine& e) {
     const mllm::Arena& a = e.mem.arena;
-    assert(a.free_units == a.n_units && a.reserved == 0 && "arena units leaked");
+    assert(a.free_units + a.cache_only_units == a.n_units && a.reserved == 0 && "arena units leaked");
 }
 
 static std::vector<std::vector<int>> run(mllm::Engine& e, const std::vector<std::vector<mllm::Message>>& prompts) {
