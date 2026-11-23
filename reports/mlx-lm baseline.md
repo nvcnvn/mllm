@@ -336,6 +336,98 @@ mlx-community/Qwen3.6-27B-4bit (64 layers: 16 full, 48 linear; hidden 5120, 24 /
 - Workspace at max_ctx (`mllm generate mlx-community/Qwen3.6-27B-4bit ... --max-ctx 32768 --arena-gib 12`, chunk 512, max batch 16; now the defaults for 2 MiB units, `Memory::unit_of`, the 0.8B keeps 1 GiB / 16k): workspace 1156.1 MiB (1463.9 before the 2-pass partials fix: the prefill lane reserved partials for 512 decode rows it never runs, and the decode lanes too few for 16 rows at gqa 6, where rows past 8192 keys take 256 blocks: 9+ such rows would have hit full_attn's assert. Now max_batch x H x blocks(max_ctx), or one prefill row of the vector path's longest q). Of it, prefill's `scores` [chunk, H, max_ctx] bf16 is 768 MiB and `kc` / `vc` 2 x 64 MiB; both scale with max_ctx (128k: 3 GiB of scores; a blocked / steel attention removes it). Peak footprint 14.24 GB (12 GiB arena + workspace + Metal; weights file-backed, 16.05 GB): ~30.3 GB with the weights, of 64 GB. A 7.5k-token prompt (one long prefill, fallback attention past 4096 keys, looped softmax) + 8 tokens ran clean, 104.7 s wall; a 16-token short prompt 46.1 s wall (cold weights cache read from the T5); machine shared (another process at 400% CPU), not speed numbers. Nothing allocates after `freeze()`: `Memory::buffer` / `surface` assert when frozen (asserts on in this build), and they are the only Metal allocations besides the weights' no-copy buffers at load.
 - 27B test status (each binary alone, `MLLM_MODEL=mlx-community/Qwen3.6-27B-4bit`; test arenas now `max(0.8B size, Memory::arena_for(spec, slots, tokens))`, so the 0.8B runs are unchanged): pass: test_arena, test_attn, test_batch, test_dense, test_engine, test_golden, test_kernels (scratch sized by hidden: it wrote 8224 x 5120 into an 8224 x 1024 buffer, SIGBUS), test_lanes, test_linear, test_lm_head, test_memory, test_memory_fuzz, test_metal, test_prefix_cache, test_server, test_spec, test_stack, test_tokenizer, test_weights. test_concurrent skips (its race harness would memcpy ~1 TB at 2 MiB units; the 0.8B covers it). test_engine_cache: chunk 512 hits, chunk 32 bit-exact hits and the small arena pass (747 s); moved chunk boundaries give K/V cos 0.99339 and state cos 0.96650, where mlx-lm's own whole-vs-split prefill of the same 1300 tokens gives 0.99338 / 0.96575 (0.8B: 0.99998 / 0.99996), so the floor off the 0.8B is 0.95; its two 80-request stress runs stopped on a 10 s stall limit tuned for 0.8B speed (now 120 s off the 0.8B), not rerun (~30 min at 27B). test_ane: no 27B ANE blocks (§5, ANE section of test_engine_cache skips for the same reason).
 
+## 27B: speed on the GPU path (g14)
+
+mlx-community/Qwen3.6-27B-4bit, MLX 0.32.4, mlx-lm `1bf8da0` (same as the 0.8B tables), `-n 3`, engine = g14
+(fda2e42: qmm_t in 64 x 64 tiles). Two holds of the machine-wide heavy lock, mlx-lm and the engine interleaved per
+shape, order swapped between holds (`/Volumes/T5/cache/mllm/g14/hold_ab.sh 1|2`, logs `hold_ab1.log`,
+`hold_ab2.log` there):
+
+```
+HF_HOME=/Volumes/T5/huggingface .venv/bin/python -m mlx_lm benchmark --model mlx-community/Qwen3.6-27B-4bit -p P -g 128 -b 1 -n 3
+HF_HOME=/Volumes/T5/huggingface build/mllm bench mlx-community/Qwen3.6-27B-4bit -p P -g 128 -b 1 -n 3
+```
+- Hold 1 (2026-11-24 01:24-01:42, mlx-lm first): a Virtualization VM at 63-72% CPU throughout; at the end imagent
+  66% and familycircled 37%. Nothing else heavy (other heavy jobs wait on the same lock).
+- Hold 2 (01:55-02:12, engine first): the VM at 52-61% CPU; nothing else above 10%.
+
+| prompt | hold | mlx-lm prefill / decode tok/s, peak GB | engine prefill / decode tok/s, peak GB | ours / mlx-lm (prefill, decode) |
+|---:|---:|---|---|---:|
+| 512 | 1 | 122.4 / 15.51, 16.40 | 129.9 / 15.05, 16.54 | 1.06, 0.97 |
+| 512 | 2 | 117.9 / 15.40, 16.40 | 129.2 / 15.01, 16.54 | 1.10, 0.97 |
+| 2048 | 1 | 118.6 / 15.29, 18.13 | 134.5 / 15.14, 16.64 | 1.13, 0.99 |
+| 2048 | 2 | 120.4 / 15.41, 18.13 | 133.1 / 15.02, 16.64 | 1.11, 0.97 |
+| 8192 | 1 | 117.3 / 14.93, 19.13 | 132.3 / 14.74, 17.05 | 1.13, 0.99 |
+| 8192 | 2 | 117.6 / 14.89, 19.13 | 132.0 / 14.74, 17.05 | 1.12, 0.99 |
+
+All 128 generated tokens, B = 1. Engine peak memory counts weights + workspace + arena units in use (not the 12 GiB
+arena's unused rest). An 8192-token prefill takes 61.9-62.1 s in the engine (8192 / prompt tok/s; the bench times
+the prefill alone, weights warm, no prefix hit) against 69.7-69.8 s in mlx-lm.
+
+- **Prefill ≥ mlx-lm: met**, 1.06-1.13x in all six pairs (p512's trials spread 114-138 tok/s in both engines,
+  falling trial by trial; p2048 trials within 4%, p8192 within 0.2%).
+- **Decode at B = 1 is not ≥ mlx-lm:** 0.97-0.99x in all six pairs (15.0-15.1 vs 15.3-15.5 tok/s at 512 / 2048,
+  14.74 vs 14.89-14.93 at 8192). The gap is ~1-2 ms per token of a ~66 ms step, outside the GPU step
+  (bench-ops below).
+- The earlier one-run table (2026-11-23, main 2be5a93 before qmm_t_64, java at 165-330% CPU and Go tests running)
+  read 100-108 tok/s prefill and 12.5-14.2 decode for both engines: a busy machine cut both by 10-20%. Its B > 1
+  rows are the only B = 4 / 8 figures for the bench (one run each, same busy machine, main 2be5a93, not rerun):
+
+| prompt | gen | batch | mlx-lm prefill / decode tok/s, peak GB | engine prefill / decode tok/s, peak GB | ours / mlx-lm (prefill, decode) |
+|---:|---:|---:|---|---|---:|
+| 512 | 256 | 4 | 101.7 / 35.11, 18.61 | 101.7 / 32.71, 17.17 | 1.00, 0.93 |
+| 512 | 256 | 8 | 98.4 / 37.06, 21.61 | 106.6 / 56.84, 17.99 | 1.08, 1.53 |
+
+**Bounds.** Decode reads all weights but the embedding per token: 15.13 - 0.72 = 14.4 GB. At the 220 GB/s of the
+checklist that is 65.5 ms (15.3 tok/s); mlx-lm's 15.5 is already past it (223 GB/s), and qmv_fast itself runs at
+240-250 GB/s on the big projections (bench-ops), so the floor of this kernel is ~59 ms (*estimate*). The engine's
+15.0-15.1 tok/s is ~98% of the 220 GB/s figure. Prefill: 48.7 GFLOP per token in matmuls (24.4 B params) against
+MLX's own bf16 GEMM, measured 7.48 / 7.49 / 7.58 TFLOPS at 512 / 2048 x 5120 x 17408 and 4096³ (MLX's 4-bit
+qmm: 6.76-6.81; `tools/gemm_peak.py`, `hold1.log`, VM at ~55% and spotlight at ~85% CPU): 6.5 ms per token,
+**~154 tok/s compute bound**. The engine reaches 129-134 (84-87%), mlx-lm 117-122 (76-80%). `tools/roofline.py`'s
+FLOPS knob (bench-ops, test_kernels) is now 7.5e12 from that run.
+
+**Change: qmm_t in 64 x 64 tiles** (`qmm_t_64`, quantized.metal; MLX fixes 32 x 32 for affine). Same template,
+same BK 32 and 2 x 2 simdgroups, so every output accumulates K in the same order through the same float MMA:
+bit-exact. test_kernels compares the 64 x 64 and 32 x 32 outputs byte for byte (M 100 / 200, N % 64 = 0 / 32),
+since no golden test reaches a full 64-row tile (golden chunks are 32 / 24 / 25 tokens). Interleaved main vs g14
+(QA, one hold, VM at 54-73% CPU, `qa/hold.log`, 2 rounds, `-g 64` / `-g 16`): p512 prefill 125.0 / 117.3 ->
+132.5 / 131.4 tok/s, p2048 119.2 / 124.3 -> 135.1 / 136.7, decode unchanged (15.1-15.4 both); 0.8B p2048 prefill
+5274-5316 -> 5415-5430 (3 rounds, +2-3%). Prefill chunk GPU time (512 tokens, traced, 2 rounds x 4 chunks,
+`-p 1024 -g 2`, `tiles.log`, busy machine): 32 x 32 3.93-4.54 s, 64 x 64 3.71-3.98 s.
+Tile rows: M ≤ 32 keeps MLX's 32 x 32 (a 64-row tile of a ≤ 32-row tail is mostly padding); at M 40 / 48 / 56
+64 x 64 is ~1% faster summed (`hold1.log`, 2 rounds, best-of-3 per op: -2..-3% on q_proj, gate_proj and
+in_proj_qkv, +2% on down_proj), so 64 x 64 starts at 33 rows (`GpuOps::tile64_rows`).
+Tried and rejected (same rounds as the chunk trace, `tiles.log`): BK 64 (+3% vs BK 32 at 64 x 64), 128 x 64
+(+5%); M-tiles-first grid order (no gain at 32 x 32 or 64 x 64, numbers not logged).
+
+**Decode at B = 1 / 4 / 8 / 16** (bench-ops whole step on fda2e42, 512 keys per row, median of 10 steps;
+`hold_ops.sh`, `hold_ops.log`, 02:21, one hold, the VM at 62-70% and duetexpertd ~50% CPU):
+
+| B | dispatches | GPU ms | wall ms | tok/s (wall) | GPU ms per row |
+|---:|---:|---:|---:|---:|---:|
+| 1 | 948 | 64.38 | 65.19 | 15.3 | 64.4 |
+| 4 | 1188 | 91.45 | 92.25 | 43.4 | 22.9 |
+| 8 | 1396 | 115.88 | 117.01 | 68.4 | 14.5 |
+| 16 | 1492 | 181.14 | 182.17 | 87.8 | 11.3 |
+
+The B = 1 GPU step (64.4 ms) matches mlx-lm's whole per-token time at p512 (64.5-64.9 ms), while the bench's
+engine decode is 66.4-66.6 ms per token (wall step 65.2): the 1-3% decode gap is ~1-2 ms outside the GPU step
+(host time between steps or the bench's per-token work; not split). Inside it, the dispatch floor (948 dispatches,
+~2-4 ms, *estimate*) is the lever to get under mlx-lm. B = 4 costs 1.42x the B = 1 step: the big projections
+run at 164-177 GB/s there (qmv_wide; q_proj 204 us vs 139 at M = 1) against 248-255 GB/s at B = 1.
+Earlier runs on the busy machine (2026-11-23, java at 330% CPU, `ops_steps.log`) gave B = 4 104-118 ms, so the
+1.5-1.7x ratio quoted before was load. Tried: g12's `qmm_t_decode` from M = 2 instead of 7 (experiment binary,
+`qmin.log`, busy machine): B = 4 136 ms vs 104-118; it takes ~254 us on q_proj at any M <= 8 (~137 GB/s), so it is
+bandwidth-latency-bound, not MMA-bound. Not landed. B = 8 runs `qmm_t_decode` (g12) and is 1.5x mlx-lm in the
+bench (one busy run, table above).
+
+Left (one line each in docs/target-27b.md): B = 1 decode 1-3% behind mlx-lm (~1-2 ms outside the GPU step; the
+dispatch floor, 948 dispatches, is ~2-4 ms of the step, *estimate* from sum of ops vs whole step); B = 4 per-row
+cost (1.42x the B = 1 step; matmuls at 164-177 GB/s vs 248-255 at B = 1; qmm_t_decode needs more bytes in
+flight: split-k > 1 for large N, or register double-buffering of W); chunk 1024 vs 512 (not measured; 1024 doubles prefill's `scores` scratch to 1.5 GiB at
+max_ctx 32k, and the matmuls are already at full occupancy at M = 512, so *estimate* < 3%).
+
 ## Raw output (final run)
 ```
 p=512 g=256

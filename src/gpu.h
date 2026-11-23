@@ -116,7 +116,11 @@ private:
     id<MTLBuffer> splitk;
     bool decode = false;  // ws.S == 1: linear() may pick qmm_t_decode (batched decode, by tolerance)
 
-    id<MTLComputePipelineState> qmv_fast, qmv_wide[6], qmm_t[2], qmm_t_splitk[2], splitk_accum;
+    id<MTLComputePipelineState> qmv_fast, qmv_wide[6], qmm_t[2], qmm_t_64[2], qmm_t_splitk[2], splitk_accum;
+    // qmm_t in 64 x 64 tiles from this many rows (prefill); shorter tails keep MLX's 32 x 32 (a 64-row tile of a
+    // <= 32-row tail is mostly padding). At 33..63 rows 64 x 64 is ~1% faster (27B, M 40 / 48 / 56: -2..-3% on
+    // q / gate / in_proj_qkv, +2% on down_proj). Tests set it to compare the two paths.
+    int tile64_rows = 33;
     id<MTLComputePipelineState> qmm_t_decode[2][2];  // [BM 8 / 16][split-k float partials / bf16 output]
     id<MTLComputePipelineState> embed_ps, rms_ps, rms_looped_ps, add_ps, swiglu_ps, precise_swiglu_ps, split_q_gate_ps;
     id<MTLComputePipelineState> rope_ps, write_kv_ps, sdpa_ps, sdpa_2pass_1[2], sdpa_2pass_2, sigmoid_gate_ps;

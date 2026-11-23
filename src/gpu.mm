@@ -70,8 +70,9 @@ GpuOps::GpuOps(Memory& mem, const Weights& weights) : spec(mem.spec), mem(mem), 
         qmv_wide[nv] = pipeline([NSString stringWithFormat:@"affine_qmv_wide_bfloat16_t_gs_64_b_4_nv_%d_kl_8_batch_0", nv]);
     for (int al = 0; al < 2; al++) {
         NSString* a = al ? @"true" : @"false";
-        qmm_t[al] = pipeline([NSString stringWithFormat:@"affine_qmm_t_bfloat16_t_gs_64_b_4_alN_%@_batch_0", a]);
         qmm_t_splitk[al] = pipeline([NSString stringWithFormat:@"affine_qmm_t_splitk_bfloat16_t_gs_64_b_4_alN_%@", a]);
+        qmm_t[al] = pipeline([NSString stringWithFormat:@"affine_qmm_t_bfloat16_t_gs_64_b_4_alN_%@_batch_0", a]);
+        qmm_t_64[al] = pipeline([NSString stringWithFormat:@"qmm_t_64_alN_%@", a]);
     }
     splitk_accum = pipeline(@"steel_gemm_splitk_accum_bfloat16_float32");
     for (int bm = 0; bm < 2; bm++)
@@ -331,10 +332,11 @@ void GpuOps::linear(const QLinear& l, Buf x, Buf y, int M) {
         int split_k = std::min(std::max(1, 512 / (n_tiles * m_tiles)), K / 64);
         while (split_k > 1 && K % (split_k * 64)) split_k--;
         bool aligned = N % 32 == 0;
-        if (split_k <= 1) {
-            bind(qmm_t[aligned]);
+        if (split_k <= 1) {  // MLX's qmm_t; 64 x 64 tiles from tile64_rows rows (quantized.metal: same values)
+            const int t = M >= tile64_rows ? 64 : 32;
+            bind(t == 64 ? qmm_t_64[N % 64 == 0] : qmm_t[aligned]);
             set(enc, y, 4), set_bytes(enc, K, 5), set_bytes(enc, N, 6), set_bytes(enc, M, 7);
-            pre(), [enc dispatchThreadgroups:MTLSizeMake(n_tiles, m_tiles, 1) threadsPerThreadgroup:MTLSizeMake(32, 2, 2)];
+            pre(), [enc dispatchThreadgroups:MTLSizeMake((N + t - 1) / t, (M + t - 1) / t, 1) threadsPerThreadgroup:MTLSizeMake(32, 2, 2)];
             return;
         }
         int k_part = K / split_k, stride = M * N;

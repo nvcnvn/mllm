@@ -7,13 +7,12 @@ Expected shape (*estimates* from the 0.8B numbers, replaced by measurements as i
 | | 0.8B (measured) | 27B 4-bit (*estimate*) |
 |---|---|---|
 | GPU weights | 0.42 GB measured (language model only) | 15.13 GB measured (weights cache v3: language model only; the 0.92 GB vision tower is left out) |
-| Decode, B = 1 | 335 tok/s (dispatch-bound) | ~13–15 tok/s (bandwidth: ~15 GB read per token) |
-| GPU prefill | ~5,000 tok/s | ~150 tok/s (compute: ~54 GFLOP per token) |
-| 8k-token prompt, cold | 1.6 s | ~55 s |
+| Decode, B = 1 | 335 tok/s (dispatch-bound) | 14.7-15.1 tok/s measured at 512-8192 keys (mlx-lm 14.9-15.5, 0.97-0.99x; two interleaved holds); 96-98% of 14.4 GB / 220 GB/s |
+| GPU prefill | ~5,000 tok/s | 129-134 tok/s measured at 512-8192 (mlx-lm 117-122, 1.06-1.13x; two interleaved holds); bound ~154 (48.7 GFLOP / 7.5 TFLOPS) |
+| 8k-token prompt, cold | 1.6 s | ~62 s *derived* (8192 / 132 tok/s from the bench's timed prefill, weights warm; TTFT not timed) |
 | Unit (32 tokens × 16 full layers × 4 KV heads × 256) | — | 2 MiB; 64 KiB per token |
 
 ## 0. Model and reference
-- [ ] mlx-lm reference at 27B: `mlx_lm.benchmark` at -p 512 / 2048 / 8192 and B = 1 / 4, plus peak memory. **Check:** a 27B section in [reports/mlx-lm baseline.md](../reports/mlx-lm%20baseline.md).
 
 ## 1. Load (g13: done, see the report)
 
@@ -21,8 +20,9 @@ Expected shape (*estimates* from the 0.8B numbers, replaced by measurements as i
 - [ ] test_engine_cache's two 80-request stress runs at 27B (stall limit now 120 s off the 0.8B; ~30 min of GPU). **Check:** `MLLM_MODEL=mlx-community/Qwen3.6-27B-4bit build/tests/test_engine_cache` passes.
 
 ## 3. GPU path, fast
-- [ ] Decode at B = 1 / 4 / 8. **Check:** B = 1 ≥ mlx-lm and within ~15% of the bandwidth bound (weights bytes / measured 220 GB/s). Record what B = 4 costs per row: batching should be close to free.
-- [ ] Prefill at 512 / 2048 / 8192, and chunk size (512 vs 1024; >= 2048 needs steel attention, not ported). **Check:** ≥ mlx-lm; tok/s against the compute bound.
+- [ ] Decode at B = 1 ≥ mlx-lm: 0.97-0.99x in two interleaved holds (g14; see the report). **Check:** ≥ 1.00 in an interleaved hold. The GPU step (64.4 ms, bench-ops) already equals mlx-lm's per-token time; ~1-2 ms is outside it, and the dispatch floor (948 dispatches, ~2-4 ms, *estimate*) is the lever.
+- [ ] Decode at B = 4 per-row cost: a B = 4 step costs 1.42x the B = 1 step (91.5 vs 64.4 ms GPU, bench-ops; qmv_wide at 164-177 GB/s; qmm_t_decode at M = 4 is slower). **Check:** B = 4 ≥ mlx-lm (35.1; engine 32.7, one run on a busy machine) and closer to free.
+- [ ] Prefill chunk 512 vs 1024 (>= 2048 needs steel attention, not ported; *estimate* < 3%). **Check:** interleaved A/B recorded; chunk 1024 the 27B default if it wins.
 
 ## 4. Memory, under real conditions
 - [ ] Budget: GPU weights + arena (12 GiB) + workspace, with typical apps open (browser, editor). **Check:** `footprint` / wired numbers recorded; swap growth during a 30-minute session of mixed requests; no decode step > 1 s.

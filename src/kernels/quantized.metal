@@ -23,6 +23,12 @@ instantiate_kernel("affine_qmm_t_bfloat16_t_gs_64_b_4_alN_true_batch_0", affine_
 instantiate_kernel("affine_qmm_t_bfloat16_t_gs_64_b_4_alN_false_batch_0", affine_qmm_t, bfloat16_t, 64, 4, false, false)
 instantiate_kernel("affine_qmm_t_splitk_bfloat16_t_gs_64_b_4_alN_true", affine_qmm_t_splitk, bfloat16_t, 64, 4, true)
 instantiate_kernel("affine_qmm_t_splitk_bfloat16_t_gs_64_b_4_alN_false", affine_qmm_t_splitk, bfloat16_t, 64, 4, false)
+// qmm_t (g14): MLX's kernel with 64 x 64 tiles instead of MLX's 32 x 32 (BK 32, 2 x 2 simdgroups as MLX). Each output
+// still accumulates its K in order, 8 at a time, in the same float simdgroup MMA, so it equals MLX's bit for bit
+// (test_kernels compares the two at full / partial tiles). Each simdgroup does 4 x 4 MMAs per 8 fragment loads, not
+// 2 x 2 per 4: 27B prefill chunks -9% GPU time (reports/mlx-lm baseline.md).
+instantiate_kernel("qmm_t_64_alN_true", affine_qmm_t, bfloat16_t, 64, 4, true, false, false, 64, 32, 64)
+instantiate_kernel("qmm_t_64_alN_false", affine_qmm_t, bfloat16_t, 64, 4, false, false, false, 64, 32, 64)
 instantiate_kernel("steel_gemm_splitk_accum_bfloat16_float32", gemm_splitk_accum, float, bfloat16_t)
 // clang-format on
 
@@ -105,3 +111,4 @@ template [[host_name("qmm_t_decode_16_bf16")]] [[kernel]] decltype(qmm_t_decode<
     out[i] = scale * d + bias;
   }
 }
+

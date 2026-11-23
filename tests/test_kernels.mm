@@ -142,9 +142,32 @@ void mllm::GpuOpsTest::run() {
     }
     printf("rms_norm, gated_rms_norm and %zu linear kernel paths match the CPU\n", std::size(cases));
 
+    // qmm_t: MLX's 32 x 32 tiles and the 64 x 64 ones give the same bytes (each output's K in the same order through
+    // the same MMA), on full and partial M tiles (100 = 64 + 36, 200 = 3 x 64 + 8), N % 64 == 0 and == 32
+    const int tile64_rows = ops.tile64_rows;
+    for (int M : {100, 200})
+        for (int cut : {0, 32}) {
+            mllm::QLinear l = l0.gate_proj;
+            l.N -= cut;
+            fill(x, (size_t)M * l.K, 1);
+            ws.S = M;
+            for (int rows : {INT_MAX, 0}) {
+                const size_t d0 = ops.dispatches;
+                ops.tile64_rows = rows;
+                mllm::encode_and_wait(q, ws, [&] {
+                    ops.use(ws);
+                    ops.linear(l, {x}, {rows ? y : z}, M);
+                });
+                assert(ops.dispatches - d0 == 1 && "qmm_t, not split-k");
+            }
+            ops.tile64_rows = tile64_rows;
+            assert(!memcmp(ys, zs, (size_t)M * l.N * 2) && "qmm_t 64 x 64 tiles != MLX's 32 x 32");
+        }
+    printf("qmm_t 64 x 64 tiles == 32 x 32, M 100 / 200, N %% 64 = 0 / 32\n");
+
     // Timing: each shape rotates through >= 64 MiB of weight copies (each layer's, repeated), so weights come from
     // DRAM as in a real step; fewer copies stay in the SLC and read faster than DRAM peak (273 GB/s, flagged).
-    // Roofline (tools/roofline.py knobs): max(bytes / BW, flops / FLOPS), BW = 210 GB/s, FLOPS = 6 TFLOPS,
+    // Roofline (tools/roofline.py knobs): max(bytes / BW, flops / FLOPS), BW = 210 GB/s, FLOPS = 7.5 TFLOPS,
     // bytes = weights at 4.5 bits + bf16 x and y.
     using P = mllm::QLinear mllm::GpuOps::Layer::*;
     using L = mllm::GpuOps::Layer;
@@ -191,7 +214,7 @@ void mllm::GpuOpsTest::run() {
                 }) / copies.size());
             }
             double bytes = (double)N * K * 4.5 / 8 + 2.0 * M * K + 2.0 * M * N;
-            double bound = std::fmax(bytes / 210e9, 2.0 * M * N * K / 6e12), gbs = bytes / best / 1e9;
+            double bound = std::fmax(bytes / 210e9, 2.0 * M * N * K / 7.5e12), gbs = bytes / best / 1e9;
             printf("%-13s %5d %5d %4d%s %9.1f %9.1f %5.0f%% %7.0f%s\n", sh.name, N, K, M, decode ? "d" : " ", best * 1e6, bound * 1e6,
                    100 * bound / best, gbs, gbs > 273 ? "  above DRAM peak: cached" : "");
         }

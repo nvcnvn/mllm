@@ -17,8 +17,9 @@
 
 namespace mllm {
 
-// tools/roofline.py calibration knobs: effective bandwidth and FP16 rate; 273 GB/s is the M4 Pro's peak
-constexpr double BW = 210e9, PEAK_BW = 273e9, FLOPS = 6.0e12;
+// tools/roofline.py calibration knobs (keep the two in step): effective bandwidth and FP16 rate; 273 GB/s is the M4
+// Pro's peak
+constexpr double BW = 210e9, PEAK_BW = 273e9, FLOPS = 7.5e12;
 constexpr size_t POOL = 64 << 20;  // rotate weights / K/V / state over at least this, so reads come from DRAM
 
 static void row(const std::string& op, const std::string& shape, double sec, double bytes, double flops,
@@ -38,7 +39,7 @@ void GpuOpsTest::bench_ops(const std::string& model) {
     id<MTLDevice> dev = MTLCreateSystemDefaultDevice();
     Weights w(s.path, dev);
     const int chunk = 512, max_batch = 16, max_ctx = 8192, L = s.n_layers();
-    Memory mem(s, dev, (size_t)2 << 30);
+    Memory mem(s, dev, std::max<size_t>((size_t)2 << 30, Memory::arena_for(s, max_batch, max_ctx)));  // 27B: 16 rows of 8k
     GpuOps ops(mem, w);
     Workspace ws = ops.workspace(chunk, max_batch, max_ctx);
     id<MTLCommandQueue> q = [dev newCommandQueue];
@@ -140,14 +141,14 @@ void GpuOpsTest::bench_ops(const std::string& model) {
     const double gdn_flops = 7.0 * Hv * Dv * s.lin_k_dim;           // per token: decay, kᵀS, update, qᵀS
     const char* tiny = "tiny: dispatch / fill floor of a few us, not bandwidth";
     const char* cached = "activations stay in cache (no rotation, as in a real step): a few-us floor when small";
-    for (int M : {1, 8, 16, 512}) {
+    for (int M : {1, 4, 8, 16, 512}) {
         const bool decode = M <= max_batch;
         const std::string title = decode ? "decode B = " + std::to_string(M) : "prefill S = 512 (one row)";
         printf("\n%s\n  %-34s %-14s %9s %8s %9s %6s  %s\n", title.c_str(), "op", "shape", "us", "GB/s", "bound us",
                "%bound", "note (below 70% or !)");
         auto lin_note = [&](const QLinear& q) {
             if (q.N * q.K < 1 << 20) return tiny;  // k_proj, v_proj, in_proj_b, in_proj_a
-            if (!decode) return "MLX qmm_t: 32x32 tiles, below the 6 TFLOPS knob";
+            if (!decode) return "qmm_t (64 x 64 tiles): dequantizing W costs ~10% next to the bf16 GEMM";
             if (M == 1) return "MLX qmv_fast";
             return M < 13 ? "MLX qmv_wide: known ~40% at M = 8-16, MLX the same; faster kernel breaks bit-exactness"
                           : "MLX qmm_t_splitk: known ~40% at M = 8-16, MLX the same; faster kernel breaks bit-exactness";
@@ -204,9 +205,14 @@ void GpuOpsTest::bench_ops(const std::string& model) {
     // a whole decode step at 512 keys: dense(0 .. L) with attn of both kinds, lm_head; one command buffer
     printf("\nwhole decode step (embed .. lm_head + argmax in one command buffer), 512 keys per row; "
            "CPU sampling at temp 0.7, top_p 0.9; median of 10 steps\n");
-    const double baseline[] = {307, 898, 1064};  // mlx-lm tok/s at B = 1 / 8 / 16
+    // mlx-lm tok/s at B = 1 / 4 / 8 / 16 by model (reports/mlx-lm baseline.md; 27B: B = 1 from two quiet holds,
+    // B = 4 / 8 from one busy run); 0: not measured, no ratio
+    const bool is08 = s.path.find("Qwen3.5-0.8B-4bit") != std::string::npos;
+    const bool is27 = s.path.find("Qwen3.6-27B-4bit") != std::string::npos;
+    const double baseline[] = {is08 ? 307 : is27 ? 15.5 : 0, is08 ? 780 : is27 ? 35.1 : 0, is08 ? 898 : is27 ? 37.1 : 0,
+                               is08 ? 1064.0 : 0};
     int bi = 0;
-    for (int B : {1, 8, 16}) {
+    for (int B : {1, 4, 8, 16}) {
         ws.B = B, ws.S = 1;
         const uint32_t pages = mem.units_for(512);
         units.assign(B, {});
@@ -241,9 +247,10 @@ void GpuOpsTest::bench_ops(const std::string& model) {
         for (int k = 0; k < draws; k++) ops.sample(ws, params);
         const double samp = std::chrono::duration<double>(std::chrono::steady_clock::now() - t0).count() / draws;
         // mlx-lm's figure is end to end, so the ratio uses wall time (greedy: the GPU argmax, no CPU sampling)
-        printf("  B = %2d: %zu dispatches; GPU %6.2f ms (%5.0f tok/s); wall %6.2f ms (%5.0f tok/s) vs mlx-lm %4.0f: %.2fx; "
-               "CPU sampling %.2f ms/row = %4.2f ms/step -> %5.0f tok/s\n", B, per_step, step * 1e3, B / step, wall * 1e3,
-               B / wall, baseline[bi], B / wall / baseline[bi], samp / B * 1e3, samp * 1e3, B / (wall + samp));
+        printf("  B = %2d: %zu dispatches; GPU %6.2f ms (%5.1f tok/s); wall %6.2f ms (%5.1f tok/s)", B, per_step, step * 1e3,
+               B / step, wall * 1e3, B / wall);
+        if (baseline[bi]) printf(" vs mlx-lm %5.1f: %.2fx", baseline[bi], B / wall / baseline[bi]);
+        printf("; CPU sampling %.2f ms/row = %4.2f ms/step -> %5.0f tok/s\n", samp / B * 1e3, samp * 1e3, B / (wall + samp));
         bi++;
     }
     // ponytail: sampling stays on the CPU (GpuOps::sample, ~B x per-row ms per step). Move it to the GPU once the

@@ -6,7 +6,8 @@ prefill time     = (linear flops + attention flops) / FLOPS
 
 # --- calibration knobs (measure on your machine and update) ---
 BW = 210e9        # effective GB/s: peak 273, GPU STREAM ~200, llama.cpp achieves 71-85%
-FLOPS = 6.0e12    # effective GPU FP16, derived from llama.cpp PP512 on 20c M4 Pro
+FLOPS = 7.5e12    # effective GPU FP16/BF16: MLX bf16 GEMM 7.48-7.58 TFLOPS at 512..4096 (tools/gemm_peak.py, g14 hold1.log);
+                  # was 6.0e12, derived from llama.cpp PP512 on 20c M4 Pro
 OVERHEAD = 1e-3   # fixed per-step cost (dispatch, sync, sampling), seconds
 BPW = 4.5         # MLX 4-bit, group 64 (~4.5 bits/weight)
 
