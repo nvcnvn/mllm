@@ -1,6 +1,7 @@
 // The decode lane's concurrent encoder (GpuOps::pre's barriers) == a serial one, byte for byte: logits and every
-// touched K/V and state byte, one whole decode step repeated 20 times at B = 13 and 16 (split-k matmuls, which share
-// ws.splitk; rows at mixed positions, some on the 2-pass SDPA path). From g9 QA's race harness.
+// touched K/V and state byte, one whole decode step repeated 20 times at B = 7, 8, 13, 16, 17 (qmm_t_decode and
+// split-k matmuls, which share ws.splitk; rows at mixed positions, some on the 2-pass SDPA path). From g9 QA's race
+// harness.
 #include <cassert>
 #include <cstdio>
 #include <cstring>
@@ -18,12 +19,12 @@ int main() {
     const int L = s.n_layers();
     Memory mem(s, dev, (size_t)1 << 30);
     GpuOps ops(mem, w);
-    Workspace ws = ops.workspace(1, 16, 4096);
+    Workspace ws = ops.workspace(1, 17, 4096);
     id<MTLCommandQueue> q = [dev newCommandQueue];
-    StepTables tables = mem.step_tables(16, 4096);
+    StepTables tables = mem.step_tables(17, 4096);
     id<MTLBuffer> tab = mem.buffer(tables.words * 4);
     mem.freeze();
-    for (int B : {13, 16}) {
+    for (int B : {7, 8, 13, 16, 17}) {
         std::mt19937 rng(B);
         std::vector<std::vector<uint32_t>> units(B);
         std::vector<StepTables::Row> rows;

@@ -108,13 +108,15 @@ private:
     void use(const Workspace& ws) {
         if (owner == std::thread::id()) owner = std::this_thread::get_id();
         assert(owner == std::this_thread::get_id() && "GpuOps used from two threads");
-        enc = ws.enc, splitk = ws.splitk;
+        enc = ws.enc, splitk = ws.splitk, decode = ws.S == 1;
     }
     std::thread::id owner;  // the first thread that encoded with this object
     id<MTLComputeCommandEncoder> enc;
     id<MTLBuffer> splitk;
+    bool decode = false;  // ws.S == 1: linear() may pick qmm_t_decode (batched decode, by tolerance)
 
     id<MTLComputePipelineState> qmv_fast, qmv_wide[6], qmm_t[2], qmm_t_splitk[2], splitk_accum;
+    id<MTLComputePipelineState> qmm_t_decode[2][2];  // [BM 8 / 16][split-k float partials / bf16 output]
     id<MTLComputePipelineState> embed_ps, rms_ps, add_ps, swiglu_ps, precise_swiglu_ps, split_q_gate_ps;
     id<MTLComputePipelineState> rope_ps, write_kv_ps, sdpa_ps, sdpa_2pass_1[2], sdpa_2pass_2, sigmoid_gate_ps;
     id<MTLComputePipelineState> gather_kv_ps, causal_mask_ps, scale_ps, softmax_ps[2];

@@ -70,6 +70,10 @@ GpuOps::GpuOps(Memory& mem, const Weights& weights) : spec(mem.spec), mem(mem), 
         qmm_t_splitk[al] = pipeline([NSString stringWithFormat:@"affine_qmm_t_splitk_bfloat16_t_gs_64_b_4_alN_%@", a]);
     }
     splitk_accum = pipeline(@"steel_gemm_splitk_accum_bfloat16_float32");
+    for (int bm = 0; bm < 2; bm++)
+        for (int sk = 0; sk < 2; sk++)
+            qmm_t_decode[bm][sk] =
+                pipeline([NSString stringWithFormat:@"qmm_t_decode_%d_%@", bm ? 16 : 8, sk ? @"float" : @"bf16"]);
     embed_ps = pipeline(@"embed");
     rms_ps = pipeline(@"rmsbfloat16");
     add_ps = pipeline(@"add");
@@ -279,6 +283,43 @@ void GpuOps::linear(const QLinear& l, Buf x, Buf y, int M) {
         [enc setComputePipelineState:ps];
         set(enc, l.w, 0), set(enc, l.scales, 1), set(enc, l.biases, 2), set(enc, x, 3);
     };
+    // split-k scratch -> y (steel_gemm_splitk_accum), M rows of N
+    auto accum = [&](int split_k, int stride) {
+        // get_block_dims(N, M, 1): powers of two, at most 1024 threads
+        int p0 = 0, p1 = 0, sum = 0;
+        for (;;) {
+            int before = sum;
+            if (N >= 2 << p0) p0++, sum++;
+            if (sum == 10) break;
+            if (M >= 2 << p1) p1++, sum++;
+            if (sum == 10 || sum == before) break;
+        }
+        [enc setComputePipelineState:splitk_accum];
+        set(enc, {splitk}, 0), set(enc, y, 1), set_bytes(enc, split_k, 2), set_bytes(enc, stride, 3), set_bytes(enc, N, 4);
+        pre(), [enc dispatchThreads:MTLSizeMake(N, M, 1) threadsPerThreadgroup:MTLSizeMake(1 << p0, 1 << p1, 1)];
+    };
+    // Batched decode, 7 <= M <= 16: qmm_t_decode (quantized.metal), not MLX's kernel, so not bit-exact with mlx-lm
+    // (checked by tolerance: test_batch). One M tile of 8 / 16 rows; split-k as MLX's heuristic, capped at 8.
+    // Below M = 7, small N (k/v_proj, in_proj_a/b) and above M = 16, MLX's kernels are as fast or faster (g12).
+    if (decode && M >= 7 && M <= 16 && N >= 1024 && N % 32 == 0) {
+        const int n_tiles = N / 32, bm = M > 8;
+        int split_k = std::min({std::max(1, 512 / n_tiles), 8, K / 64});
+        while (split_k > 1 && K % (split_k * 64)) split_k--;
+        const int k_part = K / split_k, stride = M * N;
+        bind(qmm_t_decode[bm][split_k > 1]);
+        set(enc, split_k > 1 ? Buf{splitk} : y, 4), set_bytes(enc, K, 5), set_bytes(enc, N, 6), set_bytes(enc, M, 7);
+        set_bytes(enc, k_part, 8), set_bytes(enc, stride, 9);
+        if (split_k > 1) {
+            assert((size_t)split_k * stride * sizeof(float) <= splitk.length);
+            // ws.splitk, as below: an indep neighbour's accumulate may still be reading it (write-after-read, the g9
+            // race). Guarded by review only: no test fails without it, because the partials are written only after
+            // the ~20 us K loop, by which time the accumulate has finished.
+            indep = false;
+        }
+        pre(), [enc dispatchThreadgroups:MTLSizeMake(n_tiles, 1, split_k) threadsPerThreadgroup:MTLSizeMake(32, 4, 1)];
+        if (split_k > 1) accum(split_k, stride);
+        return;
+    }
     int limit = K <= 2048 && N <= 2048 ? 13 : K <= 4096 && N <= 4096 ? 15 : 13;  // gen 15/16, not 'd'
     if (M >= limit) {
         int n_tiles = (N + 31) / 32, m_tiles = (M + 31) / 32;
@@ -298,18 +339,7 @@ void GpuOps::linear(const QLinear& l, Buf x, Buf y, int M) {
         set_bytes(enc, k_part, 8), set_bytes(enc, stride, 9);
         indep = false;  // every linear shares ws.splitk: an earlier accumulate may still be reading it
         pre(), [enc dispatchThreadgroups:MTLSizeMake(n_tiles, m_tiles, split_k) threadsPerThreadgroup:MTLSizeMake(32, 2, 2)];
-        // get_block_dims(N, M, 1): powers of two, at most 1024 threads
-        int p0 = 0, p1 = 0, sum = 0;
-        for (;;) {
-            int before = sum;
-            if (N >= 2 << p0) p0++, sum++;
-            if (sum == 10) break;
-            if (M >= 2 << p1) p1++, sum++;
-            if (sum == 10 || sum == before) break;
-        }
-        [enc setComputePipelineState:splitk_accum];
-        set(enc, {splitk}, 0), set(enc, y, 1), set_bytes(enc, split_k, 2), set_bytes(enc, stride, 3), set_bytes(enc, N, 4);
-        pre(), [enc dispatchThreads:MTLSizeMake(N, M, 1) threadsPerThreadgroup:MTLSizeMake(1 << p0, 1 << p1, 1)];
+        accum(split_k, stride);
     } else if (M >= 2) {  // qmv_wide: vecs_per_tg rows of x per threadgroup, 8 output rows per threadgroup
         int n_tiles = (M + 4) / 5, nv = (M + n_tiles - 1) / n_tiles;
         assert(nv >= 2 && nv <= 5);

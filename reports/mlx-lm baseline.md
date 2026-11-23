@@ -40,12 +40,12 @@ arena's unused rest, so it isn't comparable to MLX's (which includes its buffer 
 | 8192 | 128 | 1 | 4471 | 260 | 1.13 | 1.04, 0.97 | Attention at long context (same sdpa kernels as MLX) in both prefill (16 chunks over a growing prefix) and decode. |
 | 512 | 256 | 1 | 5272 | 325–336 (poc 300–303) | 1.04 | 1.09, 0.97 | As the first row. |
 | 512 | 256 | 4 | 4708 | 851 (poc 791) | 1.13 | 1.09, 1.00 | Decode: same MLX kernels, the per-step overhead of B=1 spread over 4 rows. Prefill: one request's chunk at a time, decode of the earlier requests running alongside on the other queue. |
-| 512 | 256 | 8 | 4445 | 930–985 (poc 913–931) | 1.25 | 1.05, 1.03 | Decode: `qmv_wide` / `qmm_t_splitk` at M=8 run at ~35–45% of the bandwidth bound (MLX's kernels; faster ones would break bit-exactness). Prefill as B=4. |
-| 512 | 256 | 16 | 4145 | 1079–1108 (poc 1080–1102) | 1.48 | 0.98, 1.04 | Decode: as B=8, at M=16. Prefill: the 16 chunks share the GPU with decode of the requests already prefilled (up to 15 rows by the last chunk), and prompt_tps runs until the last request's first token; mlx-lm prefills every prompt before decoding. |
+| 512 | 256 | 8 | 4445 | 1143–1182 (poc 931–961) | 1.25 | 1.05, 1.27 | Decode (g12): `qmm_t_decode` (MLX's steel qmm with an 8-row M tile) instead of `qmv_wide`, 50–58% of the bandwidth bound on the big projections; the lm_head is now the largest matmul (870 µs a step). Prefill as B=4. |
+| 512 | 256 | 16 | 4145 | 1416–1480 (poc ~1088–1123) | 1.48 | 0.98, 1.33 | Decode (g12): `qmm_t_decode` with a 16-row M tile instead of `qmm_t_splitk`'s 32-row one (half its MMA work was padding). Prefill: the 16 chunks share the GPU with decode of the requests already prefilled (up to 15 rows by the last chunk), and prompt_tps runs until the last request's first token; mlx-lm prefills every prompt before decoding. |
 
 Targets: decode B=1 ≥ 300 tok/s **met** since g9: +10–12% over poc, interleaved (QA: 306 → 337–339; after QA's
-split-k race fix, 325–336 vs 300–303). Decode B=16 ≥ 1,064 met (1079–1108), GPU prefill at 512 ≥ 5,000 met
-(5272–5339). The decode column of the 512 / 256 rows is g9's after the fix, from 3 rounds interleaved with poc
+split-k race fix, 325–336 vs 300–303). Decode B=16 ≥ 1,064 met (1079–1108; 1416–1480 since g12, +30–32% over poc), GPU prefill at 512 ≥ 5,000 met
+(5272–5339). The decode column of the B = 8 / 16 rows is g12's (below); of the other 512 / 256 rows, g9's after the fix, from 3 rounds interleaved with poc
 (the parentheses), except B=4 (one earlier round; M = 4 doesn't touch the fix). Their other columns (prefill, ratios, peak memory) are still poc's.
 g9's merged weight copies add 0.2 GB of Metal allocations (bench peak 1.04 → 1.24 at B=1) and ~0.4 GB RSS (QA, `/usr/bin/time -l`: max RSS 1.19 → 1.59 GB), because the originals stay paged in. Deferred until the weights cache stores them once.
 
@@ -76,6 +76,40 @@ After g9: 358 dispatches per B=1 step (from 484) and 3.04–3.16 ms GPU (from 3.
 of the gain came from the merged projections: in_proj_b / in_proj_a / k_proj / v_proj each cost a ~2.6–3.5 µs
 dispatch floor for under 0.2 µs of bytes. What's left over the bound is mostly attention's small dispatches
 (full: 5 at ~26 µs vs a 5 µs bound) and argmax (28 µs).
+
+#### Batched decode kernels (g12)
+
+Profile of the decode matmuls at M = 8–16 (standalone harness, weights rotated from DRAM, median of 5, quiet machine;
+no GPU counters reachable from the CLI, so by scaling in M, executed FLOPs and ablations):
+
+| kernel (MLX unless noted) | in_proj_qkv M 8 / 16, µs | down_proj M 8 / 16, µs | limiter |
+|---|---|---|---|
+| `qmv_wide` (picked at M 2–12/14) | 45.0 / 86.1 | 27.4 / 51.1 | scalar issue: linear in M, ~2.2 TFLOPS, a bf16 x load + convert + FMA per MAC |
+| `qmm_t_splitk` (M ≥ 13/15) | 72.1 / 73.3 | 45.1 / 46.0 | MMA compute on padding: BM = 32, 2 × 2 simdgroups, ~5.5 TFLOPS executed, 2–4× the useful work |
+| g10 `qmv_batch` (not on poc) | 79.2 / 82.5 | 54.8 / 55.4 | per-simdgroup latency, register-capped (extra accumulators spill) |
+| **g12 `qmm_t_decode`** | **30.2 / 44.0** | **20.9 / 27.9** | — |
+| bound (4.5-bit weights / 210 GB/s) | 16.9 | 9.8 | |
+
+`qmm_t_decode` (`src/kernels/quantized.metal`) is MLX's steel qmm_t with one M tile of 8 (M ≤ 8) or 16 rows, a
+1 × 4 simdgroup grid, BK = 64, and split-k by MLX's heuristic capped at 8; split 1 (the lm_head, 248320 × 1024)
+stores bf16 directly: 1654 → 870 µs at M = 8. It runs for decode at 7 ≤ M ≤ 16 and N ≥ 1024 (`GpuOps::linear`);
+below M = 7, at N = 512 and above M = 16 MLX's kernels are as fast. Not bit-exact with mlx-lm (the correctness
+rule allows it): `test_batch` B = 8 KL mean 7.9e-4 / max 8.6e-3, B = 16 7.9e-4 / 1.6e-2, top-1 within 1 ulp 100%.
+
+`mllm bench -p 512 -g 256 -n 3`, decode tok/s, g12 6b3876e against poc a0c21ec, interleaved, 2 rounds with the order
+alternating (2026-11-23, idle machine):
+
+| batch | g12 | poc | |
+|---:|---:|---:|---:|
+| 4 | 845 / 828 | 844 / 830 | flat (M = 4 keeps `qmv_wide`) |
+| 8 | 1143 / 1145 | 932 / 931 | +23% |
+| 16 | 1416 / 1416 | 1088 / 982 | +30% (the 982 is a poc outlier) |
+
+QA's interleaved run of the same build: B = 8 1182 / 1155 vs poc 961 / 936 (+23%), B = 16 1437 / 1480 vs
+1095 / 1123 (+31–32%). So B = 16 is +30–32% over poc (~1088–1123), not more.
+
+g9's merged projections stay M = 1 only: the split-k accumulate and the consumers (z / b / a slices, swiglu over
+gate | up) would all need a row stride, not a small diff.
 
 #### ANE prefill (C++, `--prefill ane`, fp16 blocks at S = 512)
 

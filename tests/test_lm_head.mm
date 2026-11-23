@@ -1,6 +1,7 @@
 // lm_head + sampling. (1) golden decode0..2: ws.x after dense(L) -> logits and greedy ids equal decodeN/logits,
 // decodeN/argmax. (2) lm_head.safetensors: the quantized matmul at N = vocab for M = 1..16 (MLX switches kernels by
-// M) bit-exact, argmax = the lowest index of the row's max. (3) argmax ties and edges. (4) make_sampler semantics:
+// M) bit-exact at M 1..6 and 13..16, by tolerance at 7..12 (qmm_t_decode), rows past M untouched, argmax = the
+// lowest index of the row's max. (3) argmax ties and edges. (4) make_sampler semantics:
 // 5k seeded draws match the expected distribution (chi-square), top_p drops exactly the tail apply_top_p drops.
 #include <cassert>
 #include <fstream>
@@ -91,9 +92,17 @@ int main() {
     memcpy(ws.x.contents, sw.data(xs), xs.nbytes);
     for (int M = 1; M <= 16; M++) {
         const mllm::Tensor& want = sw.at(std::to_string(M) + "/logits");
+        const size_t row = (size_t)V * 2, rest = (max_batch - M) * row;
+        memset(logits + M * row, 0x5a, rest);  // sentinel: rows M.. must stay untouched (padding-row stores)
         std::vector<int> got = run(M);
-        assert(exact("M = " + std::to_string(M), want, sw.data(want)));
-        for (int b = 0; b < M; b++) assert(got[b] == cpu_argmax(sw.data(want) + (size_t)b * V * 2, V));
+        for (size_t i = 0; i < rest; i++) assert(logits[M * row + i] == 0x5a);
+        if (M < 7 || M >= 13) {  // qmm_t_decode at M 13..16 happens to round as MLX's qmm_t does: keep it exact
+            assert(exact("M = " + std::to_string(M), want, sw.data(want)));
+            for (int b = 0; b < M; b++) assert(got[b] == cpu_argmax(sw.data(want) + (size_t)b * V * 2, V));
+        } else {  // qmm_t_decode (GpuOps::linear, decode at 7 <= M <= 16) at 7..12: by tolerance, argmax of our own logits
+            assert(golden::matches("M = " + std::to_string(M), want, sw.data(want), logits, 0.99999, 0.0625));
+            for (int b = 0; b < M; b++) assert(got[b] == cpu_argmax(logits + (size_t)b * V * 2, V));
+        }
     }
     // (3) argmax: ties to the lowest index, max at the last index, all -inf -> 0, NaN-free rows only
     uint16_t* L = (uint16_t*)logits;
@@ -148,7 +157,9 @@ int main() {
     for (int i = 0; i < 200; i++) assert(ops.sample(ws, {{1, 0.5f, &r3}})[0] == 123);
     L[123] = ninf;
     assert(ops.sample(ws, {{1, 0, &r3}})[0] == 0);
-    printf("decode steps: %d, logits and greedy ids bit-exact; lm_head M = 1..16 bit-exact; argmax ties ok;\n"
+    printf("decode steps: %d, logits and greedy ids bit-exact; lm_head M = 1..6, 13..16 bit-exact, 7..12 within "
+           "tolerance, rows M.. untouched; "
+           "argmax ties ok;\n"
            "sampling: 4 cases x %d draws match make_sampler's distribution (chi-square, p 0.001), top_p tails dropped\nPASS\n",
            steps, draws);
     assert(steps == 3);

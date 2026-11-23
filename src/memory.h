@@ -77,7 +77,7 @@ struct Workspace {
 
     // GpuOps' scratch (GpuOps::workspace allocates it), one set per workspace so lanes on two queues never share:
     // [rows, ...] bf16: h (residual after attn), xn (normed), t (projection out), g / u (MLP), qg (q_proj out);
-    // splitk: qmm_t_splitk's fp32 partial sums. Attention: ao (attention out, MLX's [B, H, S, D]); partials / sums /
+    // splitk: qmm_t_splitk's and qmm_t_decode's fp32 partial sums. Attention: ao (attention out, MLX's [B, H, S, D]); partials / sums /
     // maxs (sdpa 2-pass); kc / vc (prefill: the row's K/V gathered, [Hkv, max_ctx, D]); scores [H, rows, max_ctx].
     // Linear attention: nqkv (normed q / k, [rows, conv_dim]), gdn_g (fp32) / beta [rows, Hv].
     // ids: lm_head's argmax per row (int32), read by sample after the command buffer completed.

@@ -1,8 +1,9 @@
 // Kernel checks the golden trace can't give, against CPU fp32/fp64 references on random bf16 inputs:
 //  - RMSNorm and the gated RMSNorm (linear attn(i) uses it in g4; the trace has no input/output pair for it alone)
 //  - GpuOps::linear on every kernel it can pick: qmv_fast (M = 1), qmv_wide nv 2..5, qmm_t_splitk aligned and not,
-//    qmm_t aligned and not (the trace only reaches qmv_wide nv 2 and qmm_t_splitk)
-// Then times each projection shape at M = 1, 8, 16, 512 next to tools/roofline.py's bound.
+//    qmm_t aligned and not (the trace only reaches qmv_wide nv 2 and qmm_t_splitk); decode (ws.S == 1, 7 <= M <= 16):
+//    qmm_t_decode BM 8 / 16, split-k and not (lm_head), and the M = 6 / 17 neighbours that stay MLX's
+// Then times each projection shape at M = 1, 8, 16, 512 next to tools/roofline.py's bound ("8d": decode).
 #include <cassert>
 #include <random>
 
@@ -117,15 +118,22 @@ void mllm::GpuOpsTest::run() {
         const char* kernel;
         const mllm::QLinear& l;
         int M;
+        bool decode = false;
     } cases[] = {
         {"qmv_fast", l0.down_proj, 1},          {"qmv_wide nv2", l0.in_proj_z, 2},
         {"qmv_wide nv3", l0.out, 3},            {"qmv_wide nv4", l3.q_proj, 8},
         {"qmv_wide nv5", l0.in_proj_b, 5},      {"qmm_t_splitk aligned", l3.k_proj, 16},
         {"qmm_t_splitk unaligned", l0.in_proj_a, 32}, {"qmm_t aligned", l3.v_proj, 1024},
         {"qmm_t unaligned", l0.in_proj_a, 8224},
+        {"decode M 6 (qmv_wide)", l0.in_proj_qkv, 6, true}, {"qmm_t_decode BM 8 M 7", l0.down_proj, 7, true},
+        {"qmm_t_decode BM 8 M 8", l0.in_proj_qkv, 8, true},  {"qmm_t_decode BM 16 M 9", l3.q_proj, 9, true},
+        {"qmm_t_decode BM 16 M 13", l0.out, 13, true},       {"qmm_t_decode BM 16 M 16", l0.gate_proj, 16, true},
+        {"decode M 16 k_proj (MLX)", l3.k_proj, 16, true},   {"decode M 17 (splitk)", l0.down_proj, 17, true},
+        {"qmm_t_decode no split (lm_head) M 9", ops.embed_tokens, 9, true},
     };
     for (const Case& c : cases) {
         fill(x, (size_t)c.M * c.l.K, 1);
+        ws.S = c.decode ? 1 : c.M;
         mllm::encode_and_wait(q, ws, [&] {
             ops.use(ws);
             ops.linear(c.l, {x}, {y}, c.M);
@@ -154,7 +162,7 @@ void mllm::GpuOpsTest::run() {
             for (int r = 0; r < 200; r++) ops.linear(l0.in_proj_qkv, {x}, {y}, 512);
         });
     }
-    printf("%-13s %5s %5s %4s %9s %9s %6s %7s\n", "proj", "N", "K", "M", "us", "bound us", "%bound", "GB/s");
+    printf("%-13s %5s %5s %5s %9s %9s %6s %7s\n", "proj", "N", "K", "M", "us", "bound us", "%bound", "GB/s");
     for (const Shape& sh : shapes) @autoreleasepool {
         std::vector<const mllm::QLinear*> src;
         for (const L& l : ops.layers)
@@ -173,7 +181,8 @@ void mllm::GpuOpsTest::run() {
             };
             copies.push_back({copy(l.w, o, wb), copy(l.scales, o + wb, sb), copy(l.biases, o + wb + sb, sb), N, K});
         }
-        for (int M : {1, 8, 16, 512}) {
+        for (auto [M, decode] : {std::pair{1, false}, {8, false}, {8, true}, {16, false}, {16, true}, {512, false}}) {
+            ws.S = decode ? 1 : M;
             double best = 1e9;
             for (int trial = 0; trial < 3; trial++) @autoreleasepool {
                 best = std::fmin(best, mllm::encode_and_wait(q, ws, [&] {
@@ -183,7 +192,7 @@ void mllm::GpuOpsTest::run() {
             }
             double bytes = (double)N * K * 4.5 / 8 + 2.0 * M * K + 2.0 * M * N;
             double bound = std::fmax(bytes / 210e9, 2.0 * M * N * K / 6e12), gbs = bytes / best / 1e9;
-            printf("%-13s %5d %5d %4d %9.1f %9.1f %5.0f%% %7.0f%s\n", sh.name, N, K, M, best * 1e6, bound * 1e6,
+            printf("%-13s %5d %5d %4d%s %9.1f %9.1f %5.0f%% %7.0f%s\n", sh.name, N, K, M, decode ? "d" : " ", best * 1e6, bound * 1e6,
                    100 * bound / best, gbs, gbs > 273 ? "  above DRAM peak: cached" : "");
         }
     }
