@@ -46,6 +46,15 @@ arena's unused rest, so it isn't comparable to MLX's (which includes its buffer 
 Targets: decode B=1 ≥ 300 tok/s **missed** (295–299; the GPU step alone allows 310), decode B=16 ≥ 1,064 met
 (1109–1115), GPU prefill at 512 ≥ 5,000 met (5272–5339).
 
+Where B=1's time goes (2026-11-23, traced `mllm bench -p 512 -g 256`, 1,020 steps; machine loaded, java ~275% CPU,
+so 278–283 tok/s that day): each decode command buffer is committed ~3.3 ms before the previous one ends, and the
+GPU sits idle **~1 µs** between steps (p90 1 µs; same at B=8). The step time is all GPU execution (3.51–3.59 ms
+traced, 3.60 ms in `bench-ops` the same hour). So CPU encode / launch cost is fully hidden. A recorded and replayed
+step (an indirect command buffer, Metal's CUDA-graph equivalent) has nothing to remove. The gap is inside the
+GPU: ~400 dependent dispatches in one serial encoder, each draining before the next starts. Next candidates:
+concurrent dispatch with explicit barriers (independent projections overlap; same kernels, so bit-exact), then
+fusing small ops.
+
 #### ANE prefill (C++, `--prefill ane`, fp16 blocks at S = 512)
 
 ```
