@@ -41,6 +41,7 @@ sys.path.insert(0, str(Path(__file__).parent))
 import mlx.core as mx
 import numpy as np
 
+from mllm import spec as spec_mod
 from mllm.ane import CACHE, _model_key
 from mllm.engine import Engine
 from mllm.gpu import from_bits, to_bits
@@ -74,6 +75,35 @@ PAD = [{"role": "system", "content": "\u3000sys\u00a0"}, {"role": "user", "conte
 CHATS = PROMPTS + [MULTI, PAD]
 DECODE_STEPS = 3
 ARENA = 256 << 20
+
+
+def arena_bytes(s):
+    """256 MiB fits the trace's two requests on 0.8B; bigger models: 1 GiB (27B: 2 MiB units, 75 per state slot)."""
+    return ARENA if s.n_layers <= 24 else 1 << 30
+
+
+def kept_layers(s):
+    """Layers whose per-layer trace tensors are written: all of them up to 24 layers. Above, the first layer, the first
+    full one, a middle linear one and the last, each with the layer before it (its inputs), plus n_layers (the final
+    norm). 27B: every layer would be ~2 GB."""
+    if s.n_layers <= 24:
+        return set(range(s.n_layers + 1))
+    targets = {0, s.full_layers[0], s.linear_layers[len(s.linear_layers) // 2], s.n_layers - 1}
+    return {j for t in targets for j in (t - 1, t) if j >= 0} | {s.n_layers}
+
+
+def check_spec(s, args):
+    """spec.py against mlx-lm's ModelArgs (the text config mlx-lm built the model from)."""
+    t = args.text
+    kinds = tuple("full" if (i + 1) % t.full_attention_interval == 0 else "linear" for i in range(t.num_hidden_layers))
+    want = dict(kinds=kinds, hidden=t.hidden_size, vocab=t.vocab_size, n_heads=t.num_attention_heads,
+                n_kv_heads=t.num_key_value_heads, head_dim=t.head_dim, lin_k_heads=t.linear_num_key_heads,
+                lin_v_heads=t.linear_num_value_heads, lin_k_dim=t.linear_key_head_dim,
+                lin_v_dim=t.linear_value_head_dim, conv_kernel=t.linear_conv_kernel_dim)
+    got = {k: getattr(s, k) for k in want}
+    assert got == want, {k: (got[k], want[k]) for k in want if got[k] != want[k]}
+    # what the C++ engine hardcodes (gpu.mm ROPE_*, rms_norm eps)
+    assert t.rms_norm_eps == 1e-6 and t.rope_theta == 1e7 and t.partial_rotary_factor * t.head_dim == 64, t
 
 
 def weight_hashes(path):
@@ -130,12 +160,13 @@ def layout(mem):
 def trace(e):
     """Run chat[0] and chat[2] through Engine.step with decode held back until both are prefilled."""
     ops, mem = e.prefill.ops, e.mem
+    keep = kept_layers(e.spec)
     out, calls = {}, []
     cur = {}  # name of the lane call in progress, rows
 
     def record(i, kind, ws, before):
         for k, v in vars(ws).items():
-            if k != "tokens" and before.get(k) is not v:
+            if k != "tokens" and before.get(k) is not v and i in keep:
                 out[f"{cur['name']}/L{i:02d}/{kind}/{k}"] = v
 
     def wrap(name, fn):
@@ -165,12 +196,14 @@ def trace(e):
         """rows: [(req, n_tokens)] -> K/V and state of each request."""
         for b, (r, n) in enumerate(rows):
             p = f"{cur['name']}/r{b}"
-            for l in e.spec.full_layers:
+            for l in sorted(keep & set(e.spec.full_layers)):
                 k, v = mem.read_kv(l, r.pages, n)
                 out[f"{p}/L{l:02d}/k"] = mx.array(np.ascontiguousarray(k)).view(mx.bfloat16)
                 out[f"{p}/L{l:02d}/v"] = mx.array(np.ascontiguousarray(v)).view(mx.bfloat16)
             _, views = mem.load_state(r.state_slots)
             for l, (conv, delta) in views.items():
+                if l not in keep:
+                    continue
                 out[f"{p}/L{l:02d}/conv"] = mx.array(np.ascontiguousarray(conv)).view(mx.bfloat16)
                 out[f"{p}/L{l:02d}/delta"] = mx.array(np.ascontiguousarray(delta))
 
@@ -203,11 +236,11 @@ def trace(e):
 
 
 # (n, pos) around the switch points of MLX v0.32.4 on an 's' GPU: sdpa_vector 1-pass / 2-pass at 1024 keys and its
-# blocks (64 / 128 / 256, tk1 at 8 queries), the unfused fallback above 8 queries with gemv_wide up to 15, steel GEMM
+# blocks (64 / 128 / 256, tk1 at 8 queries), the unfused fallback above 8 queries (27B: above 5) with gemv_wide up to 15, steel GEMM
 # alignment (64-row / 64-key tiles, 16-key K), block / looped softmax at 4096 keys
 SWEEP = [(1, 0), (1, 1022), (1, 1023), (1, 4200), (2, 0), (8, 40), (8, 1016), (4, 1100), (8, 9000), (9, 0), (9, 100),
          (11, 50), (13, 60), (15, 0), (15, 2000), (16, 0), (16, 48), (24, 32), (33, 7), (64, 0), (100, 4000),
-         (128, 3968)]
+         (128, 3968), (6, 30), (6, 1000), (7, 1100)]  # 6, 7: unfused at gqa 6 (gemv_wide nv3 / nv4)
 
 
 def attn_sweep(eng):
@@ -245,8 +278,10 @@ def lm_head_sweep(eng):
 
 def main():
     model = sys.argv[1]
-    eng = Engine(model, arena_bytes=ARENA, chunk=CHUNK)
+    arena = arena_bytes(spec_mod.load(model))
+    eng = Engine(model, arena_bytes=arena, chunk=CHUNK)
     s = eng.spec
+    check_spec(s, eng.mem.weights.args)
     dst = Path(sys.argv[2]) if len(sys.argv) > 2 else CACHE / "golden" / _model_key(s.path)
     dst.mkdir(parents=True, exist_ok=True)
 
@@ -265,13 +300,16 @@ def main():
 
     mx.save_safetensors(str(dst / "attn.safetensors"), attn_sweep(eng))
     mx.save_safetensors(str(dst / "lm_head.safetensors"), lm_head_sweep(eng))
-    tr, calls = trace(Engine(model, arena_bytes=ARENA, chunk=CHUNK))
+    meta = {"strings": STRINGS, "chat": CHATS, "eos": sorted(eng.tok.eos), "chunk": CHUNK,
+            "page_tokens": eng.mem.T, "detok": detok_cases(eng.tok, greedy),
+            "layout": {"arena_bytes": arena, **layout(eng.mem)}}
+    del eng  # one model in memory at a time (27B: 16 GB each)
+    mx.clear_cache()
+    tr, calls = trace(Engine(model, arena_bytes=arena, chunk=CHUNK))
     mx.save_safetensors(str(dst / "trace.safetensors"), tr)
 
     spec = {k: (str(v) if isinstance(v, Path) else list(v) if isinstance(v, tuple) else v) for k, v in vars(s).items()}
-    meta = {"spec": spec, "strings": STRINGS, "chat": CHATS, "eos": sorted(eng.tok.eos), "chunk": CHUNK,
-            "page_tokens": eng.mem.T, "calls": calls, "detok": detok_cases(eng.tok, greedy),
-            "layout": {"arena_bytes": ARENA, **layout(eng.mem)}}
+    meta |= {"spec": spec, "calls": calls}
     (dst / "spec.json").write_text(json.dumps(meta, indent=1, ensure_ascii=False, sort_keys=True) + "\n")
     (dst / "weights.json").write_text(json.dumps(weight_hashes(s.path), indent=1, sort_keys=True) + "\n")
     print(f"{dst}: {len(tokens)} token arrays, {len(tr)} trace tensors")

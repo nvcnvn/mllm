@@ -119,7 +119,7 @@ void GpuOpsTest::bench_ops(const std::string& model) {
            s.path.c_str(), BW / 1e9, FLOPS / 1e12, POOL >> 20, PEAK_BW / 1e9);
     // warm the GPU (the first shapes run 2x slow otherwise)
     for (auto t0 = std::chrono::steady_clock::now(); std::chrono::steady_clock::now() - t0 < std::chrono::milliseconds(300);)
-        time([&](int) { ops.linear(ops.embed_tokens, {ws.x}, {yout}, 1); });
+        time([&](int) { ops.linear(ops.lm, {ws.x}, {yout}, 1); });
 
     // projections, deduplicated by shape
     std::vector<std::pair<std::string, QLinear>> proj;
@@ -160,7 +160,7 @@ void GpuOpsTest::bench_ops(const std::string& model) {
             row(name, std::to_string(q.K) + " -> " + std::to_string(q.N), t, bytes, 2.0 * M * q.N * q.K, lin_note(q));
         };
         for (auto& [name, q] : proj) bench_linear(name, q);
-        if (decode) bench_linear("lm_head (embed_tokens)", ops.embed_tokens);
+        if (decode) bench_linear("lm_head", ops.lm);
 
         // norms: their activations stay in cache in a real step too, so no rotation
         double t = time([&](int) { ops.rms_norm(fl.input_layernorm, {xin}, {yout}, M, s.hidden); });
@@ -254,9 +254,14 @@ void GpuOpsTest::bench_ops(const std::string& model) {
 }  // namespace mllm
 
 // mllm generate: the prompt as one user message (chat template), text streamed to stdout
+// ENGINE: --arena-gib (0: the command's default) and --max-ctx, for generate / bench / serve
+static double arena_gib = 0;
+static int max_ctx = 16384;
+static size_t arena(double def_gib) { return (size_t)((arena_gib ? arena_gib : def_gib) * (1 << 30)); }
+
 static void generate(const std::string& model, const std::string& prompt, mllm::GenParams p, const std::string& on,
                      const std::string& ane_weights, bool prefix_cache) {
-    mllm::Engine e(model, (size_t)1 << 30, 512, 32, 16, 16384, on, ane_weights, prefix_cache);
+    mllm::Engine e(model, arena(1), 512, 32, 16, max_ctx, on, ane_weights, prefix_cache);
     e.generate({{"user", prompt}}, p, [](const std::string& t) {
         fputs(t.c_str(), stdout);
         fflush(stdout);
@@ -274,7 +279,7 @@ static void generate(const std::string& model, const std::string& prompt, mllm::
 // what a concurrent prefill costs decode (architecture.md "Concurrency").
 static void bench(const std::string& model, int P, int G, int B, int n, const std::string& on,
                   const std::string& ane_weights, int stream, bool prefix_cache) {
-    mllm::Engine e(model, (size_t)1 << 30, 512, 32, 16, 16384, on, ane_weights, prefix_cache);
+    mllm::Engine e(model, arena(1), 512, 32, 16, max_ctx, on, ane_weights, prefix_cache);
     e.tok.eos.clear();  // as mlx_lm.benchmark: never stop early
     std::mt19937 rng(0);
     std::uniform_int_distribution<int> tok(0, e.spec.vocab - 1);
@@ -340,7 +345,7 @@ static void bench(const std::string& model, int P, int G, int B, int n, const st
 // mllm serve: /v1/completions on 127.0.0.1 until killed. A 2 GiB arena: 32 requests of 512 + 256 tokens need 0.9.
 static int serve(const std::string& model, int port, const std::string& on, const std::string& ane_weights,
                  int max_batch, bool prefix_cache) {
-    mllm::Engine e(model, (size_t)2 << 30, 512, 32, max_batch, 16384, on, ane_weights, prefix_cache);
+    mllm::Engine e(model, arena(2), 512, 32, max_batch, max_ctx, on, ane_weights, prefix_cache);
     mllm::Server s(e, model);
     fprintf(stderr, "mllm serve: http://127.0.0.1:%d/v1/completions (prefill on %s, max batch %d, prefix cache %s)\n",
             port, on.c_str(), max_batch, prefix_cache ? "on" : "off");
@@ -360,7 +365,9 @@ static int usage() {
             "PREFILL: [--prefill gpu|ane] [--ane-weights fp16|int8|lut6|lut4]: dense blocks of prefill on the Neural\n"
             "         Engine (Core ML models built by py/mllm/ane.py for S = 512)\n"
             "         [--prefix-cache on|off]: reuse prompt prefixes across requests (default on; off for bench, whose\n"
-            "         trials repeat the same prompts)\n");
+            "         trials repeat the same prompts)\n"
+            "ENGINE (generate, bench, serve): [--arena-gib G] (default 1, serve 2; 12 at 2 MiB units, the 27B)\n"
+            "         [--max-ctx N] (default 16384; 32768 at 2 MiB units)\n");
     return 2;
 }
 
@@ -384,6 +391,12 @@ int main(int argc, char** argv) {
         return v == "on";
     };
     try {
+        // defaults by unit size: 2 MiB units (27B) get target-27b.md's budget, a 12 GiB arena and max_ctx 32k; smaller
+        // models keep 0 (the command's default arena) and 16k
+        const bool big = npos >= 3 && cmd != "bench-ops" && mllm::Memory::unit_of(mllm::spec::load(argv[2])) >= (2u << 20);
+        arena_gib = std::stod(flag("--arena-gib", big ? "12" : "0"));
+        max_ctx = std::stoi(flag("--max-ctx", big ? "32768" : "16384"));
+        if (arena_gib < 0 || max_ctx < 1) return usage();
         if (cmd == "generate") {
             mllm::GenParams p{std::stoi(flag("--max-tokens", "256")), std::stof(flag("--temp", "0")),
                               std::stof(flag("--top-p", "0"))};

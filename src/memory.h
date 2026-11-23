@@ -14,7 +14,14 @@
 
 namespace mllm {
 
-// The model's safetensors (or header-padded copies, see memory.mm), mmapped; each file wrapped once as a no-copy MTLBuffer. A tensor = buffer + offset.
+// Projections GpuOps runs as one matmul at M = 1 (its merged QLinears), by module name: the weights cache keeps each
+// chain's weight / scales / biases back to back (memory.mm aligned).
+inline const std::vector<std::vector<std::string>> MERGED = {
+    {"linear_attn.in_proj_qkv", "linear_attn.in_proj_z", "linear_attn.in_proj_b", "linear_attn.in_proj_a"},
+    {"self_attn.q_proj", "self_attn.k_proj", "self_attn.v_proj"},
+    {"mlp.gate_proj", "mlp.up_proj"}};
+
+// The model's safetensors, rewritten once into the cache (memory.mm aligned), mmapped; each file wrapped once as a no-copy MTLBuffer. A tensor = buffer + offset.
 struct Weights {
     Weights(const std::string& path, id<MTLDevice> device);
 
@@ -106,6 +113,13 @@ struct StepTables {
 class Memory {
 public:
     Memory(const ModelSpec& spec, id<MTLDevice> device, size_t arena_bytes, int page_tokens = 32);
+    // what the constructor computes, before one exists: unit bytes, and units per state slot
+    static size_t unit_of(const ModelSpec& s, int page_tokens = 32);
+    static uint32_t state_units_of(const ModelSpec& s, int page_tokens = 32);
+    // arena bytes for `slots` requests of `tokens` tokens each: pages plus a state slot per request
+    static size_t arena_for(const ModelSpec& s, size_t slots, size_t tokens, int page_tokens = 32) {
+        return slots * ((tokens + page_tokens - 1) / page_tokens + state_units_of(s, page_tokens)) * unit_of(s, page_tokens);
+    }
 
     uint32_t units_for(size_t n_tokens) const { return (uint32_t)((n_tokens + T - 1) / T); }
     // Byte offsets, identical to memory.py's numpy views. KV within a unit: [g, kv, head, token, dim], g = index
@@ -138,6 +152,7 @@ public:
     size_t conv_bytes, delta_bytes;
     uint32_t state_units;
     int allocations = 0;
+    size_t allocated = 0;  // bytes of every allocation above (the arena included)
 
     id<MTLResidencySet> residency;  // the arena; the engine adds the weights and attaches it to the lanes' queues
 

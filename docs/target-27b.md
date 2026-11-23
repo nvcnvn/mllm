@@ -6,25 +6,19 @@ Expected shape (*estimates* from the 0.8B numbers, replaced by measurements as i
 
 | | 0.8B (measured) | 27B 4-bit (*estimate*) |
 |---|---|---|
-| GPU weights | 0.6 GB | ~15 GB |
+| GPU weights | 0.42 GB measured (language model only) | 15.13 GB measured (weights cache v3: language model only; the 0.92 GB vision tower is left out) |
 | Decode, B = 1 | 335 tok/s (dispatch-bound) | ~13–15 tok/s (bandwidth: ~15 GB read per token) |
 | GPU prefill | ~5,000 tok/s | ~150 tok/s (compute: ~54 GFLOP per token) |
 | 8k-token prompt, cold | 1.6 s | ~55 s |
 | Unit (32 tokens × 16 full layers × 4 KV heads × 256) | — | 2 MiB; 64 KiB per token |
 
 ## 0. Model and reference
-- [ ] Pick the checkpoint: Qwen3.6-27B, mlx-community 4-bit text-only. Read its `config.json` (`layer_types`, linear-attention head counts, dims) and download it to `/Volumes/T5/huggingface`. If no 4-bit conversion exists, convert with `mlx_lm.convert`. **Check:** `spec::load` reads it and every field matches mlx-lm's `ModelArgs`.
 - [ ] mlx-lm reference at 27B: `mlx_lm.benchmark` at -p 512 / 2048 / 8192 and B = 1 / 4, plus peak memory. **Check:** a 27B section in [reports/mlx-lm baseline.md](../reports/mlx-lm%20baseline.md).
-- [ ] Golden data: `py/dump_golden.py` on the 27B. If the per-layer dumps are too big, keep a few layers (first, a full-attention one, a linear one, last), plus logits and greedy tokens. **Check:** reruns are byte-identical; the size is recorded.
 
-## 1. Load
-- [ ] Weights load from the T5 (USB). The header-padded copy (`aligned()` in memory.mm) costs a second ~15 GB file if mlx-community's headers aren't 16-byte aligned. **Check:** cold load time (first start) and warm (pages cached), recorded.
-- [ ] Merged projections stored once (architecture.md Deferred, "before the 27B target"): write the merged tensors into the padded weights cache and drop the originals. **Check:** RSS after load is within 1 GB of the weights' size, not ~2×.
+## 1. Load (g13: done, see the report)
 
-## 2. GPU path, correct
-- [ ] Kernels at 27B shapes: head dim 256 in decode and prefill attention, the bigger `qmv` / `qmm` matrices, the linear layers' head counts. **Check:** per-layer cosine against golden as in cpp-port §4; greedy 64 tokens equal mlx-lm for the 3 prompts.
-- [ ] Workspace and prefill scratch at max_ctx: `scores` and `kc` / `vc` grow with heads × max_ctx. **Check:** total workspace bytes printed at startup; nothing allocates after `freeze()`; max_ctx 32k fits next to the weights and a 12 GiB arena.
-- [ ] Arena layout at 27B: unit 2 MiB, `state_units` from the 48 linear layers. **Check:** `test_memory`'s layout check passes against `memory.py` for the 27B config.
+## 2. GPU path, correct (g13: done, see the report; one 27B test run left)
+- [ ] test_engine_cache's two 80-request stress runs at 27B (stall limit now 120 s off the 0.8B; ~30 min of GPU). **Check:** `MLLM_MODEL=mlx-community/Qwen3.6-27B-4bit build/tests/test_engine_cache` passes.
 
 ## 3. GPU path, fast
 - [ ] Decode at B = 1 / 4 / 8. **Check:** B = 1 ≥ mlx-lm and within ~15% of the bandwidth bound (weights bytes / measured 220 GB/s). Record what B = 4 costs per row: batching should be close to free.

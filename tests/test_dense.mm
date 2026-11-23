@@ -49,6 +49,7 @@ int main() {
             char li[8], lp[8];
             snprintf(li, sizeof li, "L%02d", i), snprintf(lp, sizeof lp, "L%02d", i - 1);
             if (!tr.tensors.count(c + "/" + li + "/dense/x")) continue;  // dense(L) in a prefill call
+            if (i && !tr.tensors.count(c + "/" + lp + "/attn/o")) continue;  // big models: a few layers (dump_golden)
             runs++;
             if (i == 0) {
                 load(c + "/tokens", ws.tokens);
@@ -100,7 +101,7 @@ int main() {
                st.worst_cos, st.max_abs);
     int prefills = 0;
     for (const auto& call : g["calls"]) prefills += call["name"].get<std::string>().starts_with("prefill");
-    assert(runs == (int)g["calls"].size() * (L + 1) - prefills && stats["x"].calls == runs);
+    assert((L > 24 || runs == (int)g["calls"].size() * (L + 1) - prefills) && runs && stats["x"].calls == runs);
     assert(ok);
 
     // M = 1 (no golden call has it): the merged matmuls (GpuOps::merge) give the same bytes as the separate ones.
@@ -112,6 +113,7 @@ int main() {
     for (int i = 0; i <= L; i++) {
         char lp[8];
         snprintf(lp, sizeof lp, "L%02d", i - 1);
+        if (i && !tr.tensors.count(std::string("decode0/") + lp + "/attn/o")) continue;
         const bool lin = i < L && s.kinds[i] == "linear", full = i < L && !lin;
         // (name, separate path's buffer, merged path's buffer and byte offset, bytes)
         std::vector<std::tuple<std::string, id<MTLBuffer>, id<MTLBuffer>, size_t, size_t>> f = {
@@ -144,7 +146,7 @@ int main() {
         }
         m1_checked++;
     }
-    assert(ok && m1_checked == L + 1);
+    assert(ok && (L > 24 || m1_checked == L + 1) && m1_checked);
     printf("M = 1 merged == separate, %d dense calls\n", m1_checked);
     printf("PASS\n");
 }

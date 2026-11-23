@@ -12,7 +12,8 @@
 
 namespace golden {
 
-inline const char* MODEL = "mlx-community/Qwen3.5-0.8B-4bit";
+// $MLLM_MODEL picks another model's golden data (e.g. mlx-community/Qwen3.6-27B-4bit); make test runs the 0.8B
+inline const char* MODEL = getenv("MLLM_MODEL") ? getenv("MLLM_MODEL") : "mlx-community/Qwen3.5-0.8B-4bit";
 inline bool quiet = false;  // no mismatch lines (tests that expect mismatches)
 
 // <cache>/golden/<model_key>/, as dump_golden.py writes it. Exits with a hint if it isn't there.

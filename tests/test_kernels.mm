@@ -55,7 +55,7 @@ void mllm::GpuOpsTest::run() {
     id<MTLCommandQueue> q = [dev newCommandQueue];
     std::mt19937 rng(0);
     std::normal_distribution<float> normal;
-    const size_t big = (size_t)8224 * 1024;  // the largest x / y below, in elements
+    const size_t big = (size_t)8224 * s.hidden;  // the largest x / y below (qmm_t unaligned), in elements
     id<MTLBuffer> x = mem.buffer(big * 2), y = mem.buffer(big * 2), z = mem.buffer(big * 2);
     auto fill = [&](id<MTLBuffer> b, size_t n, float scale) {
         uint16_t* p = (uint16_t*)b.contents;
@@ -129,7 +129,7 @@ void mllm::GpuOpsTest::run() {
         {"qmm_t_decode BM 8 M 8", l0.in_proj_qkv, 8, true},  {"qmm_t_decode BM 16 M 9", l3.q_proj, 9, true},
         {"qmm_t_decode BM 16 M 13", l0.out, 13, true},       {"qmm_t_decode BM 16 M 16", l0.gate_proj, 16, true},
         {"decode M 16 k_proj (MLX)", l3.k_proj, 16, true},   {"decode M 17 (splitk)", l0.down_proj, 17, true},
-        {"qmm_t_decode no split (lm_head) M 9", ops.embed_tokens, 9, true},
+        {"qmm_t_decode no split (lm_head) M 9", ops.lm, 9, true},
     };
     for (const Case& c : cases) {
         fill(x, (size_t)c.M * c.l.K, 1);

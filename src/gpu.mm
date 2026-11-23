@@ -23,6 +23,10 @@ static int sdpa_blocks(int N, int n_simds) {
     return 64;
 }
 
+// MLX's has_fused_kernel: sdpa_vector only while q length <= 8 and q length x gqa <= 32 (27B, gqa 6: q length <= 5),
+// else the unfused fallback
+static bool sdpa_vector_ok(int S, int gqa) { return S <= 8 && S * gqa <= 32; }
+
 // attention.metal KVLayout
 struct KVLayout {
     uint64_t unit;
@@ -76,6 +80,7 @@ GpuOps::GpuOps(Memory& mem, const Weights& weights) : spec(mem.spec), mem(mem), 
                 pipeline([NSString stringWithFormat:@"qmm_t_decode_%d_%@", bm ? 16 : 8, sk ? @"float" : @"bf16"]);
     embed_ps = pipeline(@"embed");
     rms_ps = pipeline(@"rmsbfloat16");
+    rms_looped_ps = pipeline(@"rms_loopedbfloat16");
     add_ps = pipeline(@"add");
     swiglu_ps = pipeline(@"swiglu");
     precise_swiglu_ps = pipeline(@"precise_swiglu");
@@ -92,14 +97,16 @@ GpuOps::GpuOps(Memory& mem, const Weights& weights) : spec(mem.spec), mem(mem), 
     sdpa_2pass_2 = pipeline(@"sdpa_vector_2pass_2_bfloat16_256");
     sigmoid_gate_ps = pipeline(@"sigmoid_gate");
     // linear attention: kernel names fix the conv kernel and head shapes
-    if (!spec.linear_layers().empty() && (spec.conv_kernel != 4 || spec.lin_k_heads != 16 || spec.lin_v_heads != 16 ||
-                                          spec.lin_k_dim != 128 || spec.lin_v_dim != 128))
-        throw std::runtime_error("GpuOps: linear attention kernels instantiated for Qwen3.5-0.8B's shapes only");
+    if (!spec.linear_layers().empty() && (spec.conv_kernel != 4 || spec.lin_k_heads != 16 ||
+                                          (spec.lin_v_heads != 16 && spec.lin_v_heads != 48) || spec.lin_k_dim != 128 ||
+                                          spec.lin_v_dim != 128))
+        throw std::runtime_error("GpuOps: linear attention kernels instantiated for Qwen3.5-0.8B's and 27B's shapes only");
     conv1d_silu_ps = pipeline(@"conv1d_silu_4");
     conv_norm_qk_ps = pipeline(@"conv_norm_qk_4");
     scale_qk_ps = pipeline(@"scale_qk");
-    gdn_gates_ps = pipeline(@"gdn_gates");
-    gated_delta_ps = pipeline(@"gated_delta_paged_bfloat16_128_128_16_16");
+    gdn_gates_ps = pipeline(@"gdn_gates_float");
+    gdn_gates_bf16_ps = pipeline(@"gdn_gates_bfloat16");
+    gated_delta_ps = pipeline([NSString stringWithFormat:@"gated_delta_paged_bfloat16_128_128_16_%d", spec.lin_v_heads]);
     argmax_ps = pipeline(@"argmax_bf16");
     feed_ps = pipeline(@"feed_tokens");
     gather_kv_ps = pipeline(@"gather_kv_bfloat16_256");
@@ -107,9 +114,9 @@ GpuOps::GpuOps(Memory& mem, const Weights& weights) : spec(mem.spec), mem(mem), 
     scale_ps = pipeline(@"scale_bf16");
     softmax_ps[0] = pipeline(@"block_softmax_precise_bfloat16");
     softmax_ps[1] = pipeline(@"looped_softmax_precise_bfloat16");
-    for (int nv = 0; nv < 2; nv++)
+    for (int nv = 0; nv < 3; nv++)
         for (int kl = 0; kl < 2; kl++)  // has_batch, do_axpby
-            gemv_wide_ps[nv][kl] = pipeline([NSString stringWithFormat:@"gemv_wide_bfloat16_nv%d_kl%d", 4 + nv, 16 << kl],
+            gemv_wide_ps[nv][kl] = pipeline([NSString stringWithFormat:@"gemv_wide_bfloat16_nv%d_kl%d", 3 + nv, 16 << kl],
                                             {{0, true}, {1, false}});
     for (int nn = 0; nn < 2; nn++)
         for (int am = 0; am < 2; am++)
@@ -136,9 +143,7 @@ GpuOps::GpuOps(Memory& mem, const Weights& weights) : spec(mem.spec), mem(mem), 
     };
     const std::string P = "language_model.model.";
     embed_tokens = qlinear(P + "embed_tokens");
-    // ponytail: tied lm_head only (Qwen3.5 <= 9B); load language_model.lm_head as a QLinear for untied models
-    if (weights.st.tensors.count("language_model.lm_head.weight"))
-        throw std::runtime_error("GpuOps: untied lm_head not ported");
+    lm = weights.st.tensors.count("language_model.lm_head.weight") ? qlinear("language_model.lm_head") : embed_tokens;
     norm = buf(P + "norm.weight");
     for (int i = 0, n_full = 0; i < spec.n_layers(); i++) {
         std::string p = P + "layers." + std::to_string(i) + ".";
@@ -160,8 +165,10 @@ GpuOps::GpuOps(Memory& mem, const Weights& weights) : spec(mem.spec), mem(mem), 
             l.A_log = buf(p + "linear_attn.A_log");
             l.dt_bias = buf(p + "linear_attn.dt_bias");
             l.gated_norm = buf(p + "linear_attn.norm.weight");
-            if (weights[p + "linear_attn.A_log"].t.dtype != "F32" || weights[p + "linear_attn.conv1d.weight"].t.dtype != "BF16")
-                throw std::runtime_error(p + "linear_attn: A_log F32 and conv1d BF16 expected");
+            const std::string a_dt = weights[p + "linear_attn.A_log"].t.dtype;
+            if ((a_dt != "F32" && a_dt != "BF16") || weights[p + "linear_attn.conv1d.weight"].t.dtype != "BF16")
+                throw std::runtime_error(p + "linear_attn: A_log F32 / BF16 and conv1d BF16 expected");
+            if (a_dt == "BF16") gdn_gates_ps = gdn_gates_bf16_ps;
         } else {
             l.out = qlinear(p + "self_attn.o_proj");
             l.q_proj = qlinear(p + "self_attn.q_proj");
@@ -172,22 +179,17 @@ GpuOps::GpuOps(Memory& mem, const Weights& weights) : spec(mem.spec), mem(mem), 
         }
         layers.push_back(l);
     }
-    // the merged weights: parts copied next to each other, then the parts repointed at their rows.
-    // ponytail: the copies add ~0.4 GB RSS on 0.8B (the originals stay paged in: by this memcpy and through the
-    // residency set). Must be fixed before the 27B target, where the duplicate would approach the weights' own size:
-    // write the merged tensors into the header-padded weights cache (architecture.md, Deferred).
+    // the merged weights: the weights cache keeps each chain's parts back to back (memory.h MERGED), so the merged
+    // matmul is a view starting at the first part
     auto merged = [&](std::initializer_list<QLinear*> parts) {
-        QLinear m{.K = (*parts.begin())->K};
-        for (QLinear* p : parts) assert(p->K == m.K), m.N += p->N;
-        const size_t wrow = m.K / 2, srow = m.K / 64 * ELEM;
-        m.w = {mem.buffer(m.N * wrow)}, m.scales = {mem.buffer(m.N * srow)}, m.biases = {mem.buffer(m.N * srow)};
-        size_t n = 0;
+        const QLinear& f = **parts.begin();
+        QLinear m{.w = f.w, .scales = f.scales, .biases = f.biases, .K = f.K};
         for (QLinear* p : parts) {
-            for (auto [dst, src, row] : {std::tuple{&m.w, &p->w, wrow}, {&m.scales, &p->scales, srow}, {&m.biases, &p->biases, srow}}) {
-                memcpy((uint8_t*)dst->buffer.contents + n * row, (uint8_t*)src->buffer.contents + src->offset, p->N * row);
-                *src = {dst->buffer, n * row};
-            }
-            n += p->N;
+            const size_t wrow = m.K / 2, srow = m.K / 64 * ELEM;
+            for (auto [whole, part, row] : {std::tuple{&m.w, &p->w, wrow}, {&m.scales, &p->scales, srow}, {&m.biases, &p->biases, srow}})
+                if (p->K != m.K || part->buffer != whole->buffer || part->offset != whole->offset + m.N * row)
+                    throw std::runtime_error("GpuOps: merged projection parts not adjacent in the weights cache");
+            m.N += p->N;
         }
         return m;
     };
@@ -220,13 +222,15 @@ Workspace GpuOps::workspace(int chunk, int max_batch, int max_ctx) {
     ws.splitk = mem.buffer(512 * 32 * 32 * sizeof(float));  // split_k * M * N <= 512 tiles of 32 x 32 (see linear)
     const size_t H = spec.n_heads, D = spec.head_dim, gqa = H / spec.n_kv_heads;
     ws.ao = mem.buffer(row * H * D);
-    // 2-pass partials: decode (ws.rows rows, 64 blocks) or one row of up to 8 queries at ws.max_ctx keys
-    size_t q8 = std::min(8, ws.rows), n_part = std::max(ws.rows * H * 64, q8 * H * sdpa_blocks(ws.max_ctx, gqa * q8));
+    // 2-pass partials at max_ctx keys: decode (max_batch rows of 1 query; gqa > 4 takes up to 1024 blocks) or one
+    // prefill row of up to qv queries (the vector path's longest)
+    const int qv = std::min({chunk, 8, 32 / (int)gqa});
+    size_t n_part = std::max(max_batch * H * sdpa_blocks(max_ctx, gqa), qv * H * sdpa_blocks(max_ctx, gqa * qv));
     ws.partials = mem.buffer(n_part * D * ELEM);
     ws.sums = mem.buffer(n_part * sizeof(float));
     ws.maxs = mem.buffer(n_part * sizeof(float));
-    // the unfused fallback (> 8 queries) only: decode workspaces (chunk <= 8) never gather
-    const size_t kv_rows = chunk > 8 ? ws.max_ctx : 1;
+    // the unfused fallback only: decode workspaces (chunk on the vector path) never gather
+    const size_t kv_rows = sdpa_vector_ok(chunk, (int)gqa) ? 1 : ws.max_ctx;
     ws.kc = mem.buffer(spec.n_kv_heads * kv_rows * D * ELEM);
     ws.vc = mem.buffer(spec.n_kv_heads * kv_rows * D * ELEM);
     ws.scores = mem.buffer((size_t)std::max(chunk, 1) * ELEM * H * kv_rows);
@@ -249,12 +253,13 @@ void GpuOps::embed(Buf tokens, Buf out, int rows) {
     pre(), [enc dispatchThreads:MTLSizeMake(e.K / 8, rows, 1) threadsPerThreadgroup:MTLSizeMake(std::min(e.K / 8, 256), 1, 1)];
 }
 
-// mlx RMSNorm::eval_gpu, rms_single_row branch
+// mlx RMSNorm::eval_gpu: rms_single_row up to RMS_LOOPED_LIMIT (4096) wide, rms_looped above (27B hidden 5120)
 void GpuOps::rms_norm(Buf weight, Buf x, Buf out, int rows, int dim, float eps, uint32_t w_stride) {
-    assert(dim <= 4096);  // RMS_LOOPED_LIMIT; wider rows need rms_looped
-    uint32_t tg = 32 * (((dim + 3) / 4 + 31) / 32), axis = dim;
-    assert(tg <= rms_ps.maxTotalThreadsPerThreadgroup);
-    [enc setComputePipelineState:rms_ps];
+    const bool looped = dim > 4096;
+    id<MTLComputePipelineState> ps = looped ? rms_looped_ps : rms_ps;
+    uint32_t tg = looped ? (uint32_t)ps.maxTotalThreadsPerThreadgroup : 32 * (((dim + 3) / 4 + 31) / 32), axis = dim;
+    assert(tg <= ps.maxTotalThreadsPerThreadgroup);
+    [enc setComputePipelineState:ps];
     set(enc, x, 0), set(enc, weight, 1), set(enc, out, 2);
     set_bytes(enc, eps, 3), set_bytes(enc, axis, 4), set_bytes(enc, w_stride, 5);
     pre(), [enc dispatchThreads:MTLSizeMake((size_t)rows * tg, 1, 1) threadsPerThreadgroup:MTLSizeMake(tg, 1, 1)];
@@ -409,7 +414,7 @@ void GpuOps::dense(int i, Workspace& ws) {
 }
 
 // mlx Matmul::eval_gpu for the fallback's two matmuls (matmul.cpp): batch [Hkv, gqa] never collapses (the repeat
-// stride of K/V is 0), 8 batches rule out split-k, so: gemv_wide when transposed B and 2 <= M <= 15, else
+// stride of K/V is 0), H batches rule out split-k, so: gemv_wide when transposed B and 2 <= M <= 15, else
 // steel_matmul_regular_axpby with the 's' tiles (GEMM_TPARAM_MACRO: bm 64, bn 64, bk 16, wm 2, wn 2).
 void GpuOps::matmul(bool transpose_b, Buf a, Buf b, Buf d, int M, int N, int K, int lda, int ldb, int ldd,
                     const int64_t a_bs[2], const int64_t b_bs[2], int64_t d_bs) {
@@ -418,8 +423,8 @@ void GpuOps::matmul(bool transpose_b, Buf a, Buf b, Buf d, int M, int N, int K, 
     if (transpose_b && M >= 2 && passes <= 3 && K % 4 == 0) {  // gemv_wide_config (gen >= 15, aligned)
         assert(d_bs == (int64_t)M * N);                         // gemv_wide writes [batch, M, N] densely
         int vecs = (M + passes - 1) / passes, k_lanes = passes == 1 || N <= 64 ? 32 : 16;
-        assert(vecs == 4 || vecs == 5);  // M 9..15: the fallback runs only above 8 queries
-        [enc setComputePipelineState:gemv_wide_ps[vecs - 4][k_lanes == 32]];
+        assert(vecs >= 3 && vecs <= 5);  // M 6..15: the fallback runs above 8 queries, or above 32 / gqa
+        [enc setComputePipelineState:gemv_wide_ps[vecs - 3][k_lanes == 32]];
         set(enc, b, 0), set(enc, a, 1), set(enc, d, 3);
         set_bytes(enc, K, 4), set_bytes(enc, N, 5), set_bytes(enc, M, 6), set_bytes(enc, ldb, 7), set_bytes(enc, lda, 8);
         set_bytes(enc, 2, 11);
@@ -514,7 +519,7 @@ void GpuOps::linear_attn(int i, const Layer& l, Workspace& ws) {
 }
 
 // gpu.py _full, batched: one dispatch per op over all rows. MLX v0.32.4 ops in Python's order: fast::rope on q and k,
-// write_kv, fast::scaled_dot_product_attention (sdpa_vector / 2-pass for q length <= 8), * sigmoid(gate).
+// write_kv, fast::scaled_dot_product_attention (sdpa_vector / 2-pass while sdpa_vector_ok), * sigmoid(gate).
 // Lane contract: Python's GPU path never pads, and MLX picks kernels by q length, so ws.S is the row's n_valid when
 // B == 1 (prefill; g6's ANE lane converts its padded output to n rows before attn). B > 1 is decode: S == 1, rows
 // with n == 0 are skipped.
@@ -555,7 +560,7 @@ void GpuOps::full_attn(const Layer& l, Workspace& ws) {
     pre(), [enc dispatchThreads:MTLSizeMake(D, Hkv, B * S) threadsPerThreadgroup:MTLSizeMake(D, 1, 1)];
 
     const float scale = 1.0f / std::sqrt((float)D);  // mlx-lm: head_dim ** -0.5
-    if (S <= 8) {  // MLX: sdpa_vector, 2-pass from SDPA_2PASS_KEYS keys. Rows pick their path by N = pos + n.
+    if (sdpa_vector_ok(S, gqa)) {  // MLX: sdpa_vector, 2-pass from SDPA_2PASS_KEYS keys. Rows pick their path by N.
         if (max_N >= SDPA_2PASS_KEYS) {
             const int blocks = sdpa_blocks(max_N, gqa * S);
             assert((size_t)B * H * S * blocks <= ws.sums.length / sizeof(float));
@@ -576,7 +581,7 @@ void GpuOps::full_attn(const Layer& l, Workspace& ws) {
             set_bytes(enc, L, 6), set_bytes(enc, 0, 7), set_bytes(enc, SDPA_2PASS_KEYS, 8), set_bytes(enc, scale, 10);
             pre(), [enc dispatchThreadgroups:MTLSizeMake(B * H, S, 1) threadsPerThreadgroup:MTLSizeMake(1024, 1, 1)];
         }
-    } else {  // MLX's unfused fallback (fast.cpp; use_fallback: head_dim 256, q length > 8), row 0 only
+    } else {  // MLX's unfused fallback (fast.cpp; use_fallback: head_dim 256, !sdpa_vector_ok), row 0 only
         assert(B == 1);
         const int n = S, kL = max_N;
         // ponytail: MLX v0.32.4 runs fused steel attention for n >= 2048 == kL (no prefix); not ported (chunks are
@@ -619,9 +624,9 @@ namespace mllm {
 
 void GpuOps::lm_head(Workspace& ws) {
     use(ws);
-    const int B = ws.B, V = embed_tokens.N;
+    const int B = ws.B, V = lm.N;
     assert(ws.S == 1 && B <= ws.rows && ws.logits.length >= (size_t)B * V * ELEM);
-    linear(embed_tokens, {ws.x}, {ws.logits}, B);  // embed_tokens.as_linear: the same quantized matmul
+    linear(lm, {ws.x}, {ws.logits}, B);
     argmax({ws.logits}, {ws.ids}, B, V);
 }
 
@@ -702,7 +707,7 @@ static int sample_row(const uint16_t* row, int V, const SampleParams& p) {
 }
 
 std::vector<int> GpuOps::sample(const Workspace& ws, const std::vector<SampleParams>& params) const {
-    const int V = embed_tokens.N;
+    const int V = lm.N;
     assert((int)params.size() == ws.B);
     std::vector<int> out(ws.B);
     for (int b = 0; b < ws.B; b++) {

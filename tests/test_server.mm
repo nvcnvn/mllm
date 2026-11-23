@@ -52,7 +52,8 @@ int main() {
     assert(!want.empty() && want.back() == '\n');
     want.pop_back();  // generate's closing newline
 
-    mllm::Engine e(golden::MODEL, 256 << 20);
+    // one request up to max_ctx (the 15000-token hang-up below); also holds the short ones and their snapshots
+    mllm::Engine e(golden::MODEL, std::max<size_t>(256 << 20, mllm::Memory::arena_for(mllm::spec::load(golden::MODEL), 1, 16384)));
     mllm::Server s(e, golden::MODEL);
     bool listened = false;
     std::thread t([&] { listened = s.listen("127.0.0.1", PORT); });

@@ -4,7 +4,10 @@
 // Decode calls run a second time at B = 4 (both requests plus copies of them on other slots): every row must
 // equal the B = 2 run. Then attn.safetensors (py/dump_golden.py SWEEP): one row per (n, pos) around MLX's SDPA
 // switch points (1-pass / 2-pass and its blocks, vector / unfused, gemv_wide / steel, block / looped softmax), and
-// a 1-pass and a 2-pass decode row in one B = 2 call. Pass: everything bit-exact. Also: a padded prefill row
+// a 1-pass and a 2-pass decode row in one B = 2 call. Pass: everything bit-exact, except two 2-pass rows in one call:
+// they share max N's block count (27B: 128 at N 4201, 1_1023 alone runs 64), which batched decode allows (KL / top-1
+// tolerance, test_batch); at gqa > 4 there o must be within max |o| / 64 (2-4 bf16 ulps at max |o|), at gqa <= 4
+// (0.8B: always 64 blocks) bit-exact. Also: a padded prefill row
 // (n < ws.S), a slot past the arena and a linear layer on a table without state units assert.
 #include <fcntl.h>
 #include <spawn.h>
@@ -52,7 +55,7 @@ int main(int argc, char** argv) {
     mllm::Safetensors tr(d + "/trace.safetensors");
     id<MTLDevice> dev = MTLCreateSystemDefaultDevice();
     mllm::Weights w(s.path, dev);
-    mllm::Memory mem(s, dev, 128 << 20);
+    mllm::Memory mem(s, dev, std::max<size_t>(128 << 20, mllm::Memory::arena_for(s, 1, 9216)));  // the sweep's 9128 tokens
     const int chunk = 128, max_batch = 4, rows_max = std::max(chunk, max_batch);  // the sweep's longest chunk
     mllm::GpuOps ops(mem, w);
     ops.merge = false;  // the fields are loaded here, not left by dense's merged M = 1 matmuls
@@ -125,7 +128,7 @@ int main(int argc, char** argv) {
     };
 
     const auto full = s.full_layers();
-    int b4_rows = 0;
+    int b4_rows = 0, n_full = 0;  // full layers in the trace (big models: a few, dump_golden kept_layers)
     for (const auto& call : g["calls"]) {
         std::string c = call["name"].get<std::string>();
         const mllm::Tensor& tok = tr.at(c + "/tokens");
@@ -144,6 +147,8 @@ int main(int argc, char** argv) {
             char li[8];
             snprintf(li, sizeof li, "L%02d", full[gi]);
             std::string pre = c + "/" + li + "/";
+            if (!tr.tensors.count(pre + "attn/o")) continue;
+            n_full += c == "decode0";
             auto run = [&](const std::vector<int>& src, const std::vector<int>& reqs) {
                 ws.B = (int)src.size();
                 write_table(reqs);
@@ -183,7 +188,7 @@ int main(int argc, char** argv) {
     std::vector<uint32_t> down(mem.arena.n_units), up(mem.arena.n_units);
     for (uint32_t u = 0; u < mem.arena.n_units; u++) up[u] = u, down[u] = mem.arena.n_units - 1 - u;
     // rows: (case, pages); loads the inputs and the first pos tokens of the case's pages, runs attn, checks o / K/V
-    auto sweep = [&](const std::vector<std::pair<std::string, const std::vector<uint32_t>*>>& rows) {
+    auto sweep = [&](const std::vector<std::pair<std::string, const std::vector<uint32_t>*>>& rows, bool tol = false) {
         std::vector<mllm::StepTables::Row> trows;
         size_t at = 0;
         for (auto& [c, sl] : rows) {
@@ -214,7 +219,10 @@ int main(int argc, char** argv) {
         for (auto& [c, sl] : rows) {
             const mllm::Tensor& o = sw.at(c + "/o");
             std::string what = "sweep " + c + (rows.size() > 1 ? " (B = " + std::to_string(rows.size()) + ")" : "");
-            record("sweep o", what + " o", max_diff((const uint8_t*)ws.o.contents + at++ * o.nbytes, sw.data(o), o.numel()));
+            double diff = max_diff((const uint8_t*)ws.o.contents + at++ * o.nbytes, sw.data(o), o.numel()), m = 0;
+            for (size_t e = 0; e < o.numel(); e++) m = std::fmax(m, std::fabs(golden::to_double("BF16", sw.data(o), e)));
+            if (tol) printf("  %s o: max |diff| %g, max |o| %g (tolerance)\n", what.c_str(), diff, m), assert(diff <= m / 64);
+            else record("sweep o", what + " o", diff);
             for (int kv = 0; kv < 2; kv++) {
                 const mllm::Tensor& t = sw.at(c + (kv ? "/kv_v" : "/kv_k"));
                 record("sweep kv", what + (kv ? " v" : " k"), max_diff(pages(*sl, gl, kv, (int)t.shape[1]).data(), sw.data(t), t.numel()));
@@ -225,8 +233,9 @@ int main(int argc, char** argv) {
     for (const auto& [k, t] : sw.tensors)
         if (k.ends_with("/o")) cases.push_back(k.substr(0, k.size() - 2));
     for (const std::string& c : cases) sweep({{c, &down}});
-    sweep({{"1_1023", &up}, {"1_4200", &down}});  // 1-pass row and 2-pass row in one decode call
+    sweep({{"1_1022", &up}, {"1_4200", &down}});  // 1-pass row and 2-pass row in one decode call
     sweep({{"1_4200", &up}, {"1_0", &down}});
+    sweep({{"1_1023", &up}, {"1_4200", &down}}, s.n_heads / s.n_kv_heads > 4);  // two 2-pass rows, N 1024 and 4201
 
     assert(aborts(argv[0], "padded") && aborts(argv[0], "slot") && aborts(argv[0], "nostate"));
 
@@ -236,7 +245,7 @@ int main(int argc, char** argv) {
         ok &= st.exact == st.n;
     }
     printf("B = 4 decode: %d rows equal to the B = 2 run\n", b4_rows);
-    printf("sweep: %zu cases + 2 mixed decode calls\n", cases.size());
-    assert(ok && b4_rows == 3 * 6 * 4 && cases.size() >= 20);
+    printf("sweep: %zu cases + 3 mixed decode calls\n", cases.size());
+    assert(ok && n_full && b4_rows == 3 * n_full * 4 && cases.size() >= 20);
     printf("PASS\n");
 }

@@ -20,7 +20,7 @@ int main() {
     mllm::Safetensors tr(d + "/trace.safetensors");
     id<MTLDevice> dev = MTLCreateSystemDefaultDevice();
     mllm::Weights w(s.path, dev);
-    mllm::Memory mem(s, dev, 256 << 20);
+    mllm::Memory mem(s, dev, std::max<size_t>(256 << 20, mllm::Memory::arena_for(s, 6, 64)));  // 6 requests
     const int chunk = g["chunk"], max_batch = 4, rows_max = std::max(chunk, max_batch), max_ctx = 64, L = s.n_layers();
     mllm::GpuOps ops(mem, w);
     mllm::Workspace ws = ops.workspace(chunk, max_batch, max_ctx);

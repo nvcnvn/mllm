@@ -31,7 +31,7 @@ int main() {
     mllm::Safetensors tr(d + "/trace.safetensors");
     id<MTLDevice> dev = MTLCreateSystemDefaultDevice();
     mllm::Weights w(s.path, dev);
-    mllm::Memory mem(s, dev, 256 << 20);
+    mllm::Memory mem(s, dev, std::max<size_t>(256 << 20, mllm::Memory::arena_for(s, 5, 0)));  // 5 state spans
     const int chunk = g["chunk"], max_batch = 5, rows_max = std::max(chunk, max_batch);
     mllm::GpuOps ops(mem, w);
     ops.merge = false;  // the fields are loaded here, not left by dense's merged M = 1 matmuls
@@ -124,6 +124,7 @@ int main() {
             char lname[8];
             snprintf(lname, sizeof lname, "L%02d", li);
             std::string pre = c + "/" + lname + "/";
+            if (!tr.tensors.count(pre + "dense/qkv")) continue;  // big models: a few layers (dump_golden kept_layers)
             load(pre + "dense/qkv", ws.qkv, src), load(pre + "dense/z", ws.z, src);
             load(pre + "dense/b", ws.b, src), load(pre + "dense/a", ws.a, src);
             @autoreleasepool {
@@ -143,6 +144,7 @@ int main() {
                 char key[64];
                 for (int li : s.linear_layers()) {
                     snprintf(key, sizeof key, "%s/r%d/L%02d/%s", c.c_str(), b, li, f);
+                    if (!tr.tensors.count(key)) continue;
                     const mllm::Tensor& t = tr.at(key);
                     size_t off = mem.state_offset(li) + (f[0] == 'd' ? mem.conv_bytes : 0);
                     std::vector<uint8_t> got(t.nbytes);
@@ -161,7 +163,8 @@ int main() {
         printf("%-6s bit-exact %3d/%3d  max |diff| %g\n", name.c_str(), x.exact, x.n, x.max_abs);
         ok &= x.exact == x.n;
     }
-    const int L = (int)s.linear_layers().size();
+    int L = 0;  // linear layers in the trace
+    for (int li : s.linear_layers()) L += tr.tensors.count("decode0/L" + std::string(li < 10 ? "0" : "") + std::to_string(li) + "/dense/qkv");
     printf("decode at B = 5: %d copied rows equal to the originals (o and state), n = 0 row's state untouched\n", dup_rows);
     assert(ok && stats["o"].n == 6 * L && stats["delta"].n == 9 * L && dup_rows == 3 * L * 2);
     printf("PASS\n");

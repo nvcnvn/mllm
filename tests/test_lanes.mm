@@ -18,7 +18,7 @@ int main() {
     mllm::Safetensors tr(d + "/trace.safetensors");
     id<MTLDevice> dev = MTLCreateSystemDefaultDevice();
     mllm::Weights w(s.path, dev);
-    mllm::Memory mem(s, dev, 64 << 20);
+    mllm::Memory mem(s, dev, std::max<size_t>(64 << 20, mllm::Memory::arena_for(s, 3, 128)));  // two requests of max_ctx, then spare units
     const int chunk = g["chunk"], max_ctx = 128;
     mllm::GpuOps ops(mem, w);
     mllm::PrefillLane prefill(ops, mem, chunk, max_ctx);

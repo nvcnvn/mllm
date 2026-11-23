@@ -178,7 +178,6 @@ Python reuses mlx-lm wherever it can: `mlx_lm.load` for weights and the GPU dens
 |---|---|
 | ~~Prefix cache~~ Done (g8): `PrefixCache`, on by default (`--prefix-cache on|off`; off for `bench`). Resumes only at a state snapshot (the prompt's last full page, or a branch point) | Generated tokens cached (multi-turn without resending), or requests waiting for a snapshot an in-flight request is about to take |
 | Page-level sparse decode on full layers (Quest-style: a min/max key summary per page, attend to the top-k pages). Saves bandwidth. Saves RAM only if cold pages are spilled to the SSD tier | Full-layer K/V reads show up in decode time at long context |
-| Merged-projection weights stored once (g9): `GpuOps` copies in_proj / q·k·v / gate·up into new buffers at load, and the mmapped originals stay paged in (+0.4 GB RSS on 0.8B) | Before the 27B target, where the duplicate would approach the weights' own size: write the merged tensors into the header-padded weights cache and drop the originals |
 | Sliding-window `attn` kind (window pages) | Running Gemma 4 or another sliding-window model |
 | ~~HTTP / OpenAI-style server~~ Done (cpp-port §7): `mllm serve`, streaming `/v1/completions` only | Non-streaming, chat completions, more params: a client that needs them |
 | ~~C++ tokenizer choice~~ Done: our own byte-level BPE with llama.cpp's unicode tables, ChatML hard-coded (cpp-port §2) | Jinja templates: a second model family |

@@ -16,6 +16,10 @@
 #include "golden.h"
 
 constexpr int N = 64, CHUNK = 512;
+// 512 MiB at 0.8B (1365 units): ~16 requests of ~900 tokens (pages + state) cached at once; the same count elsewhere
+static const size_t ARENA = std::max<size_t>(512 << 20, mllm::Memory::arena_for(mllm::spec::load(golden::MODEL), 16, 900));
+// 64 MiB at 0.8B (170 units: one state slot of 50 and 3840 tokens of pages); the same elsewhere, in its units
+static const size_t SMALL = std::max<size_t>(64 << 20, mllm::Memory::arena_for(mllm::spec::load(golden::MODEL), 1, 3840));
 
 struct Run {
     std::vector<int> toks;
@@ -65,6 +69,11 @@ static Run run(mllm::Engine& e, const std::vector<int>& ids, int max_tokens = N)
     return r;
 }
 
+// cos floor when chunk boundaries move. mlx-lm's own long1300, prefilled whole vs split at 1280 (chunks of 512):
+// 0.8B K/V cos 0.99998, state 0.99996; 27B (64 layers) K/V 0.99338, state 0.96575. Ours match both to ~1e-3. The
+// bit-exact checks (chunk 32, same boundaries) are the strict ones.
+static const double COS_MIN = getenv("MLLM_MODEL") ? 0.95 : 0.9999;
+
 static void compare(const char* what, const std::vector<float>& a, const std::vector<float>& b, bool exact) {
     assert(a.size() == b.size() && !a.empty());
     double dot = 0, na = 0, nb = 0, mx = 0;
@@ -73,7 +82,7 @@ static void compare(const char* what, const std::vector<float>& a, const std::ve
     const double cos = dot / std::sqrt(na * nb);
     const bool same = !memcmp(a.data(), b.data(), a.size() * 4);
     printf("  %-28s max |diff| %.3g, cos %.8f%s\n", what, mx, cos, same ? " (bit-exact)" : "");
-    assert(exact ? same : cos >= 0.9999);
+    assert(exact ? same : cos >= COS_MIN);
 }
 
 static std::vector<int> head(const std::vector<int>& a, size_t n) {
@@ -121,8 +130,8 @@ static void invariants(const mllm::Engine& e) {
 
 // QA's stress (g8qa_cache): 80 random requests (shared bases, multi-turn extensions, repeats; random cancels in
 // prefill and decode) on a small arena. Invariants every step, cached units never change while cached, no stall.
-static void stress(int chunk, int seed, size_t mib) {
-    mllm::Engine e(golden::MODEL, mib << 20, chunk, 32, 16, 16384, "gpu", "fp16", true);
+static void stress(int chunk, int seed) {
+    mllm::Engine e(golden::MODEL, SMALL, chunk, 32, 16, 16384, "gpu", "fp16", true);
     std::mt19937 g(seed);
     std::uniform_int_distribution<int> pick(0, 99), tokd(1000, 100000);
     auto rand_ids = [&](int n) {
@@ -167,7 +176,9 @@ static void stress(int chunk, int seed, size_t mib) {
             submitted++;
         }
         if (!e.step().empty()) last_ev = std::chrono::steady_clock::now();
-        assert(std::chrono::steady_clock::now() - last_ev < std::chrono::seconds(10) && "stalled");
+        // no token for this long = stalled; 0.8B prefills 2500 tokens in < 1 s, the 27B on the GPU in ~20-35 s
+        assert(std::chrono::steady_clock::now() - last_ev < std::chrono::seconds(getenv("MLLM_MODEL") ? 120 : 10) &&
+               "stalled");
         for (auto& [id, r] : e.reqs) {
             if (r.state == mllm::State::DONE || r.cancelled) continue;
             const auto [at_pos, at_out] = plans[id];
@@ -188,7 +199,7 @@ static void stress(int chunk, int seed, size_t mib) {
     check_idle(e);
     while (e.cache->evict()) {}
     assert(e.mem.arena.cache_only_units == 0 && e.mem.arena.free_units == e.mem.arena.n_units);
-    printf("  stress chunk %d seed %d, %zu MiB: 80 requests, %zu hits; invariants held\n", chunk, seed, mib, hit.size());
+    printf("  stress chunk %d seed %d, %zu MiB: 80 requests, %zu hits; invariants held\n", chunk, seed, SMALL >> 20, hit.size());
     assert(!hit.empty());
 }
 
@@ -242,8 +253,8 @@ int main() {
     {
         // chunk 512, the served configuration
         std::map<std::vector<int>, std::vector<int>> off_toks;  // greedy 64, cache off
-        mllm::Engine off(golden::MODEL, 512 << 20, CHUNK, 32, 16, 16384, "gpu", "fp16", false);
-        mllm::Engine on(golden::MODEL, 512 << 20, CHUNK, 32, 16, 16384, "gpu", "fp16", true);
+        mllm::Engine off(golden::MODEL, ARENA, CHUNK, 32, 16, 16384, "gpu", "fp16", false);
+        mllm::Engine on(golden::MODEL, ARENA, CHUNK, 32, 16, 16384, "gpu", "fp16", true);
         assert(!off.cache && on.cache);
         for (const auto& p : all) {
             Run o = run(off, p);
@@ -293,8 +304,8 @@ int main() {
     std::map<std::vector<int>, std::vector<int>> off32;  // greedy 64, cache off, chunk 32
     {
         // chunk 32: every chunk is one page with or without the cache, so a hit must be bit-exact: tokens, K/V, state
-        mllm::Engine off(golden::MODEL, 512 << 20, 32, 32, 16, 16384, "gpu", "fp16", false);
-        mllm::Engine on(golden::MODEL, 512 << 20, 32, 32, 16, 16384, "gpu", "fp16", true);
+        mllm::Engine off(golden::MODEL, ARENA, 32, 32, 16, 16384, "gpu", "fp16", false);
+        mllm::Engine on(golden::MODEL, ARENA, 32, 32, 16, 16384, "gpu", "fp16", true);
         for (const auto& p : all) off32[p] = run(off, p).toks;
         for (const auto& p : {X, Y, Z, Z2, X}) {
             Run h = run(on, p), h1 = run(on, p, 1), o1 = run(off, p, 1);
@@ -306,10 +317,10 @@ int main() {
         check_idle(on);
         printf("gpu chunk 32: hits bit-exact with cache off (tokens, K/V, state)\n");
     }
-    {
+    try {
         // ANE prefill: the same hits; long1300 tokens equal ANE's cache-off run (the others as at chunk 512)
-        mllm::Engine off(golden::MODEL, 512 << 20, CHUNK, 32, 16, 16384, "ane", "fp16", false);
-        mllm::Engine on(golden::MODEL, 512 << 20, CHUNK, 32, 16, 16384, "ane", "fp16", true);
+        mllm::Engine off(golden::MODEL, ARENA, CHUNK, 32, 16, 16384, "ane", "fp16", false);
+        mllm::Engine on(golden::MODEL, ARENA, CHUNK, 32, 16, 16384, "ane", "fp16", true);
         for (const auto& p : {long1300, X, Y, Z, Z3}) {
             Run o = run(off, p), cold = run(on, p), hit = run(on, p);
             const int P = ((int)p.size() - 1) / 32 * 32;
@@ -320,11 +331,14 @@ int main() {
         }
         check_idle(on);
         printf("ane: hits where expected\n");
+    } catch (const std::runtime_error& e) {  // another model ($MLLM_MODEL) may have no ANE blocks built yet
+        if (!getenv("MLLM_MODEL")) throw;
+        printf("ane: skipped (%.60s...)\n", e.what());
     }
     {
-        // 64 MiB (170 units; one request's state is 50): admissions evict; 20 mixed requests at once. Chunk 32 so
-        // that outputs must equal cache off's solo runs.
-        mllm::Engine on(golden::MODEL, 64 << 20, 32, 32, 16, 16384, "gpu", "fp16", true);
+        // SMALL (0.8B: 170 units; one request's state is 50): admissions evict; 20 mixed requests at once. Chunk 32
+        // so that outputs must equal cache off's solo runs.
+        mllm::Engine on(golden::MODEL, SMALL, 32, 32, 16, 16384, "gpu", "fp16", true);
         std::map<int, std::vector<int>> want, got;
         for (int i = 0; i < 20; i++) {
             const auto& p = all[(i / 2 * 5) % all.size()];  // in pairs: the second can hit what the first left
@@ -366,7 +380,7 @@ int main() {
         while (!on.reqs.empty()) on.step();
         check_idle(on);
     }
-    stress(512, 3, 64);
-    stress(32, 1, 64);
+    stress(512, 3);
+    stress(32, 1);
     printf("PASS\n");
 }
