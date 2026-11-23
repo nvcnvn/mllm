@@ -102,5 +102,49 @@ int main() {
     for (const auto& call : g["calls"]) prefills += call["name"].get<std::string>().starts_with("prefill");
     assert(runs == (int)g["calls"].size() * (L + 1) - prefills && stats["x"].calls == runs);
     assert(ok);
+
+    // M = 1 (no golden call has it): the merged matmuls (GpuOps::merge) give the same bytes as the separate ones.
+    // Row 0 of decode0's inputs; z / b / a / v are read where the merged row leaves them (ws.qkv, ws.qg).
+    const size_t E = 2, C = s.conv_dim(), vd = (size_t)s.lin_v_heads * s.lin_v_dim, Hv = s.lin_v_heads;
+    const size_t qd = (size_t)s.n_heads * s.head_dim, kvd = (size_t)s.n_kv_heads * s.head_dim;
+    ws.B = 1, ws.S = 1;
+    int m1_checked = 0;
+    for (int i = 0; i <= L; i++) {
+        char lp[8];
+        snprintf(lp, sizeof lp, "L%02d", i - 1);
+        const bool lin = i < L && s.kinds[i] == "linear", full = i < L && !lin;
+        // (name, separate path's buffer, merged path's buffer and byte offset, bytes)
+        std::vector<std::tuple<std::string, id<MTLBuffer>, id<MTLBuffer>, size_t, size_t>> f = {
+            {"x", ws.x, ws.x, 0, s.hidden * E}};
+        if (lin)
+            f.insert(f.end(), {{"qkv", ws.qkv, ws.qkv, 0, C * E}, {"z", ws.z, ws.qkv, C * E, vd * E},
+                               {"b", ws.b, ws.qkv, (C + vd) * E, Hv * E}, {"a", ws.a, ws.qkv, (C + vd + Hv) * E, Hv * E}});
+        if (full)
+            f.insert(f.end(), {{"q", ws.q, ws.q, 0, qd * E}, {"gate", ws.gate, ws.gate, 0, qd * E}, {"k", ws.k, ws.k, 0, kvd * E},
+                               {"v", ws.v, ws.qg, (2 * qd + kvd) * E, kvd * E}});
+        std::vector<std::vector<uint8_t>> want;
+        for (bool merge : {false, true}) {
+            if (i == 0) {
+                load("decode0/tokens", ws.tokens);
+            } else {
+                load(std::string("decode0/") + lp + "/dense/x", ws.x);
+                load(std::string("decode0/") + lp + "/attn/o", ws.o);
+            }
+            for (auto& [name, sep, mb, off, n] : f) memset((uint8_t*)mb.contents + off, 0xFF, n), memset(sep.contents, 0xFF, n);
+            ops.merge = merge;
+            @autoreleasepool {
+                mllm::encode_and_wait(q, ws, [&] { ops.dense(i, ws); });
+            }
+            for (size_t k = 0; k < f.size(); k++) {
+                auto& [name, sep, mb, off, n] = f[k];
+                const uint8_t* p = merge ? (const uint8_t*)mb.contents + off : (const uint8_t*)sep.contents;
+                if (!merge) want.emplace_back(p, p + n);
+                else if (memcmp(p, want[k].data(), n)) printf("L%02d %s: merged M = 1 differs\n", i, name.c_str()), ok = false;
+            }
+        }
+        m1_checked++;
+    }
+    assert(ok && m1_checked == L + 1);
+    printf("M = 1 merged == separate, %d dense calls\n", m1_checked);
     printf("PASS\n");
 }

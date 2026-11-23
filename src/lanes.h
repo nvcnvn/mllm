@@ -42,8 +42,8 @@ struct DecodeWork {
     std::vector<DecodeRow> rows;
 };
 
-// One command buffer on q: f encodes into ws.enc. Waits; returns GPU seconds. For tests and bench-ops.
-double encode_and_wait(id<MTLCommandQueue> q, Workspace& ws, const std::function<void()>& f);
+// One command buffer on q: f encodes into ws.enc (concurrent: as the decode lane's). Waits; returns GPU seconds.
+double encode_and_wait(id<MTLCommandQueue> q, Workspace& ws, const std::function<void()>& f, bool concurrent = false);
 
 class PrefillLane {
 public:

@@ -55,6 +55,7 @@ int main(int argc, char** argv) {
     mllm::Memory mem(s, dev, 128 << 20);
     const int chunk = 128, max_batch = 4, rows_max = std::max(chunk, max_batch);  // the sweep's longest chunk
     mllm::GpuOps ops(mem, w);
+    ops.merge = false;  // the fields are loaded here, not left by dense's merged M = 1 matmuls
     mllm::Workspace ws = ops.workspace(chunk, max_batch, 9216);
     id<MTLCommandQueue> q = [dev newCommandQueue];
     mllm::StepTables tables = mem.step_tables(rows_max);

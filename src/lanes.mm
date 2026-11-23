@@ -11,10 +11,10 @@ static std::runtime_error failed(const char* lane, id<MTLCommandBuffer> cb) {
                               (cb.error ? std::string(": ") + cb.error.localizedDescription.UTF8String : ""));
 }
 
-double encode_and_wait(id<MTLCommandQueue> q, Workspace& ws, const std::function<void()>& f) {
+double encode_and_wait(id<MTLCommandQueue> q, Workspace& ws, const std::function<void()>& f, bool concurrent) {
     @autoreleasepool {
         id<MTLCommandBuffer> cb = [q commandBuffer];
-        ws.enc = [cb computeCommandEncoder];
+        ws.enc = [cb computeCommandEncoderWithDispatchType:concurrent ? MTLDispatchTypeConcurrent : MTLDispatchTypeSerial];
         try {
             f();
         } catch (...) {  // the ANE's predict failed midway: close the encoder, drop the command buffer
@@ -183,7 +183,7 @@ void DecodeLane::submit(DecodeWork work) {
         ws.table = tables.begin(work.step + 1, event.signaledValue);
         tables.write(ws.table, rows);
         id<MTLCommandBuffer> cb = [queue commandBuffer];
-        ws.enc = [cb computeCommandEncoder];
+        ws.enc = [cb computeCommandEncoderWithDispatchType:MTLDispatchTypeConcurrent];
         // Defensive today: a row in both step N and N + 1 is fed, and feeding reads N's ids, a tracked buffer, so
         // Metal already orders the two encoders (and with them the untracked arena's K/V and state). Needed if
         // workspace buffers become untracked. A fence, not encodeWaitForEvent: that cost B = 1 ~3.5% (297 vs 287).

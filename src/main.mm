@@ -192,7 +192,7 @@ void GpuOpsTest::bench_ops(const std::string& model) {
         });
         row("attn linear (conv, gated delta)", decode ? std::to_string(B) + " rows" : "512 tokens", t, B * state + lact,
             (double)B * S * gdn_flops,
-            decode ? "7 dispatches (conv, norm, scale, gates, delta, gated norm x2): their floor dominates at small B"
+            decode ? "5 dispatches (conv + norm + scale, gates, delta, gated norm x2): their floor dominates at small B"
                    : "mlx-lm's gated delta kernel walks the 512 tokens in order (128 threadgroups): latency-bound");
         if (decode) {
             t = time([&](int) { ops.argmax({ws.logits}, {yout}, M, s.vocab); });
@@ -218,6 +218,7 @@ void GpuOpsTest::bench_ops(const std::string& model) {
         ws.table = tabs[0];
         tables.write(ws.table, rows);
         std::vector<double> ts, walls;  // GPU time; wall = encode + commit + wait
+        size_t d0 = ops.dispatches, per_step = 0;
         for (int k = 0; k < 13; k++) @autoreleasepool {
                 const auto w0 = std::chrono::steady_clock::now();
                 const double t = encode_and_wait(q, ws, [&] {
@@ -226,7 +227,8 @@ void GpuOpsTest::bench_ops(const std::string& model) {
                         if (i < L) ops.attn(i, ws);
                     }
                     ops.lm_head(ws);
-                });
+                }, true);
+                if (!k) per_step = ops.dispatches - d0;
                 const double wall = std::chrono::duration<double>(std::chrono::steady_clock::now() - w0).count();
                 if (k >= 3) ts.push_back(t), walls.push_back(wall);
             }
@@ -239,8 +241,8 @@ void GpuOpsTest::bench_ops(const std::string& model) {
         for (int k = 0; k < draws; k++) ops.sample(ws, params);
         const double samp = std::chrono::duration<double>(std::chrono::steady_clock::now() - t0).count() / draws;
         // mlx-lm's figure is end to end, so the ratio uses wall time (greedy: the GPU argmax, no CPU sampling)
-        printf("  B = %2d: GPU %6.2f ms (%5.0f tok/s); wall %6.2f ms (%5.0f tok/s) vs mlx-lm %4.0f: %.2fx; "
-               "CPU sampling %.2f ms/row = %4.2f ms/step -> %5.0f tok/s\n", B, step * 1e3, B / step, wall * 1e3,
+        printf("  B = %2d: %zu dispatches; GPU %6.2f ms (%5.0f tok/s); wall %6.2f ms (%5.0f tok/s) vs mlx-lm %4.0f: %.2fx; "
+               "CPU sampling %.2f ms/row = %4.2f ms/step -> %5.0f tok/s\n", B, per_step, step * 1e3, B / step, wall * 1e3,
                B / wall, baseline[bi], B / wall / baseline[bi], samp / B * 1e3, samp * 1e3, B / (wall + samp));
         bi++;
     }

@@ -92,6 +92,7 @@ GpuOps::GpuOps(Memory& mem, const Weights& weights) : spec(mem.spec), mem(mem), 
                                           spec.lin_k_dim != 128 || spec.lin_v_dim != 128))
         throw std::runtime_error("GpuOps: linear attention kernels instantiated for Qwen3.5-0.8B's shapes only");
     conv1d_silu_ps = pipeline(@"conv1d_silu_4");
+    conv_norm_qk_ps = pipeline(@"conv_norm_qk_4");
     scale_qk_ps = pipeline(@"scale_qk");
     gdn_gates_ps = pipeline(@"gdn_gates");
     gated_delta_ps = pipeline(@"gated_delta_paged_bfloat16_128_128_16_16");
@@ -167,6 +168,32 @@ GpuOps::GpuOps(Memory& mem, const Weights& weights) : spec(mem.spec), mem(mem), 
         }
         layers.push_back(l);
     }
+    // the merged weights: parts copied next to each other, then the parts repointed at their rows.
+    // ponytail: the copies add ~0.4 GB RSS on 0.8B (the originals stay paged in: by this memcpy and through the
+    // residency set). Must be fixed before the 27B target, where the duplicate would approach the weights' own size:
+    // write the merged tensors into the header-padded weights cache (architecture.md, Deferred).
+    auto merged = [&](std::initializer_list<QLinear*> parts) {
+        QLinear m{.K = (*parts.begin())->K};
+        for (QLinear* p : parts) assert(p->K == m.K), m.N += p->N;
+        const size_t wrow = m.K / 2, srow = m.K / 64 * ELEM;
+        m.w = {mem.buffer(m.N * wrow)}, m.scales = {mem.buffer(m.N * srow)}, m.biases = {mem.buffer(m.N * srow)};
+        size_t n = 0;
+        for (QLinear* p : parts) {
+            for (auto [dst, src, row] : {std::tuple{&m.w, &p->w, wrow}, {&m.scales, &p->scales, srow}, {&m.biases, &p->biases, srow}}) {
+                memcpy((uint8_t*)dst->buffer.contents + n * row, (uint8_t*)src->buffer.contents + src->offset, p->N * row);
+                *src = {dst->buffer, n * row};
+            }
+            n += p->N;
+        }
+        return m;
+    };
+    for (Layer& l : layers) {
+        if (l.is_linear)
+            l.in_proj = merged({&l.in_proj_qkv, &l.in_proj_z, &l.in_proj_b, &l.in_proj_a});
+        else
+            l.qkv_proj = merged({&l.q_proj, &l.k_proj, &l.v_proj});
+        l.gate_up = merged({&l.gate_proj, &l.up_proj});
+    }
 
     one = mem.buffer(ELEM);
     *(uint16_t*)one.contents = 0x3F80;  // bf16 1.0
@@ -179,9 +206,13 @@ Workspace GpuOps::workspace(int chunk, int max_batch, int max_ctx) {
     ws.h = mem.buffer(row * spec.hidden);
     ws.xn = mem.buffer(row * spec.hidden);
     ws.t = mem.buffer(row * spec.hidden);
-    ws.g = mem.buffer(row * layers[0].gate_proj.N);
+    // merge: the M = 1 merged rows land in ws.g, ws.qg and ws.qkv (rows may be 1)
+    ws.g = mem.buffer(std::max(row * layers[0].gate_proj.N, layers[0].gate_up.N * ELEM));
     ws.u = mem.buffer(row * layers[0].gate_proj.N);
-    ws.qg = mem.buffer(row * 2 * spec.n_heads * spec.head_dim);
+    size_t qkv_N = 0, in_N = 0;
+    for (const Layer& l : layers) qkv_N = std::max<size_t>(qkv_N, l.qkv_proj.N), in_N = std::max<size_t>(in_N, l.in_proj.N);
+    ws.qg = mem.buffer(std::max(row * 2 * spec.n_heads * spec.head_dim, qkv_N * ELEM));
+    if (ws.qkv.length < in_N * ELEM) ws.qkv = mem.buffer(in_N * ELEM);
     ws.splitk = mem.buffer(512 * 32 * 32 * sizeof(float));  // split_k * M * N <= 512 tiles of 32 x 32 (see linear)
     const size_t H = spec.n_heads, D = spec.head_dim, gqa = H / spec.n_kv_heads;
     ws.ao = mem.buffer(row * H * D);
@@ -211,7 +242,7 @@ void GpuOps::embed(Buf tokens, Buf out, int rows) {
     [enc setComputePipelineState:embed_ps];
     set(enc, e.w, 0), set(enc, e.scales, 1), set(enc, e.biases, 2), set(enc, tokens, 3), set(enc, out, 4);
     set_bytes(enc, e.K, 5);
-    [enc dispatchThreads:MTLSizeMake(e.K / 8, rows, 1) threadsPerThreadgroup:MTLSizeMake(std::min(e.K / 8, 256), 1, 1)];
+    pre(), [enc dispatchThreads:MTLSizeMake(e.K / 8, rows, 1) threadsPerThreadgroup:MTLSizeMake(std::min(e.K / 8, 256), 1, 1)];
 }
 
 // mlx RMSNorm::eval_gpu, rms_single_row branch
@@ -222,7 +253,7 @@ void GpuOps::rms_norm(Buf weight, Buf x, Buf out, int rows, int dim, float eps, 
     [enc setComputePipelineState:rms_ps];
     set(enc, x, 0), set(enc, weight, 1), set(enc, out, 2);
     set_bytes(enc, eps, 3), set_bytes(enc, axis, 4), set_bytes(enc, w_stride, 5);
-    [enc dispatchThreads:MTLSizeMake((size_t)rows * tg, 1, 1) threadsPerThreadgroup:MTLSizeMake(tg, 1, 1)];
+    pre(), [enc dispatchThreads:MTLSizeMake((size_t)rows * tg, 1, 1) threadsPerThreadgroup:MTLSizeMake(tg, 1, 1)];
 }
 
 // Qwen3NextRMSNormGated: precise_swiglu(x, z, rms_norm(x, weight))
@@ -234,7 +265,7 @@ void GpuOps::gated_rms_norm(Buf weight, Buf x, Buf z, Buf out, int rows, int dim
 void GpuOps::elementwise(id<MTLComputePipelineState> ps, Buf a, Buf b, Buf out, size_t n) {
     [enc setComputePipelineState:ps];
     set(enc, a, 0), set(enc, b, 1), set(enc, out, 2);
-    [enc dispatchThreads:MTLSizeMake(n, 1, 1) threadsPerThreadgroup:MTLSizeMake(std::min<size_t>(n, 256), 1, 1)];
+    pre(), [enc dispatchThreads:MTLSizeMake(n, 1, 1) threadsPerThreadgroup:MTLSizeMake(std::min<size_t>(n, 256), 1, 1)];
 }
 
 void GpuOps::add(Buf x, Buf y, Buf out, size_t n) { elementwise(add_ps, x, y, out, n); }
@@ -257,7 +288,7 @@ void GpuOps::linear(const QLinear& l, Buf x, Buf y, int M) {
         if (split_k <= 1) {
             bind(qmm_t[aligned]);
             set(enc, y, 4), set_bytes(enc, K, 5), set_bytes(enc, N, 6), set_bytes(enc, M, 7);
-            [enc dispatchThreadgroups:MTLSizeMake(n_tiles, m_tiles, 1) threadsPerThreadgroup:MTLSizeMake(32, 2, 2)];
+            pre(), [enc dispatchThreadgroups:MTLSizeMake(n_tiles, m_tiles, 1) threadsPerThreadgroup:MTLSizeMake(32, 2, 2)];
             return;
         }
         int k_part = K / split_k, stride = M * N;
@@ -265,7 +296,8 @@ void GpuOps::linear(const QLinear& l, Buf x, Buf y, int M) {
         bind(qmm_t_splitk[aligned]);
         set(enc, {splitk}, 4), set_bytes(enc, K, 5), set_bytes(enc, N, 6), set_bytes(enc, M, 7);
         set_bytes(enc, k_part, 8), set_bytes(enc, stride, 9);
-        [enc dispatchThreadgroups:MTLSizeMake(n_tiles, m_tiles, split_k) threadsPerThreadgroup:MTLSizeMake(32, 2, 2)];
+        indep = false;  // every linear shares ws.splitk: an earlier accumulate may still be reading it
+        pre(), [enc dispatchThreadgroups:MTLSizeMake(n_tiles, m_tiles, split_k) threadsPerThreadgroup:MTLSizeMake(32, 2, 2)];
         // get_block_dims(N, M, 1): powers of two, at most 1024 threads
         int p0 = 0, p1 = 0, sum = 0;
         for (;;) {
@@ -277,17 +309,17 @@ void GpuOps::linear(const QLinear& l, Buf x, Buf y, int M) {
         }
         [enc setComputePipelineState:splitk_accum];
         set(enc, {splitk}, 0), set(enc, y, 1), set_bytes(enc, split_k, 2), set_bytes(enc, stride, 3), set_bytes(enc, N, 4);
-        [enc dispatchThreads:MTLSizeMake(N, M, 1) threadsPerThreadgroup:MTLSizeMake(1 << p0, 1 << p1, 1)];
+        pre(), [enc dispatchThreads:MTLSizeMake(N, M, 1) threadsPerThreadgroup:MTLSizeMake(1 << p0, 1 << p1, 1)];
     } else if (M >= 2) {  // qmv_wide: vecs_per_tg rows of x per threadgroup, 8 output rows per threadgroup
         int n_tiles = (M + 4) / 5, nv = (M + n_tiles - 1) / n_tiles;
         assert(nv >= 2 && nv <= 5);
         bind(qmv_wide[nv]);
         set(enc, y, 4), set_bytes(enc, K, 5), set_bytes(enc, N, 6), set_bytes(enc, M, 7);
-        [enc dispatchThreadgroups:MTLSizeMake((M + nv - 1) / nv, (N + 7) / 8, 1) threadsPerThreadgroup:MTLSizeMake(32, 2, 1)];
+        pre(), [enc dispatchThreadgroups:MTLSizeMake((M + nv - 1) / nv, (N + 7) / 8, 1) threadsPerThreadgroup:MTLSizeMake(32, 2, 1)];
     } else {  // qmv_fast, no partial rows (shapes checked at load)
         bind(qmv_fast);
         set(enc, y, 4), set_bytes(enc, K, 5), set_bytes(enc, N, 6);
-        [enc dispatchThreadgroups:MTLSizeMake(M, N / 8, 1) threadsPerThreadgroup:MTLSizeMake(32, 2, 1)];
+        pre(), [enc dispatchThreadgroups:MTLSizeMake(M, N / 8, 1) threadsPerThreadgroup:MTLSizeMake(32, 2, 1)];
     }
 }
 
@@ -302,9 +334,14 @@ void GpuOps::dense(int i, Workspace& ws) {
         linear(p.out, {ws.o}, {ws.t}, M);
         add({ws.x}, {ws.t}, {ws.h}, (size_t)M * H);
         rms_norm(p.post_attention_layernorm, {ws.h}, {ws.xn}, M, H);
-        linear(p.gate_proj, {ws.xn}, {ws.g}, M);
-        linear(p.up_proj, {ws.xn}, {ws.u}, M);
-        swiglu({ws.g}, {ws.u}, {ws.g}, (size_t)M * p.gate_proj.N);
+        if (merge && M == 1) {
+            linear(p.gate_up, {ws.xn}, {ws.g}, M);
+            swiglu({ws.g}, {ws.g, p.gate_proj.N * ELEM}, {ws.g}, p.gate_proj.N);
+        } else {
+            linear(p.gate_proj, {ws.xn}, {ws.g}, M);
+            indep = true, linear(p.up_proj, {ws.xn}, {ws.u}, M);
+            swiglu({ws.g}, {ws.u}, {ws.g}, (size_t)M * p.gate_proj.N);
+        }
         linear(p.down_proj, {ws.g}, {ws.t}, M);
         add({ws.h}, {ws.t}, {ws.x}, (size_t)M * H);
     }
@@ -314,22 +351,31 @@ void GpuOps::dense(int i, Workspace& ws) {
     }
     const Layer& l = layers[i];
     rms_norm(l.input_layernorm, {ws.x}, {ws.xn}, M, H);
+    const bool m1 = merge && M == 1;
+    if (l.is_linear && m1) {
+        linear(l.in_proj, {ws.xn}, {ws.qkv}, M);
+        return;
+    }
     if (l.is_linear) {
         linear(l.in_proj_qkv, {ws.xn}, {ws.qkv}, M);
-        linear(l.in_proj_z, {ws.xn}, {ws.z}, M);
-        linear(l.in_proj_b, {ws.xn}, {ws.b}, M);
-        linear(l.in_proj_a, {ws.xn}, {ws.a}, M);
+        indep = true, linear(l.in_proj_z, {ws.xn}, {ws.z}, M);
+        indep = true, linear(l.in_proj_b, {ws.xn}, {ws.b}, M);
+        indep = true, linear(l.in_proj_a, {ws.xn}, {ws.a}, M);
         return;
     }
     const int D = spec.head_dim;
-    linear(l.q_proj, {ws.xn}, {ws.qg}, M);
+    linear(m1 ? l.qkv_proj : l.q_proj, {ws.xn}, {ws.qg}, M);
     [enc setComputePipelineState:split_q_gate_ps];
     set(enc, {ws.qg}, 0), set(enc, {ws.q}, 1), set(enc, {ws.gate}, 2);
-    [enc dispatchThreads:MTLSizeMake(D, (size_t)M * spec.n_heads, 1) threadsPerThreadgroup:MTLSizeMake(D, 1, 1)];
+    pre(), [enc dispatchThreads:MTLSizeMake(D, (size_t)M * spec.n_heads, 1) threadsPerThreadgroup:MTLSizeMake(D, 1, 1)];
     rms_norm(l.q_norm, {ws.q}, {ws.q}, M * spec.n_heads, D);
-    linear(l.k_proj, {ws.xn}, {ws.k}, M);
+    if (m1) {  // k, v follow q | gate in ws.qg; v stays there (full_attn reads it)
+        indep = true, rms_norm(l.k_norm, {ws.qg, l.q_proj.N * ELEM}, {ws.k}, spec.n_kv_heads, D);
+        return;
+    }
+    indep = true, linear(l.k_proj, {ws.xn}, {ws.k}, M);
     rms_norm(l.k_norm, {ws.k}, {ws.k}, M * spec.n_kv_heads, D);
-    linear(l.v_proj, {ws.xn}, {ws.v}, M);
+    indep = true, linear(l.v_proj, {ws.xn}, {ws.v}, M);
 }
 
 // mlx Matmul::eval_gpu for the fallback's two matmuls (matmul.cpp): batch [Hkv, gqa] never collapses (the repeat
@@ -350,7 +396,7 @@ void GpuOps::matmul(bool transpose_b, Buf a, Buf b, Buf d, int M, int N, int K, 
         [enc setBytes:batch_shape length:sizeof batch_shape atIndex:12];
         [enc setBytes:a_bs length:2 * sizeof(int64_t) atIndex:13];
         [enc setBytes:b_bs length:2 * sizeof(int64_t) atIndex:14];
-        [enc dispatchThreadgroups:MTLSizeMake(N >= 65536 ? 1 : passes, (N + 3) / 4, batches)
+        pre(), [enc dispatchThreadgroups:MTLSizeMake(N >= 65536 ? 1 : passes, (N + 3) / 4, batches)
             threadsPerThreadgroup:MTLSizeMake(32, k_lanes / 8, 1)];
         return;
     }
@@ -362,7 +408,7 @@ void GpuOps::matmul(bool transpose_b, Buf a, Buf b, Buf d, int M, int N, int K, 
     set(enc, a, 0), set(enc, b, 1), set(enc, d, 3), set_bytes(enc, params, 4);
     [enc setBytes:batch_shape length:sizeof batch_shape atIndex:6];
     [enc setBytes:strides length:sizeof strides atIndex:7];
-    [enc dispatchThreadgroups:MTLSizeMake(tn, tm, batches) threadsPerThreadgroup:MTLSizeMake(32, 2, 2)];
+    pre(), [enc dispatchThreadgroups:MTLSizeMake(tn, tm, batches) threadsPerThreadgroup:MTLSizeMake(32, 2, 2)];
 }
 
 void GpuOps::attn(int i, Workspace& ws) {
@@ -390,25 +436,41 @@ void GpuOps::linear_attn(int i, const Layer& l, Workspace& ws) {
     // gated_delta_paged reads each lane's 32 floats as one run: runs must not cross a unit
     assert(unit % 128 == 0 && delta_off % 128 == 0);
     id<MTLBuffer> arena = mem.arena_buffer;
+    // merge: dense wrote [qkv | z | b | a] as one row in ws.qkv
+    const bool m1 = merge && M == 1;
+    const size_t vd = (size_t)Hv * spec.lin_v_dim;
+    const Buf z = m1 ? Buf{ws.qkv, C * ELEM} : Buf{ws.z}, b = m1 ? Buf{ws.qkv, (C + vd) * ELEM} : Buf{ws.b},
+              a = m1 ? Buf{ws.qkv, (C + vd + Hv) * ELEM} : Buf{ws.a};
 
-    [enc setComputePipelineState:conv1d_silu_ps];
-    set(enc, {ws.qkv}, 0), set(enc, l.conv1d, 1), set(enc, {arena}, 2), set(enc, {table}, 3);
-    set_bytes(enc, unit, 4), set_bytes(enc, n_state, 5), set_bytes(enc, conv_off, 6), set_bytes(enc, S, 7);
-    [enc dispatchThreads:MTLSizeMake(C, B, 1) threadsPerThreadgroup:MTLSizeMake(256, 1, 1)];
-
-    // normalize_qk: rms_norm without weight (eps scaled to the mean), then the scales. Rows of 128 over the whole
-    // conv output (v too, into scratch; only q / k are used), as MLX norms the q / k slices.
     const double inv_scale = std::pow((double)Dk, -0.5);
-    rms_norm({one}, {ws.qkv}, {ws.nqkv}, M * (C / Dk), Dk, (float)(1e-6 * inv_scale * inv_scale), 0);
-    [enc setComputePipelineState:scale_qk_ps];
-    set(enc, {ws.nqkv}, 0), set_bytes(enc, (float)(inv_scale * inv_scale), 1), set_bytes(enc, (float)inv_scale, 2);
-    set_bytes(enc, C, 3);
-    [enc dispatchThreads:MTLSizeMake(2 * key_dim, M, 1) threadsPerThreadgroup:MTLSizeMake(256, 1, 1)];
+    if (S == 1) {  // decode: conv, norm and scales fused (conv_norm_qk), same eps and scales as below
+        const float eps = (float)(1e-6 * inv_scale * inv_scale), q_scale = (float)(inv_scale * inv_scale);
+        assert(C % Dk == 0 && key_dim % Dk == 0);
+        [enc setComputePipelineState:conv_norm_qk_ps];
+        set(enc, {ws.qkv}, 0), set(enc, l.conv1d, 1), set(enc, {arena}, 2), set(enc, {table}, 3);
+        set_bytes(enc, unit, 4), set_bytes(enc, n_state, 5), set_bytes(enc, conv_off, 6), set(enc, {ws.nqkv}, 7);
+        set_bytes(enc, eps, 8), set_bytes(enc, q_scale, 9), set_bytes(enc, (float)inv_scale, 10), set_bytes(enc, key_dim, 11);
+        pre(), [enc dispatchThreadgroups:MTLSizeMake(C / Dk, B, 1) threadsPerThreadgroup:MTLSizeMake(Dk, 1, 1)];
+    } else {
+        [enc setComputePipelineState:conv1d_silu_ps];
+        set(enc, {ws.qkv}, 0), set(enc, l.conv1d, 1), set(enc, {arena}, 2), set(enc, {table}, 3);
+        set_bytes(enc, unit, 4), set_bytes(enc, n_state, 5), set_bytes(enc, conv_off, 6), set_bytes(enc, S, 7);
+        pre(), [enc dispatchThreads:MTLSizeMake(C, B, 1) threadsPerThreadgroup:MTLSizeMake(256, 1, 1)];
 
+        // normalize_qk: rms_norm without weight (eps scaled to the mean), then the scales. Rows of 128 over the whole
+        // conv output (v too, into scratch; only q / k are used), as MLX norms the q / k slices.
+        rms_norm({one}, {ws.qkv}, {ws.nqkv}, M * (C / Dk), Dk, (float)(1e-6 * inv_scale * inv_scale), 0);
+        [enc setComputePipelineState:scale_qk_ps];
+        set(enc, {ws.nqkv}, 0), set_bytes(enc, (float)(inv_scale * inv_scale), 1), set_bytes(enc, (float)inv_scale, 2);
+        set_bytes(enc, C, 3);
+        pre(), [enc dispatchThreads:MTLSizeMake(2 * key_dim, M, 1) threadsPerThreadgroup:MTLSizeMake(256, 1, 1)];
+    }
+
+    indep = true;
     [enc setComputePipelineState:gdn_gates_ps];
-    set(enc, {ws.a}, 0), set(enc, {ws.b}, 1), set(enc, l.A_log, 2), set(enc, l.dt_bias, 3), set(enc, {ws.gdn_g}, 4);
+    set(enc, a, 0), set(enc, b, 1), set(enc, l.A_log, 2), set(enc, l.dt_bias, 3), set(enc, {ws.gdn_g}, 4);
     set(enc, {ws.beta}, 5);
-    [enc dispatchThreads:MTLSizeMake(Hv, M, 1) threadsPerThreadgroup:MTLSizeMake(Hv, 1, 1)];
+    pre(), [enc dispatchThreads:MTLSizeMake(Hv, M, 1) threadsPerThreadgroup:MTLSizeMake(Hv, 1, 1)];
 
     // mlx-lm: grid (32, Dv / 8, B * Hv), threadgroup (32, 2, 1)
     [enc setComputePipelineState:gated_delta_ps];
@@ -416,9 +478,9 @@ void GpuOps::linear_attn(int i, const Layer& l, Workspace& ws) {
     set(enc, {ws.gdn_g}, 3), set(enc, {ws.beta}, 4), set(enc, {arena}, 5), set(enc, {ws.o}, 6), set(enc, {table}, 7);
     set_bytes(enc, S, 8), set_bytes(enc, C, 9), set_bytes(enc, unit, 10), set_bytes(enc, n_state, 11);
     set_bytes(enc, delta_off, 12);
-    [enc dispatchThreads:MTLSizeMake(32, spec.lin_v_dim / 8, B * Hv) threadsPerThreadgroup:MTLSizeMake(32, 2, 1)];
+    pre(), [enc dispatchThreads:MTLSizeMake(32, spec.lin_v_dim / 8, B * Hv) threadsPerThreadgroup:MTLSizeMake(32, 2, 1)];
 
-    gated_rms_norm(l.gated_norm, {ws.o}, {ws.z}, {ws.o}, M * Hv, spec.lin_v_dim);
+    gated_rms_norm(l.gated_norm, {ws.o}, z, {ws.o}, M * Hv, spec.lin_v_dim);
 }
 
 // gpu.py _full, batched: one dispatch per op over all rows. MLX v0.32.4 ops in Python's order: fast::rope on q and k,
@@ -448,20 +510,19 @@ void GpuOps::full_attn(const Layer& l, Workspace& ws) {
         [enc setBytes:strides length:sizeof strides atIndex:4];
         [enc setBytes:strides length:sizeof strides atIndex:5];
         set_bytes(enc, (int64_t)1, 6), set_bytes(enc, heads, 7), set_bytes(enc, std::log2(ROPE_THETA), 10);
-        [enc dispatchThreads:MTLSizeMake(ROPE_DIMS / 2, S, B * ((heads + 3) / 4)) threadsPerThreadgroup:MTLSizeMake(32, 1, 1)];
+        pre(), [enc dispatchThreads:MTLSizeMake(ROPE_DIMS / 2, S, B * ((heads + 3) / 4)) threadsPerThreadgroup:MTLSizeMake(32, 1, 1)];
     };
     rope(ws.q, H);
-    rope(ws.k, Hkv);
+    indep = true, rope(ws.k, Hkv);
 
     KVLayout L{mem.arena.unit_bytes / ELEM, mem.T, Hkv, l.g};
     id<MTLBuffer> arena = mem.arena_buffer;
     [enc setComputePipelineState:write_kv_ps];
-    set(enc, {ws.k}, 0), set(enc, {ws.v}, 1), set(enc, {arena}, 2), set(enc, {table}, 3);
+    // merge: v is still in dense's [q | gate | k | v] row in ws.qg
+    const Buf v = merge && B * S == 1 ? Buf{ws.qg, (size_t)(l.q_proj.N + l.k_proj.N) * ELEM} : Buf{ws.v};
+    set(enc, {ws.k}, 0), set(enc, v, 1), set(enc, {arena}, 2), set(enc, {table}, 3);
     set_bytes(enc, L, 4), set_bytes(enc, S, 5);
-    [enc dispatchThreads:MTLSizeMake(D, Hkv, B * S) threadsPerThreadgroup:MTLSizeMake(D, 1, 1)];
-    // serial encoder: dispatch order is the sync (the arena is untracked). ponytail: a concurrent encoder needs
-    // barriers at rope -> write_kv -> sdpa, 2pass_1 -> 2pass_2 -> 1-pass overwrite, gather -> GEMMs, and each GEMM
-    // / mask / softmax step.
+    pre(), [enc dispatchThreads:MTLSizeMake(D, Hkv, B * S) threadsPerThreadgroup:MTLSizeMake(D, 1, 1)];
 
     const float scale = 1.0f / std::sqrt((float)D);  // mlx-lm: head_dim ** -0.5
     if (S <= 8) {  // MLX: sdpa_vector, 2-pass from SDPA_2PASS_KEYS keys. Rows pick their path by N = pos + n.
@@ -473,17 +534,17 @@ void GpuOps::full_attn(const Layer& l, Workspace& ws) {
             set(enc, {ws.q}, 0), set(enc, {arena}, 1), set(enc, {ws.partials}, 3), set(enc, {ws.sums}, 4), set(enc, {ws.maxs}, 5);
             set(enc, {table}, 6), set_bytes(enc, L, 7), set_bytes(enc, SDPA_2PASS_KEYS, 8), set_bytes(enc, INT_MAX, 9);
             set_bytes(enc, blocks, 11), set_bytes(enc, scale, 12);
-            [enc dispatchThreadgroups:MTLSizeMake(Hkv, B, blocks) threadsPerThreadgroup:MTLSizeMake(32, gqa, S)];
+            pre(), [enc dispatchThreadgroups:MTLSizeMake(Hkv, B, blocks) threadsPerThreadgroup:MTLSizeMake(32, gqa, S)];
             // over every row; the 1-pass below then overwrites the rows that are not on this path
             [enc setComputePipelineState:sdpa_2pass_2];
             set(enc, {ws.partials}, 0), set(enc, {ws.sums}, 1), set(enc, {ws.maxs}, 2), set(enc, {ws.ao}, 3), set_bytes(enc, blocks, 4);
-            [enc dispatchThreadgroups:MTLSizeMake(B * H, S, 1) threadsPerThreadgroup:MTLSizeMake(1024, 1, 1)];
+            pre(), [enc dispatchThreadgroups:MTLSizeMake(B * H, S, 1) threadsPerThreadgroup:MTLSizeMake(1024, 1, 1)];
         }
         if (min_N < SDPA_2PASS_KEYS) {
             [enc setComputePipelineState:sdpa_ps];
             set(enc, {ws.q}, 0), set(enc, {arena}, 1), set(enc, {ws.ao}, 3), set_bytes(enc, gqa, 4), set(enc, {table}, 5);
             set_bytes(enc, L, 6), set_bytes(enc, 0, 7), set_bytes(enc, SDPA_2PASS_KEYS, 8), set_bytes(enc, scale, 10);
-            [enc dispatchThreadgroups:MTLSizeMake(B * H, S, 1) threadsPerThreadgroup:MTLSizeMake(1024, 1, 1)];
+            pre(), [enc dispatchThreadgroups:MTLSizeMake(B * H, S, 1) threadsPerThreadgroup:MTLSizeMake(1024, 1, 1)];
         }
     } else {  // MLX's unfused fallback (fast.cpp; use_fallback: head_dim 256, q length > 8), row 0 only
         assert(B == 1);
@@ -494,16 +555,16 @@ void GpuOps::full_attn(const Layer& l, Workspace& ws) {
         assert((size_t)n * H * kL * ELEM <= ws.scores.length && (size_t)Hkv * kL * D * ELEM <= ws.kc.length);
         [enc setComputePipelineState:gather_kv_ps];
         set(enc, {arena}, 0), set(enc, {ws.kc}, 1), set(enc, {ws.vc}, 2), set(enc, {table}, 3), set_bytes(enc, L, 4);
-        [enc dispatchThreads:MTLSizeMake(D, kL, Hkv) threadsPerThreadgroup:MTLSizeMake(D, 1, 1)];
+        pre(), [enc dispatchThreads:MTLSizeMake(D, kL, Hkv) threadsPerThreadgroup:MTLSizeMake(D, 1, 1)];
         [enc setComputePipelineState:scale_ps];
         set(enc, {ws.q}, 0), set_bytes(enc, scale, 1);
-        [enc dispatchThreads:MTLSizeMake((size_t)n * H * D, 1, 1) threadsPerThreadgroup:MTLSizeMake(256, 1, 1)];
+        pre(), [enc dispatchThreads:MTLSizeMake((size_t)n * H * D, 1, 1) threadsPerThreadgroup:MTLSizeMake(256, 1, 1)];
         // scores [H, n, kL] = q kᵀ; q is our [n, H, D], (kv head, repeat) -> head kv * gqa + repeat
         const int64_t q_bs[2] = {(int64_t)gqa * D, D}, kv_bs[2] = {(int64_t)kL * D, 0};
         matmul(true, {ws.q}, {ws.kc}, {ws.scores}, n, kL, D, H * D, D, kL, q_bs, kv_bs, (int64_t)n * kL);
         [enc setComputePipelineState:causal_mask_ps];
         set(enc, {ws.scores}, 0), set(enc, {table}, 1);
-        [enc dispatchThreads:MTLSizeMake(kL, n, H) threadsPerThreadgroup:MTLSizeMake(std::min(kL, 256), 1, 1)];
+        pre(), [enc dispatchThreads:MTLSizeMake(kL, n, H) threadsPerThreadgroup:MTLSizeMake(std::min(kL, 256), 1, 1)];
         // softmax(precise=True), in place (softmax.cpp)
         const bool looped = kL > 4096;
         id<MTLComputePipelineState> sm = softmax_ps[looped];
@@ -511,7 +572,7 @@ void GpuOps::full_attn(const Layer& l, Workspace& ws) {
         assert(tg <= sm.maxTotalThreadsPerThreadgroup);
         [enc setComputePipelineState:sm];
         set(enc, {ws.scores}, 0), set(enc, {ws.scores}, 1), set_bytes(enc, kL, 2);
-        [enc dispatchThreads:MTLSizeMake((size_t)H * n * tg, 1, 1) threadsPerThreadgroup:MTLSizeMake(tg, 1, 1)];
+        pre(), [enc dispatchThreads:MTLSizeMake((size_t)H * n * tg, 1, 1) threadsPerThreadgroup:MTLSizeMake(tg, 1, 1)];
         // ao [H, S, D] = p v
         const int64_t p_bs[2] = {(int64_t)gqa * n * kL, (int64_t)n * kL};
         matmul(false, {ws.scores}, {ws.vc}, {ws.ao}, n, D, kL, kL, D, D, p_bs, kv_bs, (int64_t)S * D);
@@ -519,7 +580,7 @@ void GpuOps::full_attn(const Layer& l, Workspace& ws) {
 
     [enc setComputePipelineState:sigmoid_gate_ps];
     set(enc, {ws.ao}, 0), set(enc, {ws.gate}, 1), set(enc, {ws.o}, 2), set_bytes(enc, S, 3);
-    [enc dispatchThreads:MTLSizeMake(D, H, B * S) threadsPerThreadgroup:MTLSizeMake(D, 1, 1)];
+    pre(), [enc dispatchThreads:MTLSizeMake(D, H, B * S) threadsPerThreadgroup:MTLSizeMake(D, 1, 1)];
 }
 
 }  // namespace mllm
@@ -540,13 +601,13 @@ void GpuOps::feed_tokens(Workspace& ws, id<MTLBuffer> prev_ids, const std::vecto
     [enc setComputePipelineState:feed_ps];
     set(enc, {prev_ids}, 0), set(enc, {ws.tokens}, 1);
     [enc setBytes:src.data() length:src.size() * sizeof(int) atIndex:2];
-    [enc dispatchThreads:MTLSizeMake(src.size(), 1, 1) threadsPerThreadgroup:MTLSizeMake(src.size(), 1, 1)];
+    pre(), [enc dispatchThreads:MTLSizeMake(src.size(), 1, 1) threadsPerThreadgroup:MTLSizeMake(src.size(), 1, 1)];
 }
 
 void GpuOps::argmax(Buf x, Buf out, int rows, int V) {
     [enc setComputePipelineState:argmax_ps];
     set(enc, x, 0), set(enc, out, 1), set_bytes(enc, V, 2);
-    [enc dispatchThreadgroups:MTLSizeMake(rows, 1, 1) threadsPerThreadgroup:MTLSizeMake(1024, 1, 1)];
+    pre(), [enc dispatchThreadgroups:MTLSizeMake(rows, 1, 1) threadsPerThreadgroup:MTLSizeMake(1024, 1, 1)];
 }
 
 // make_sampler(temp, top_p) on one logits row: apply_top_p on the temperature-1 probabilities (keep every token

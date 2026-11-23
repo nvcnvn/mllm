@@ -38,13 +38,31 @@ arena's unused rest, so it isn't comparable to MLX's (which includes its buffer 
 | 512 | 128 | 1 | 5333 | 299 | 1.04 | 1.06, 0.95 | Decode: GPU time per step is 3.23 ms (310 tok/s), ~400 dispatches of which ~0.5 ms is the small-dispatch floor; the measured 3.35 ms per token leaves ~0.12 ms between command buffers. Prefill: one 512 chunk, one command buffer. |
 | 2048 | 128 | 1 | 5272 | 288 | 1.06 | 1.04, 0.94 | Decode loses 11 tok/s to the longer K/V read (mlx-lm 8); the gap is the B=1 step overhead above. Prefill: 4 chunks of 512 (mlx-lm prefills 2048 at once). |
 | 8192 | 128 | 1 | 4471 | 260 | 1.13 | 1.04, 0.97 | Attention at long context (same sdpa kernels as MLX) in both prefill (16 chunks over a growing prefix) and decode. |
-| 512 | 256 | 1 | 5272 | 297 | 1.04 | 1.09, 0.97 | As the first row. |
-| 512 | 256 | 4 | 4708 | 782 | 1.13 | 1.09, 1.00 | Decode: same MLX kernels, the per-step overhead of B=1 spread over 4 rows. Prefill: one request's chunk at a time, decode of the earlier requests running alongside on the other queue. |
-| 512 | 256 | 8 | 4445 | 921 | 1.25 | 1.05, 1.03 | Decode: `qmv_wide` / `qmm_t_splitk` at M=8 run at ~35–45% of the bandwidth bound (MLX's kernels; faster ones would break bit-exactness). Prefill as B=4. |
-| 512 | 256 | 16 | 4145 | 1109 | 1.48 | 0.98, 1.04 | Decode: as B=8, at M=16. Prefill: the 16 chunks share the GPU with decode of the requests already prefilled (up to 15 rows by the last chunk), and prompt_tps runs until the last request's first token; mlx-lm prefills every prompt before decoding. |
+| 512 | 256 | 1 | 5272 | 325–336 (poc 300–303) | 1.04 | 1.09, 0.97 | As the first row. |
+| 512 | 256 | 4 | 4708 | 851 (poc 791) | 1.13 | 1.09, 1.00 | Decode: same MLX kernels, the per-step overhead of B=1 spread over 4 rows. Prefill: one request's chunk at a time, decode of the earlier requests running alongside on the other queue. |
+| 512 | 256 | 8 | 4445 | 930–985 (poc 913–931) | 1.25 | 1.05, 1.03 | Decode: `qmv_wide` / `qmm_t_splitk` at M=8 run at ~35–45% of the bandwidth bound (MLX's kernels; faster ones would break bit-exactness). Prefill as B=4. |
+| 512 | 256 | 16 | 4145 | 1079–1108 (poc 1080–1102) | 1.48 | 0.98, 1.04 | Decode: as B=8, at M=16. Prefill: the 16 chunks share the GPU with decode of the requests already prefilled (up to 15 rows by the last chunk), and prompt_tps runs until the last request's first token; mlx-lm prefills every prompt before decoding. |
 
-Targets: decode B=1 ≥ 300 tok/s **missed** (295–299; the GPU step alone allows 310), decode B=16 ≥ 1,064 met
-(1109–1115), GPU prefill at 512 ≥ 5,000 met (5272–5339).
+Targets: decode B=1 ≥ 300 tok/s **met** since g9: +10–12% over poc, interleaved (QA: 306 → 337–339; after QA's
+split-k race fix, 325–336 vs 300–303). Decode B=16 ≥ 1,064 met (1079–1108), GPU prefill at 512 ≥ 5,000 met
+(5272–5339). The decode column of the 512 / 256 rows is g9's after the fix, from 3 rounds interleaved with poc
+(the parentheses), except B=4 (one earlier round; M = 4 doesn't touch the fix). Their other columns (prefill, ratios, peak memory) are still poc's.
+g9's merged weight copies add 0.2 GB of Metal allocations (bench peak 1.04 → 1.24 at B=1) and ~0.4 GB RSS (QA, `/usr/bin/time -l`: max RSS 1.19 → 1.59 GB), because the originals stay paged in. Deferred until the weights cache stores them once.
+
+g9 (dispatch floor), each item interleaved A/B against the previous one, 3 rounds; B=1 / B=8 per decode step:
+
+| item | dispatches | bench-ops GPU ms | bench decode tok/s | kept |
+|---|---|---|---|---|
+| poc | 484 / 484 | 3.35–3.41 / 8.11–8.15 | 282–293 / 928–951 | — |
+| a: count dispatches (`GpuOps::dispatches`) | 484 / 484 | — | — | yes |
+| b: merged projections at M = 1 (in_proj ×4, q/k/v, gate/up; weights concatenated at load, +0.4 GB RSS) | 394 / 484 | 3.16–3.17 / 8.09–8.17 | 314–318 / 927–943 | yes |
+| c: concurrent decode encoder, buffer barrier before each dependent dispatch (split-k always waits: shared `ws.splitk`, a race QA found at M ≥ 13) | 394 / 484 | ≈ b / −3% | +0.2% / +2.2% vs b; after the fix, vs a serial build: B=8 +3–5%, B=16 −6% / +1% / +1% | yes |
+| d1: conv1d + q/k rms_norm + scale fused at S = 1 (`conv_norm_qk`) | 358 / 448 | −1% / flat | +2.3% / flat vs c | yes |
+| d2: gated rms_norm + precise_swiglu fused (`rms_swiglu`) | 340 / 430 | op 2.7 → 1.75 µs; step flat | −0.3% / −1.5% vs d1 | reverted |
+
+Not started (each estimated below 1% of the B=1 step from bench-ops): rope q + rope k + write_kv (~2 µs × 2 × 6
+layers), argmax across threadgroups (28 µs → ~3 µs; 0.8% at B=1, 0.4% at B=8). Merging at M > 1 would need
+consumers that take a row stride, because qmv_wide / qmm split-k choose by N.
 
 Where B=1's time goes (2026-11-23, traced `mllm bench -p 512 -g 256`, 1,020 steps; machine loaded, java ~275% CPU,
 so 278–283 tok/s that day): each decode command buffer is committed ~3.3 ms before the previous one ends, and the
@@ -54,6 +72,10 @@ step (an indirect command buffer, Metal's CUDA-graph equivalent) has nothing to 
 GPU: ~400 dependent dispatches in one serial encoder, each draining before the next starts. Next candidates:
 concurrent dispatch with explicit barriers (independent projections overlap; same kernels, so bit-exact), then
 fusing small ops.
+After g9: 358 dispatches per B=1 step (from 484) and 3.04–3.16 ms GPU (from 3.22–3.53 in the same session). Most
+of the gain came from the merged projections: in_proj_b / in_proj_a / k_proj / v_proj each cost a ~2.6–3.5 µs
+dispatch floor for under 0.2 µs of bytes. What's left over the bound is mostly attention's small dispatches
+(full: 5 at ~26 µs vs a 5 µs bound) and argmax (28 µs).
 
 #### ANE prefill (C++, `--prefill ane`, fp16 blocks at S = 512)
 

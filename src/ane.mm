@@ -21,6 +21,7 @@ static const std::map<std::string, id<MTLBuffer> Workspace::*> FIELDS = {
 AneOps::AneOps(GpuOps& gpu, Memory& mem, int S, const std::string& weights)
     : S(S), root(spec::cache_dir() + "/ane/" + spec::model_key(mem.spec.path) + "/S" + std::to_string(S) + "_" + weights),
       gpu(gpu), from_ane_ps(gpu.pipeline(@"from_ane")), to_ane_ps(gpu.pipeline(@"to_ane")) {
+    this->gpu.merge = false;  // dense runs here and writes every workspace field: attn must read those
     // The surface for a feature: shared by every block with the same name and channels
     auto surface = [&](const std::string& name, MLFeatureDescription* d, const std::string& where) -> Surface& {
         MLMultiArrayConstraint* c = d.multiArrayConstraint;

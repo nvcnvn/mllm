@@ -86,6 +86,9 @@ private:
         Buf q_norm, k_norm;
         QLinear in_proj_qkv, in_proj_z, in_proj_b, in_proj_a;  // linear
         Buf conv1d, A_log, dt_bias, gated_norm;
+        // M = 1 (see merge): the projections that read xn as one matmul, weights concatenated along N. in_proj:
+        // qkv | z | b | a (linear), qkv_proj: q | k | v (full), gate_up: gate | up. The parts above are views into it.
+        QLinear in_proj, qkv_proj, gate_up;
     };
     std::vector<Layer> layers;
     void full_attn(const Layer& l, Workspace& ws);
@@ -115,7 +118,7 @@ private:
     id<MTLComputePipelineState> embed_ps, rms_ps, add_ps, swiglu_ps, precise_swiglu_ps, split_q_gate_ps;
     id<MTLComputePipelineState> rope_ps, write_kv_ps, sdpa_ps, sdpa_2pass_1[2], sdpa_2pass_2, sigmoid_gate_ps;
     id<MTLComputePipelineState> gather_kv_ps, causal_mask_ps, scale_ps, softmax_ps[2];
-    id<MTLComputePipelineState> conv1d_silu_ps, scale_qk_ps, gdn_gates_ps, gated_delta_ps, argmax_ps, feed_ps;
+    id<MTLComputePipelineState> conv1d_silu_ps, conv_norm_qk_ps, scale_qk_ps, gdn_gates_ps, gated_delta_ps, argmax_ps, feed_ps;
     // the fallback's matmul variants: gemv_wide [nv 4/5][k_lanes 16/32]; steel [nt/nn][align M][align N][align K]
     id<MTLComputePipelineState> gemv_wide_ps[2][2], steel_ps[2][2][2][2];
     id<MTLComputePipelineState> pipeline(NSString* name, std::initializer_list<std::pair<int, bool>> constants);
@@ -125,6 +128,25 @@ private:
                 const int64_t a_bs[2], const int64_t b_bs[2], int64_t d_bs);
 
     id<MTLBuffer> one;  // bf16 1, read only
+
+    // Before every dispatch. The decode lane's encoder is concurrent: a buffer-scope barrier (it covers the untracked
+    // arena too) orders each dispatch after the ones before it, unless the call site set indep: the next dispatch
+    // neither reads what the dispatches since the last barrier write, nor writes what they read or write (scratch
+    // such as ws.splitk counts: linear() clears indep for split-k). Serial encoders ignore barriers.
+    bool indep = false;
+    void pre() {
+        dispatches++;
+        if (!indep) [enc memoryBarrierWithScope:MTLBarrierScopeBuffers];
+        indep = false;
+    }
+
+public:
+    // dense(i) at M = 1 runs each Layer's merged matmuls: one output row [part | part ...] in ws.qkv (in_proj),
+    // ws.qg (qkv_proj) or ws.g (gate_up), and attn(i) reads z / b / a / v as slices of it. qmv_fast computes each
+    // output from its own weight row the same way for any N, so the values equal the separate matmuls'. False in
+    // AneOps' copy (the ANE writes each workspace field) and in tests that load the fields themselves.
+    bool merge = true;
+    size_t dispatches = 0;  // kernels encoded so far (bench-ops reports it per decode step)
 };
 
 }  // namespace mllm

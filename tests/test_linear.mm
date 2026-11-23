@@ -34,6 +34,7 @@ int main() {
     mllm::Memory mem(s, dev, 256 << 20);
     const int chunk = g["chunk"], max_batch = 5, rows_max = std::max(chunk, max_batch);
     mllm::GpuOps ops(mem, w);
+    ops.merge = false;  // the fields are loaded here, not left by dense's merged M = 1 matmuls
     mllm::Workspace ws = ops.workspace(chunk, max_batch, 1024);
     id<MTLCommandQueue> q = [dev newCommandQueue];
     mllm::StepTables tables = mem.step_tables(rows_max);

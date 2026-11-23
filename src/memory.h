@@ -72,7 +72,7 @@ struct Workspace {
     id<MTLBuffer> logits;  // [max_batch, vocab]
     int B = 0, S = 0;      // tokens' shape this step (the lane sets it); dense ops work on B * S rows
     id<MTLBuffer> table;   // this step's StepTables copy, row b = workspace row b (the lane sets it; attn reads it)
-    id<MTLComputeCommandEncoder> enc;  // GpuOps encodes into it (the lane sets it; serial: dispatch order is the sync)
+    id<MTLComputeCommandEncoder> enc;  // GpuOps encodes into it (the lane sets it; GpuOps::pre orders it)
     int rows = 0, max_ctx = 0;         // capacity: B * S <= rows, pos + n <= max_ctx
 
     // GpuOps' scratch (GpuOps::workspace allocates it), one set per workspace so lanes on two queues never share:
