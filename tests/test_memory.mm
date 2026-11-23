@@ -99,6 +99,8 @@ int main() {
         snprintf(key, sizeof key, fmt, l);
         return tr.at(key);
     };
+    // big models' traces keep a few layers (dump_golden kept_layers)
+    auto kept = [&](int l) { return tr.tensors.count("decode2/r0/L" + std::string(l < 10 ? "0" : "") + std::to_string(l) + (s.kinds[l] == "full" ? "/k" : "/conv")); };
     const int n_tok = (int)at("decode2/r0/L%02d/k", s.full_layers()[0]).shape[1];
     const uint32_t n_p = mem.units_for(n_tok), n_units = mem.arena.n_units;
     std::vector<uint32_t> pages, state;  // scattered, disjoint
@@ -107,7 +109,7 @@ int main() {
     const size_t row = D * ELEM, run = T * row;  // one (page, g, kv, head) run
     id<MTLBuffer> kv_out = [dev newBufferWithLength:(size_t)G * 2 * H * n_p * run options:MTLResourceStorageModeShared];
     for (int gi = 0; gi < G; gi++)
-        for (int kv = 0; kv < 2; kv++) {
+        for (int kv = 0; kv < 2 && kept(s.full_layers()[gi]); kv++) {
             const mllm::Tensor& t = at(kv ? "decode2/r0/L%02d/v" : "decode2/r0/L%02d/k", s.full_layers()[gi]);
             assert(t.dtype == "BF16" && t.shape == std::vector<int64_t>({H, n_tok, D}));
             for (int h = 0; h < H; h++) {
@@ -127,6 +129,7 @@ int main() {
     };
     for (const auto& p : L["state"]) {  // Python's offsets
         int l = p[0];
+        if (!kept(l)) continue;
         const mllm::Tensor &conv = at("decode2/r0/L%02d/conv", l), &delta = at("decode2/r0/L%02d/delta", l);
         assert(conv.nbytes == mem.conv_bytes && delta.nbytes == mem.delta_bytes);
         span_write(p[1], tr.data(conv), conv.nbytes);
@@ -138,7 +141,7 @@ int main() {
 
     const uint8_t* K = (const uint8_t*)kv_out.contents;
     for (int gi = 0; gi < G; gi++)
-        for (int kv = 0; kv < 2; kv++) {
+        for (int kv = 0; kv < 2 && kept(s.full_layers()[gi]); kv++) {
             const mllm::Tensor& t = at(kv ? "decode2/r0/L%02d/v" : "decode2/r0/L%02d/k", s.full_layers()[gi]);
             for (int h = 0; h < H; h++)
                 assert(!memcmp(K + (((size_t)gi * 2 + kv) * H + h) * n_p * run, tr.data(t) + (size_t)h * n_tok * row,
@@ -146,6 +149,7 @@ int main() {
         }
     const uint8_t* S = (const uint8_t*)st_out.contents;
     for (int l : s.linear_layers()) {
+        if (!kept(l)) continue;
         const mllm::Tensor &conv = at("decode2/r0/L%02d/conv", l), &delta = at("decode2/r0/L%02d/delta", l);
         assert(!memcmp(S + mem.state_offset(l), tr.data(conv), conv.nbytes));
         assert(!memcmp(S + mem.state_offset(l) + mem.conv_bytes, tr.data(delta), delta.nbytes));

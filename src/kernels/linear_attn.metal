@@ -126,6 +126,9 @@ template <typename InT, typename StT, int Dk, int Dv, int Hk, int Hv>
   }
 }
 
-// ponytail: Qwen3.5-0.8B's heads (Hk = Hv = 16, Dk = Dv = 128); instantiate others when a model needs them
+// ponytail: Qwen3.5-0.8B's heads (Hk = Hv = 16) and Qwen3.6-27B's (Hk 16, Hv 48), Dk = Dv = 128; instantiate others
+// when a model needs them
 template [[host_name("gated_delta_paged_bfloat16_128_128_16_16")]] [[kernel]]
 decltype(gated_delta_paged<bfloat16_t, float, 128, 128, 16, 16>) gated_delta_paged<bfloat16_t, float, 128, 128, 16, 16>;
+template [[host_name("gated_delta_paged_bfloat16_128_128_16_48")]] [[kernel]]
+decltype(gated_delta_paged<bfloat16_t, float, 128, 128, 16, 48>) gated_delta_paged<bfloat16_t, float, 128, 128, 16, 48>;

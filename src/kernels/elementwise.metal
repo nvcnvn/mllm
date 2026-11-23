@@ -114,17 +114,21 @@ template [[host_name("conv1d_silu_4")]] [[kernel]] decltype(conv1d_silu<4>) conv
 }
 
 // gated_delta_update's gates: beta = sigmoid(b) (bf16); g = compute_g, compiled: exp(-exp(A_log) * float(softplus(a +
-// dt_bias))), softplus = logaddexp(x, 0) in bf16. Grid (Hv, rows).
+// dt_bias))), softplus = logaddexp(x, 0) in bf16. Grid (Hv, rows). A_log: F32 (0.8B) or BF16 (27B; astype(float32)
+// is exact).
+template <typename AT>
 [[kernel]] void gdn_gates(const device bfloat16_t* a [[buffer(0)]], const device bfloat16_t* b [[buffer(1)]],
-                          const device float* A_log [[buffer(2)]], const device bfloat16_t* dt_bias [[buffer(3)]],
+                          const device AT* A_log [[buffer(2)]], const device bfloat16_t* dt_bias [[buffer(3)]],
                           device float* g [[buffer(4)]], device bfloat16_t* beta [[buffer(5)]],
                           uint2 i [[thread_position_in_grid]], uint2 grid [[threads_per_grid]]) {
   ulong j = ulong(i.y) * grid.x + i.x;
   beta[j] = Sigmoid{}(b[j]);
-  float e = Negative{}(Exp{}(A_log[i.x]));
+  float e = Negative{}(Exp{}(static_cast<float>(A_log[i.x])));
   bfloat16_t sp = LogAddExp{}(Add{}(a[j], dt_bias[i.x]), static_cast<bfloat16_t>(0));
   g[j] = Exp{}(Multiply{}(e, static_cast<float>(sp)));
 }
+template [[host_name("gdn_gates_float")]] [[kernel]] decltype(gdn_gates<float>) gdn_gates<float>;
+template [[host_name("gdn_gates_bfloat16")]] [[kernel]] decltype(gdn_gates<bfloat16_t>) gdn_gates<bfloat16_t>;
 
 // --- fused kernels: each does the same floating-point operations in the same order as the kernels it replaces ---
 

@@ -14,6 +14,10 @@
 int main() {
     using namespace mllm;
     const ModelSpec s = spec::load(golden::MODEL);
+    if (Memory::unit_of(s) >= (2u << 20)) {  // 27B: 17 rows x (74 state + pages) units of 2 MiB, ~4 GB copied 200 times
+        printf("SKIP: the race harness copies every touched unit per run (~1 TB of memcpy at 2 MiB units); the 0.8B covers it\n");
+        return 0;
+    }
     id<MTLDevice> dev = MTLCreateSystemDefaultDevice();
     Weights w(s.path, dev);
     const int L = s.n_layers();

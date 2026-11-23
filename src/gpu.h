@@ -93,7 +93,8 @@ private:
     std::vector<Layer> layers;
     void full_attn(const Layer& l, Workspace& ws);
     void linear_attn(int i, const Layer& l, Workspace& ws);
-    QLinear embed_tokens;  // its scales/biases also make it the tied lm_head (g4)
+    QLinear embed_tokens;
+    QLinear lm;  // language_model.lm_head, or embed_tokens when tied (Qwen3.5 <= 9B: embed_tokens.as_linear)
     Buf norm;
 
     void elementwise(id<MTLComputePipelineState> ps, Buf a, Buf b, Buf out, size_t n);
@@ -117,12 +118,12 @@ private:
 
     id<MTLComputePipelineState> qmv_fast, qmv_wide[6], qmm_t[2], qmm_t_splitk[2], splitk_accum;
     id<MTLComputePipelineState> qmm_t_decode[2][2];  // [BM 8 / 16][split-k float partials / bf16 output]
-    id<MTLComputePipelineState> embed_ps, rms_ps, add_ps, swiglu_ps, precise_swiglu_ps, split_q_gate_ps;
+    id<MTLComputePipelineState> embed_ps, rms_ps, rms_looped_ps, add_ps, swiglu_ps, precise_swiglu_ps, split_q_gate_ps;
     id<MTLComputePipelineState> rope_ps, write_kv_ps, sdpa_ps, sdpa_2pass_1[2], sdpa_2pass_2, sigmoid_gate_ps;
     id<MTLComputePipelineState> gather_kv_ps, causal_mask_ps, scale_ps, softmax_ps[2];
-    id<MTLComputePipelineState> conv1d_silu_ps, conv_norm_qk_ps, scale_qk_ps, gdn_gates_ps, gated_delta_ps, argmax_ps, feed_ps;
+    id<MTLComputePipelineState> conv1d_silu_ps, conv_norm_qk_ps, scale_qk_ps, gdn_gates_ps, gdn_gates_bf16_ps, gated_delta_ps, argmax_ps, feed_ps;
     // the fallback's matmul variants: gemv_wide [nv 4/5][k_lanes 16/32]; steel [nt/nn][align M][align N][align K]
-    id<MTLComputePipelineState> gemv_wide_ps[2][2], steel_ps[2][2][2][2];
+    id<MTLComputePipelineState> gemv_wide_ps[3][2], steel_ps[2][2][2][2];
     id<MTLComputePipelineState> pipeline(NSString* name, std::initializer_list<std::pair<int, bool>> constants);
     // MLX's bf16 matmul for the attention fallback over the 8 (kv head, repeat) batches: steel_gemm_fused
     // (transpose_b: nt) or gemv_wide (nt, M 2..15). a_bs / b_bs: batch strides over [Hkv, gqa].

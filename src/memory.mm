@@ -5,7 +5,12 @@
 
 #include <unistd.h>
 
+#include <algorithm>
+#include <nlohmann/json.hpp>
+
 #include <cassert>
+#include <cerrno>
+#include <csignal>
 #include <filesystem>
 #include <fstream>
 #include <stdexcept>
@@ -16,34 +21,78 @@ namespace fs = std::filesystem;
 
 namespace mllm {
 
-// Metal needs buffer offsets aligned, but safetensors only pads its JSON header if the writer chose to
-// (mlx-community files don't). Such a file gets a copy with the header padded by spaces so data starts at
-// 0 mod 16, kept under <cache>/weights/<model_key>/ and reused. Tensor bytes are unchanged.
+// The weights as GpuOps reads them, rewritten once into <cache>/weights/<model_key>-v3/ and reused: (a) Metal needs
+// buffer offsets aligned, but safetensors only pads its JSON header if the writer chose to (mlx-community files
+// don't), so the header is padded to put data at 0 mod 16 and every tensor at 0 mod 16; (b) each MERGED chain's
+// weight / scales / biases are written back to back, so a merged matmul is a view of the file, not a copy at load
+// (architecture.md Deferred, "before the 27B target"); (c) only language_model.* tensors (v3: the vision tower,
+// 0.9 GB at 27B, is never read). Tensor bytes and names are unchanged. A chain member in another source file moves
+// to its first member's file.
 static std::vector<std::string> aligned(const std::string& path) {
+    const std::vector<std::string> files = files_in(path);
+    const fs::path dir = fs::path(spec::cache_dir()) / "weights" / (spec::model_key(path) + "-v3");
     std::vector<std::string> out;
-    for (const auto& f : files_in(path)) {
-        std::ifstream in(f, std::ios::binary);
-        uint64_t n = 0;
-        if (!in.read((char*)&n, 8)) throw std::runtime_error(f + ": cannot read header length");
-        if ((8 + n) % 16 == 0) {
-            out.push_back(f);
-            continue;
+    for (const auto& f : files) out.push_back((dir / fs::path(f).filename()).string());
+    if (std::all_of(out.begin(), out.end(), [](const std::string& o) { return fs::exists(o); })) return out;
+
+    const Safetensors src(files);
+    // name -> its chain's names (first member) or "" (a later member: written with the first)
+    auto chain = [&](const std::string& name) -> std::vector<std::string> {
+        const size_t dot = name.rfind('.');
+        const std::string module = name.substr(0, dot), suffix = name.substr(dot);
+        for (const auto& c : MERGED)
+            for (size_t k = 0; k < c.size(); k++) {
+                if (module.size() <= c[k].size() || module.compare(module.size() - c[k].size(), c[k].size(), c[k]) ||
+                    module[module.size() - c[k].size() - 1] != '.')
+                    continue;
+                const std::string prefix = module.substr(0, module.size() - c[k].size());
+                if (k) return {};
+                std::vector<std::string> names;
+                for (const auto& m : c) src.at(prefix + m + suffix), names.push_back(prefix + m + suffix);
+                return names;
+            }
+        return {name};
+    };
+    fs::create_directories(dir);
+    for (const auto& e : fs::directory_iterator(dir)) {  // a crashed rewrite's partial copies (<file>.tmp<pid>)
+        const std::string n = e.path().filename().string();
+        const size_t at = n.rfind(".tmp");
+        if (at != std::string::npos && kill(std::atoi(n.c_str() + at + 4), 0) && errno == ESRCH) fs::remove(e.path());
+    }
+    for (size_t fi = 0; fi < files.size(); fi++) {
+        std::vector<std::pair<size_t, std::string>> by_offset;  // this file's tensors in their source order
+        for (const auto& [name, t] : src.tensors)
+            if (t.file == (int)fi && name.starts_with("language_model.")) by_offset.emplace_back(t.offset, name);
+        std::sort(by_offset.begin(), by_offset.end());
+        nlohmann::ordered_json h;
+        std::vector<const Tensor*> order;
+        size_t off = 0;
+        for (const auto& [_, first] : by_offset) {
+            const std::vector<std::string> names = chain(first);
+            off = (off + 15) / 16 * 16;
+            for (const auto& name : names) {
+                const Tensor& t = src.at(name);
+                if (off % 16) throw std::runtime_error(name + ": chain member not 16-byte sized");
+                h[name] = {{"dtype", t.dtype}, {"shape", t.shape}, {"data_offsets", {off, off + t.nbytes}}};
+                order.push_back(&t);
+                off += t.nbytes;
+            }
         }
-        fs::path dst = fs::path(spec::cache_dir()) / "weights" / spec::model_key(path) / fs::path(f).filename();
-        if (!fs::exists(dst)) {
-            uint64_t n16 = (8 + n + 15) / 16 * 16 - 8;
-            std::string h(n16, ' ');
-            if (n > n16 || !in.read(h.data(), n)) throw std::runtime_error(f + ": bad header");
-            fs::create_directories(dst.parent_path());
-            fs::path tmp = dst;
-            tmp += ".tmp" + std::to_string(getpid());
-            std::ofstream o(tmp, std::ios::binary);
-            o.write((const char*)&n16, 8).write(h.data(), n16) << in.rdbuf();
-            o.close();
-            if (!o) throw std::runtime_error(tmp.string() + ": write failed");
-            fs::rename(tmp, dst);  // atomic: a reader never sees a partial copy
+        std::string header = h.dump();
+        header.resize((8 + header.size() + 15) / 16 * 16 - 8, ' ');
+        const uint64_t n = header.size();
+        const fs::path tmp = out[fi] + ".tmp" + std::to_string(getpid());
+        std::ofstream o(tmp, std::ios::binary);
+        o.write((const char*)&n, 8).write(header.data(), n);
+        size_t pos = 0;
+        static const char zeros[16] = {};
+        for (const Tensor* t : order) {
+            o.write(zeros, (16 - pos % 16) % 16), pos = (pos + 15) / 16 * 16;
+            o.write((const char*)src.data(*t), t->nbytes), pos += t->nbytes;
         }
-        out.push_back(dst.string());
+        o.close();
+        if (!o) throw std::runtime_error(tmp.string() + ": write failed");
+        fs::rename(tmp, out[fi]);  // atomic: a reader never sees a partial copy
     }
     return out;
 }
@@ -168,9 +217,18 @@ void StepTables::write(id<MTLBuffer> table, const std::vector<Row>& rows) const 
 }
 
 // memory.py: a unit is one KV page (T tokens) of every full layer, rounded up to the OS page.
-static size_t unit_of(const ModelSpec& s, int T) {
+size_t Memory::unit_of(const ModelSpec& s, int T) {
     size_t kv = s.full_layers().size() * 2 * s.n_kv_heads * T * s.head_dim * ELEM;
     return (kv + PAGE - 1) / PAGE * PAGE;
+}
+
+static size_t state_layer_bytes(const ModelSpec& s) {  // conv then delta, per linear layer
+    return (s.conv_kernel - 1) * s.conv_dim() * ELEM + (size_t)s.lin_v_heads * s.lin_v_dim * s.lin_k_dim * 4;
+}
+
+uint32_t Memory::state_units_of(const ModelSpec& s, int T) {
+    const size_t u = unit_of(s, T);
+    return (uint32_t)((state_layer_bytes(s) * s.linear_layers().size() + u - 1) / u);
 }
 
 Memory::Memory(const ModelSpec& spec, id<MTLDevice> device, size_t arena_bytes, int page_tokens)
@@ -179,8 +237,9 @@ Memory::Memory(const ModelSpec& spec, id<MTLDevice> device, size_t arena_bytes, 
     conv_bytes = (spec.conv_kernel - 1) * spec.conv_dim() * ELEM;
     delta_bytes = (size_t)spec.lin_v_heads * spec.lin_v_dim * spec.lin_k_dim * 4;
     size_t per_layer = conv_bytes + delta_bytes;
+    assert(per_layer == state_layer_bytes(spec));
     auto lin = spec.linear_layers();
-    state_units = (uint32_t)((per_layer * lin.size() + arena.unit_bytes - 1) / arena.unit_bytes);
+    state_units = state_units_of(spec, page_tokens);
     state_off.assign(spec.n_layers(), SIZE_MAX);
     for (size_t j = 0; j < lin.size(); j++) state_off[lin[j]] = j * per_layer;
 
@@ -208,7 +267,7 @@ id<MTLBuffer> Memory::buffer(size_t bytes, MTLResourceOptions options) {
     assert(!frozen && "allocation after startup");
     id<MTLBuffer> b = [device newBufferWithLength:bytes options:options];
     if (!b) throw std::runtime_error("newBufferWithLength failed: " + std::to_string(bytes) + " bytes");
-    allocations++;
+    allocations++, allocated += b.length;
     return b;
 }
 
@@ -230,7 +289,7 @@ Memory::Surface Memory::surface(int rows, int cols) {
     id<MTLBuffer> b = [device newBufferWithBytesNoCopy:base length:len options:MTLResourceStorageModeShared
                                            deallocator:nil];
     if (!b) throw std::runtime_error("newBufferWithBytesNoCopy over an IOSurface failed");
-    allocations++;
+    allocations++, allocated += b.length;
     return {owner, b, (uint32_t)(bpr / 2)};
 }
 

@@ -44,7 +44,7 @@ int main() {
         for (size_t j = 0; j < golden_ids.back().size(); j++) golden_ids.back()[j] = golden::load<int32_t>(tk.data(t), j);
     }
 
-    mllm::Engine e(golden::MODEL, 256 << 20, CHUNK);
+    mllm::Engine e(golden::MODEL, g["layout"]["arena_bytes"].get<size_t>(), CHUNK);  // 0.8B 256 MiB, 27B 1 GiB
     // 1. one request at a time == mlx-lm greedy, token for token
     std::vector<std::vector<int>> solo;
     for (int i = 0; i < 3; i++) {

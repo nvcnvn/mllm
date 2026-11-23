@@ -15,7 +15,9 @@ int main() {
     nlohmann::json want = nlohmann::json::parse(f);
     id<MTLDevice> dev = MTLCreateSystemDefaultDevice();
     mllm::Weights w(s.path, dev);
-    assert(w.st.tensors.size() == want.size());
+    size_t n_lm = 0;  // the weights cache keeps language_model.* only (memory.mm aligned)
+    for (const auto& [name, _] : want.items()) n_lm += name.starts_with("language_model.");
+    assert(w.st.tensors.size() == n_lm);
     for (size_t i = 0; i < w.buffers.size(); i++) assert(w.buffers[i].contents == w.st.files[i].base);  // no copy
 
     NSError* err = nil;
@@ -29,6 +31,7 @@ int main() {
     id<MTLCommandQueue> q = [dev newCommandQueue];
 
     for (const auto& [name, g] : want.items()) {
+        if (!name.starts_with("language_model.")) continue;
         auto v = w[name];
         assert(v.t.dtype == g["dtype"].get<std::string>() && v.t.shape == g["shape"].get<std::vector<int64_t>>());
         assert(v.offset % 16 == 0);
@@ -51,5 +54,5 @@ int main() {
         if (want_hex != hex) fprintf(stderr, "%s: sha256 of the GPU read-back differs\n", name.c_str());
         assert(want_hex == hex);
     }
-    printf("%zu tensors in %zu files: GPU read-back hashes equal\nPASS\n", want.size(), w.buffers.size());
+    printf("%zu tensors in %zu files: GPU read-back hashes equal (%zu others skipped)\nPASS\n", n_lm, w.buffers.size(), want.size() - n_lm);
 }

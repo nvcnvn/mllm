@@ -37,7 +37,7 @@ int main() {
 
     id<MTLDevice> dev = MTLCreateSystemDefaultDevice();
     Weights w(s.path, dev);
-    Memory mem(s, dev, (size_t)1 << 30);
+    Memory mem(s, dev, std::max<size_t>((size_t)1 << 30, Memory::arena_for(s, 16, T)));  // 16 rows
     GpuOps ops(mem, w);
     Workspace ws = ops.workspace(1, 16, T);
     id<MTLCommandQueue> q = [dev newCommandQueue];
