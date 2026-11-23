@@ -203,7 +203,16 @@ static void stress(int chunk, int seed) {
     assert(!hit.empty());
 }
 
-int main() {
+int main(int argc, char** argv) {
+    // At 27B the whole test takes ~28 min (g15 logs: `cache` 652 s, stress 508 + 494 s), too close to a 30-min hold:
+    // `cache` runs all but the stress runs, `stress512` / `stress32` one stress run each. No argument: everything.
+    const std::string part = argc > 1 ? argv[1] : "";
+    if (part == "stress512" || part == "stress32") {
+        part == "stress512" ? stress(512, 3) : stress(32, 1);
+        printf("PASS\n");
+        return 0;
+    }
+    assert(part.empty() || part == "cache");
     mllm::ModelSpec s = mllm::spec::load(golden::MODEL);
     std::string d = golden::dir(s);
     nlohmann::json g = nlohmann::json::parse(std::ifstream(d + "/spec.json"));
@@ -380,7 +389,6 @@ int main() {
         while (!on.reqs.empty()) on.step();
         check_idle(on);
     }
-    stress(512, 3);
-    stress(32, 1);
+    if (part.empty()) stress(512, 3), stress(32, 1);
     printf("PASS\n");
 }

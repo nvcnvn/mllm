@@ -428,6 +428,109 @@ cost (1.42x the B = 1 step; matmuls at 164-177 GB/s vs 248-255 at B = 1; qmm_t_d
 flight: split-k > 1 for large N, or register double-buffering of W); chunk 1024 vs 512 (not measured; 1024 doubles prefill's `scores` scratch to 1.5 GiB at
 max_ctx 32k, and the matmuls are already at full occupancy at M = 512, so *estimate* < 3%).
 
+## 27B: long context, memory budget, prefix cache (g15)
+
+Measured 2026-11-24 on the g15 branch, each run alone under the shared heavy lock. Long context, snapshot copy,
+multi-turn and test_engine_cache's `cache` part ran before the rebase onto g14 (main 2be5a93: prefill ~8% slower than
+now); the stress runs, the mixed session and the overlap runs on g14 (a0479ef). The machine was not idle: a VM at 55-75% CPU (16 GB) throughout, docker idle, at times a qemu
+VM (46%) and Spotlight; logs in `/Volumes/T5/cache/mllm/g15/`. GPU prefill, chunk 512, 12 GiB arena.
+
+**Long context** (`tools/long_ctx.mm`: one request of P random tokens, then 128 greedy tokens, EOS ignored, cache off):
+```
+build/long_ctx mlx-community/Qwen3.6-27B-4bit 32768 512 32640       # max_ctx 32768: workspace 1156.1 MiB
+build/long_ctx mlx-community/Qwen3.6-27B-4bit 131072 130944         # max_ctx 131072: workspace 4182.7 MiB
+```
+| prompt | cold prefill + first token | prefill tok/s, last 4k | decode tok/s (127 steps) | ms / step | longest step | footprint |
+|---:|---:|---:|---:|---:|---:|---:|
+| 512 | 4.0 s (130 tok/s) | | 15.54 | 64.4 | 66 ms | 14.14 GB |
+| 32,640 | 307 s (106 tok/s) | 101 | 12.95 | 77.2 | 81 ms | 14.24 GB |
+| 130,944 | 1689 s (77.5 tok/s) | 56.5 | 8.49 | 117.8 | 124 ms | 17.37 GB |
+
+- **Both admit and decode.** 128k: 4096 pages + 74 state units of the arena's 6144; the cold prefill took 28 min,
+  inside one 30-min hold with ~50 s to spare (it won't fit in a hold on a busier machine). Swap unchanged (1583 MB used
+  before and after).
+- **Decode time per step grows linearly with the K/V read**: K/V is 64 KiB per token, so 2.15 GB at 32k and 8.59 GB at
+  128k. Over the 512 step that adds 12.8 ms (168 GB/s) and 53.4 ms (161 GB/s); the weights stream at 235 GB/s
+  (15.13 GB / 64.4 ms). Nothing else grows: it is the full layers' K/V reads, by sdpa_vector_2pass (MLX's kernel, ported
+  bit-exact) at ~70% of the weights' rate. Against a bound with K/V at the weights' rate (101 ms at 128k, 9.9 tok/s),
+  decode is at 86%. Not compared with mlx-lm at these lengths.
+- **Prefill slows with position**, 8.2 ms per token at the start to 17.7 ms at 127k: MLX's unfused fallback attention
+  (prefix chunks) runs q kᵀ and p v over every key and writes [512, 24, keys] bf16 scores (3 GiB per layer at 128k) that
+  the mask and softmax read and write again. At max_ctx 131072 that buffer makes the workspace 4.2 GiB (1.2 at 32k).
+  A blocked (flash-style) attention removes both, but MLX v0.32.4 runs this fallback for prefix chunks, so it would cost
+  bit-exactness with mlx-lm.
+
+**Memory budget, mixed session** (`tools/serve_session.py mixed`: 4 clients, each sending a request then pausing
+0-20 s, prompts 64-8192 tokens (a third start with one shared 2048-token prefix), 16-256 tokens out; 24 min, 85
+requests; `mllm serve` defaults: 12 GiB arena, max_ctx 32768, max batch 32, prefix cache on). Open meanwhile: a
+Virtualization VM (16 GB, 43-75% CPU), docker, iTerm2, Finder, several Claude Code sessions; no browser.
+- Server footprint 12-13 GB through the session (`footprint`: 13 GB IOAccelerator = arena + workspace 1276 MiB +
+  Metal; peak 13 GB); weights 15.13 GB file-backed on top, in the residency set. Wired: 3.4-3.6 GB with the server
+  down, 29.5-31.6 GiB (1.93-2.07 M pages of 16 KiB) while it ran: arena, workspace and the weights are wired.
+- **Swap: no growth** (1582.9 MB used before, 1574.9 MB after; swapouts unchanged at 908016, swapins +171, pageouts
+  +151). Memory free 84% before (the VM's 16 GB included).
+- **Decode steps > 1 s: yes, broken.** The longest gap between two streamed tokens was 4979 ms; 44 of 85 requests had
+  one over 1 s (median of per-request longest 1068 ms). Cause (`overlap.mm`, A decodes alone at 64 ms per token while B
+  prefills 2048 tokens): the GPU runs the two lanes' command buffers in commit order, so a decode step committed after
+  a 512-token chunk (one command buffer, ~3.9 s at 27B) waits out the whole chunk: 11 tokens in B's 15.2-15.9 s, gaps
+  up to 3.75-3.92 s. Splitting the chunk into command buffers of K layers but committing them together did not help
+  (K = 16 / 8 / 4: max 3.66-3.94 s; K = 1: 2.16-2.19 s, and prefill 3% slower). Fix (g15, `PrefillLane::submit`): the
+  chunk is encoded as command buffers of K layers, each committed from the completion handler of the one before, so a
+  decode step waits for one K-layer buffer at most. Bit-exact (same dispatches in the same order).
+  `tools/overlap.mm`, `build/overlap mlx-community/Qwen3.6-27B-4bit 2048`, interleaved in one hold, two reps per run
+  (K = 4, 2 and 64 run twice, K = 8 once). Every row, the K = 8 one included, is from an experimental build with an env
+  knob for K, not the committed code (K fixed at 8, knob removed); the mixed rerun below is on the committed build:
+
+  | K layers per buffer | B's prefill, tok/s | A's tokens during it | A's gap mean / max, ms |
+  |---|---:|---:|---:|
+  | 64, committed whole (before) | 128.9-133.6 | 11 | 1393-1444 / 3791-3889 |
+  | 8 (**now**) | 106.2-108.3 | 67 | 282-288 / 539-545 |
+  | 4 | 82.9-89.4 | 131 | 175-189 / 300-332 |
+  | 2 | 62.7-65.3 | 259 | 121-126 / 188-195 |
+
+  The GPU is time-shared, not overlapped: B's extra time equals A's extra steps x 64 ms. K = 8 keeps every decode step
+  under ~0.55 s while giving up the least prefill.
+- **Rerun with the fix** (QA, committed build 3355c08, same session for 23 min, not 30; logs
+  `/Volumes/T5/cache/mllm/g15/qa/h2*`, `mixed*.log`): 82 requests; **longest gap 814 ms, 0 requests over 1 s** (47
+  over 500 ms; median of per-request longest 553 ms). Footprint 12-13 GB; wired 29.2-31.5 GiB while serving, 3.4 GB
+  idle; swap 1526.9 → 1350.9 MB used, no growth. The cost: TTFT mean 35.8 → 49.8 s and max 100.5 → 146.0 s against
+  the first session, prefill now sharing the GPU with decode (and partly a busier machine).
+
+**Prefix cache: snapshot copy** (`long_ctx`'s first lines: `Engine::copy_units`' memcpy of one state, 74 units of
+2 MiB, on idle arena units): 148 MiB in 2.4-2.8 ms (56-66 GB/s, 6 samples in two runs); the memset that zeroes a cold
+request's state 0.6 ms. A request makes at most two copies (~5 ms) and one at admit on a hit; one 512-token prefill
+chunk takes ~4 s at 27B, so a copy costs ~0.1% of the chunk it saves, and the multi-turn hits below each saved ~4.2k
+tokens (34 s).
+
+**test_engine_cache at 27B** (`MLLM_MODEL=mlx-community/Qwen3.6-27B-4bit build/tests/test_engine_cache [part]`): passes.
+The whole test is ~28 min of GPU here, too close to a 30-min hold, so it takes a part argument (`cache`, `stress512`,
+`stress32`; none = all, as the gate runs it). `cache`: 652 s pre-g14, passed again on the final build (00a1a77, 662 s; hits, bit-exact chunk-32 hits, moved
+boundaries K/V cos 0.99339 / state 0.96650 as g13, small arena 20 / 20 equal cache off; ANE part skips, no 27B blocks).
+`stress512`: 508 s, 80 requests, 9 hits; `stress32`: 494 s, 4 hits (rebased on g14, but before the prefill
+command-buffer chain); invariants held every step, no stall past 120 s, every unit free or cache-held at the end. QA
+reran `stress512` on the final build (3355c08, with the chain): PASS, 80 requests, 9 hits, 559 s on a busy machine
+(`qa/h4*`). `stress32` was not rerun on the final build.
+
+**Multi-turn** (`tools/serve_session.py turns`: a ~4.2k-token system prompt, then 10 user turns; each prompt is the
+previous prompt + its reply (up to 64 tokens) + the next question):
+```
+build/mllm serve mlx-community/Qwen3.6-27B-4bit --port 18015 [--prefix-cache off]
+.venv/bin/python tools/serve_session.py turns --system 4000 --turns 10 -g 64 --save turn10.txt
+.venv/bin/python tools/serve_session.py turns --replay turn10.txt          # on the --prefix-cache off server
+```
+| turn | 1 | 2 | 3 | 4 | 5 | 6 | 7 | 8 | 9 | 10 | turn 10, cache off |
+|---|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|
+| prompt tokens | 4249 | 4339 | 4396 | 4453 | 4510 | 4566 | 4622 | 4679 | 4736 | 4794 | 4794 |
+| cached | 0 | 4224 | 4320 | 4384 | 4448 | 4480 | 4544 | 4608 | 4672 | 4704 | 0 |
+| TTFT s | 33.86 | 1.18 | 0.94 | 0.78 | 0.74 | 0.97 | 0.97 | 0.84 | 0.73 | 0.99 | 38.70 |
+
+- Every turn after the first resumes at the previous prompt's last full page (the snapshot taken there) and prefills
+  only the reply, the new question and the < 32-token page tail: 62-115 tokens, 0.7-1.2 s. **Turn 10 is 0.99 s against
+  38.7 s for a cold re-prefill of the same 4794 tokens (39x), and within 2x of every hit turn.** Turn 1 is the cold
+  system prompt (33.9 s).
+- A new conversation on the same system prompt hit 4224 tokens (turn 1's last full page lay inside the shared part):
+  TTFT 0.42 and 0.38 s.
+
 ## Raw output (final run)
 ```
 p=512 g=256

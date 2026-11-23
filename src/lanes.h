@@ -1,7 +1,7 @@
-// PrefillLane and DecodeLane: submit() / poll() (py/mllm/lanes.py). submit encodes the work into a command buffer on
-// the lane's own MTLCommandQueue, commits it and returns; poll checks the lane's MTLSharedEvent (never blocks) and
-// returns finished work. Both lanes live on the engine thread; prefill and decode overlap on the GPU through the two
-// queues. Lanes never touch the allocator: every unit a work item needs is allocated before submit.
+// PrefillLane and DecodeLane: submit() / poll() (py/mllm/lanes.py). submit encodes the work into command buffers on
+// the lane's own MTLCommandQueue (prefill: a chain of 8-layer buffers per chunk), commits and returns; poll checks the
+// lane's MTLSharedEvent (never blocks) and returns finished work. Both lanes live on the engine thread; the GPU
+// time-shares the two queues' command buffers in commit order (g15), it doesn't run them side by side. Lanes never touch the allocator: every unit a work item needs is allocated before submit.
 // With AneOps, PrefillLane runs chunks on a thread of its own (Core ML's predict blocks): per layer, ANE dense(i)
 // then GPU attn(i) on the lane's queue, two chunks in flight so the ANE runs one's dense while the GPU runs the
 // other's attn; the engine sees the same submit / poll / event as on the GPU.
@@ -80,7 +80,7 @@ private:
     Workspace ws[2];
     StepTables tables;
     uint64_t n = 0;  // chunks committed
-    id<MTLCommandBuffer> cb;
+    std::vector<id<MTLCommandBuffer>> cbs;  // GPU: the chunk in flight's
     std::deque<PrefillWork> q;  // in flight, oldest first: chunks n - q.size() + 1 .. n
 
     // ANE: the engine queues chunk k in `todo` (its workspace and surface set: k % 2); the thread signals `event`
@@ -94,7 +94,7 @@ private:
         id<MTLCommandBuffer> cb;  // the last one committed
     };
     AneOps* ane;
-    id<MTLFence> fence;  // the untracked arena's K/V and state: each command buffer after the one before
+    id<MTLFence> fence;  // the untracked arena's K/V and state: each command buffer after the one before (both paths)
     std::mutex m;
     std::condition_variable cv;
     std::deque<Chunk> todo;

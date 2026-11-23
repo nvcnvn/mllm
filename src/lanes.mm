@@ -11,10 +11,10 @@ static std::runtime_error failed(const char* lane, id<MTLCommandBuffer> cb) {
                               (cb.error ? std::string(": ") + cb.error.localizedDescription.UTF8String : ""));
 }
 
-// One command buffer on q: f encodes into ws.enc (after fence's last update, then updating it, if a fence is given).
-// Commits it.
-static id<MTLCommandBuffer> commit(id<MTLCommandQueue> q, Workspace& ws, const std::function<void()>& f, bool concurrent,
-                                   id<MTLFence> fence = nil) {
+// One command buffer on q: f encodes into ws.enc (after fence's last update, then updating it, if a fence is given),
+// signaling `signal` with `value` at its end if given. Not committed.
+static id<MTLCommandBuffer> encode(id<MTLCommandQueue> q, Workspace& ws, const std::function<void()>& f, bool concurrent,
+                                   id<MTLFence> fence = nil, id<MTLSharedEvent> signal = nil, uint64_t value = 0) {
     id<MTLCommandBuffer> cb = [q commandBuffer];
     ws.enc = [cb computeCommandEncoderWithDispatchType:concurrent ? MTLDispatchTypeConcurrent : MTLDispatchTypeSerial];
     if (fence) [ws.enc waitForFence:fence];
@@ -28,6 +28,13 @@ static id<MTLCommandBuffer> commit(id<MTLCommandQueue> q, Workspace& ws, const s
     if (fence) [ws.enc updateFence:fence];
     [ws.enc endEncoding];
     ws.enc = nil;
+    if (signal) [cb encodeSignalEvent:signal value:value];
+    return cb;
+}
+
+static id<MTLCommandBuffer> commit(id<MTLCommandQueue> q, Workspace& ws, const std::function<void()>& f, bool concurrent,
+                                   id<MTLFence> fence = nil) {
+    id<MTLCommandBuffer> cb = encode(q, ws, f, concurrent, fence);
     [cb commit];
     return cb;
 }
@@ -58,7 +65,7 @@ static void layers(GpuOps& ops, Workspace& ws, int L) {
 PrefillLane::PrefillLane(GpuOps& ops, Memory& mem, int chunk, int max_ctx, AneOps* ane)
     : queue(lane_queue(mem)), event([mem.device newSharedEvent]), ops(ane ? ane->gpu : ops), mem(mem),
       ws{ops.workspace(chunk, 1, max_ctx), {}}, tables(mem.step_tables(1, max_ctx)), ane(ane),
-      fence(ane ? [mem.device newFence] : nil) {
+      fence([mem.device newFence]) {
     if (ane && ane->S != chunk) throw std::invalid_argument("ANE prefill: chunk must equal the blocks' compiled S");
     if (ane) {
         const Workspace own = mem.workspace(chunk, 1);
@@ -184,14 +191,23 @@ void PrefillLane::submit(PrefillWork work) {
             }
             cv.notify_one();
         } else {
-            cb = [queue commandBuffer];
-            ws.enc = [cb computeCommandEncoder];
-            // K/V and state only: the last layer's o_proj + FFN and lm_head never run
-            layers(ops, ws, mem.spec.n_layers());
-            [ws.enc endEncoding];
-            ws.enc = nil;
-            [cb encodeSignalEvent:event value:n];
-            [cb commit];
+            // The GPU runs both lanes' command buffers in commit order: a decode step committed after a whole chunk
+            // waited for all of it (27B: ~4 s for 512 tokens). So the chunk is encoded now as command buffers of K
+            // layers, and each is committed when the one before completes: a decode step waits for one at most.
+            // K/V and state only: the last layer's o_proj + FFN and lm_head never run.
+            const int L = mem.spec.n_layers();
+            // K 8 at 27B (~0.5 s each): a 2048-token prefill next to a B = 1 decode keeps 107 tok/s (131 alone)
+            // and the decode's longest step is 0.54 s (3.9 s committed whole); K 4: 85 tok/s, 0.31 s (report, g15)
+            constexpr int K = 8;
+            for (int a = 0; a < L; a += K)
+                cbs.push_back(encode(queue, ws, [&] {
+                    for (int i = a; i < std::min(a + K, L); i++) ops.dense(i, ws), ops.attn(i, ws);
+                }, false, fence, a + K >= L ? event : nil, n));
+            for (size_t j = 0; j + 1 < cbs.size(); j++) {
+                id<MTLCommandBuffer> next = cbs[j + 1];
+                [cbs[j] addCompletedHandler:^(id<MTLCommandBuffer>) { [next commit]; }];  // also after an error
+            }
+            [cbs[0] commit];
         }
         q.push_back(std::move(work));
     }
@@ -214,16 +230,25 @@ std::vector<PrefillWork> PrefillLane::poll() {
                 std::rethrow_exception(e);
             }
         } else {
-            if (cb.status == MTLCommandBufferStatusError) {
-                auto e = failed("PrefillLane", cb);
-                cb = nil, q.clear();
-                throw e;
-            }
-            d = event.signaledValue;
+            d = event.signaledValue;  // before the scan: once the last buffer signals, every status is final
+            for (id<MTLCommandBuffer> cb : cbs)
+                if (cb.status == MTLCommandBufferStatusError) {
+                    auto e = failed("PrefillLane", cb);
+                    // The chain commits them all, also after an error: let it end before the next chunk. Not
+                    // waitUntilCompleted alone: on a buffer not committed yet it asserts under API validation
+                    // (without validation it waits for the commit; g15 checked both).
+                    id<MTLCommandBuffer> last = cbs.back();
+                    while (last.status < MTLCommandBufferStatusCommitted) std::this_thread::yield();
+                    [last waitUntilCompleted];
+                    // a failed last buffer may skip its signal: mark the chunk done, as DecodeLane::poll does
+                    event.signaledValue = std::max(event.signaledValue, n);
+                    cbs.clear(), q.clear();
+                    throw e;
+                }
         }
         std::vector<PrefillWork> out;
         while (!q.empty() && n - q.size() + 1 <= d) out.push_back(std::move(q.front())), q.pop_front();
-        if (q.empty()) cb = nil;
+        if (q.empty()) cbs.clear();
         return out;
     }
 }
