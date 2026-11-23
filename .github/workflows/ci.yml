@@ -1,0 +1,28 @@
+# Build + quick checks on a GitHub-hosted Apple-silicon VM. The real gate (golden bit-exactness, GPU, ANE)
+# needs real hardware and the model: run `make test` locally (README).
+name: ci
+on:
+  push:
+  pull_request:
+permissions:
+  contents: read
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+jobs:
+  build:
+    runs-on: macos-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v4
+      - name: Versions
+        run: sw_vers; xcodebuild -version; clang++ --version | head -1
+      - name: Metal Toolchain
+        run: xcrun -sdk macosx metal --version || xcodebuild -downloadComponent MetalToolchain
+      - name: Build (warnings are errors)
+        run: make -j"$(sysctl -n hw.ncpu)" WERROR=-Werror
+      - name: CPU tests
+        run: make test-ci
+      - name: GPU probe (informational; VM GPU may not run our kernels)
+        continue-on-error: true
+        run: build/tests/test_metal

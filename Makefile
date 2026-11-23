@@ -1,11 +1,12 @@
 # make: build/libmllm.a, build/mllm (CLI), build/tests/*, build/mllm.metallib.  make test: run every test.
 CXX := clang++
 B := build
-CXXFLAGS := -std=c++20 -O2 -Wall -Wextra -MMD -MP -Isrc -isystem src/vendor
+WERROR ?=  # CI: make WERROR=-Werror
+CXXFLAGS := -std=c++20 -O2 -Wall -Wextra $(WERROR) -MMD -MP -Isrc -isystem src/vendor
 METALLIB := $(abspath $(B)/mllm.metallib)
 OBJCFLAGS := -fobjc-arc -DMETALLIB='"$(METALLIB)"'
 # MLX's own kernel flags (mlx/backend/metal/kernels/CMakeLists.txt): no fast math, or results drift from MLX's
-METALFLAGS := -Wall -Wextra -fno-fast-math -Wno-c++17-extensions -Wno-c++20-extensions -Isrc/vendor/mlx
+METALFLAGS := -Wall -Wextra $(WERROR) -fno-fast-math -Wno-c++17-extensions -Wno-c++20-extensions -Isrc/vendor/mlx
 LDLIBS := -framework Metal -framework Foundation -framework CoreML -framework CoreVideo -framework IOSurface
 export HF_HOME ?= /Volumes/T5/huggingface
 
@@ -50,8 +51,13 @@ $(B)/mllm.metallib: $(AIR)
 test: all
 	@for t in $(TESTS); do echo "== $$t"; $$t || exit 1; done
 
+# CI (GitHub-hosted macOS VMs): only tests that need no model, golden data, GPU or ANE
+CI_TESTS := $(B)/tests/test_arena $(B)/tests/test_prefix_cache
+test-ci: all
+	@for t in $(CI_TESTS); do echo "== $$t"; $$t || exit 1; done
+
 clean:
 	rm -rf $(B)
 
-.PHONY: all test clean
+.PHONY: all test test-ci clean
 -include $(wildcard $(B)/obj/*.d $(B)/obj/*/*/*.d $(B)/tests/*.d $(B)/air/*.d)
