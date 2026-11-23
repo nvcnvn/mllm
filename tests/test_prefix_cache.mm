@@ -81,6 +81,12 @@ int main() {
     a.release(B.pages);
     check(a);
     assert(a.cache_only_units == 5 + 2 * STATE);
+    // differs from A only in page 1's last token: matches page 0 alone, never a deeper page or snapshot of A's
+    // (llama.cpp f174553e1: a checkpoint reused for a prompt that diverged before it)
+    std::vector<int> id = ia;
+    id[2 * T - 1] = 77;
+    m = c.match(id);
+    assert(m.L == 1 && m.S == 0 && m.pages.empty() && m.snapshot.empty());
     // C: same three pages, then its own: hits B's snapshot, reuses A's pages
     const std::vector<int> ic = prompt({1, 2, 3, 9}, 3);
     m = c.match(ic);

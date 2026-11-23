@@ -288,6 +288,9 @@ std::vector<std::pair<int, int>> DecodeLane::poll() {
             if (f.cb.status == MTLCommandBufferStatusError) {
                 auto e = failed("DecodeLane", f.cb);
                 wait();
+                // a failed command buffer may skip its signal: units released at its step would stay pending for
+                // good. Everything committed has completed now, so mark it done (one queue, in order).
+                event.signaledValue = std::max(event.signaledValue, q.back().w.step + 1);
                 q.clear();
                 throw e;
             }

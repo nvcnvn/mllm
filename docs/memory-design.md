@@ -148,6 +148,20 @@ A step is one command buffer: one decode token for every active request, plus an
 - Load = `admit`, `alloc`, then `pread` straight into the units (shared memory, no GPU upload), finished before the step that reads them is committed.
 - Spilling stops when free space on the spill volume would fall below a floor (config, default 16 GiB, leaving room for swap if it is the internal SSD). Past that, eviction drops pages instead.
 
+Rules from other engines' SSD-tier bugs (oMLX, vllm-mlx, vllm-metal; [reports/prior art.md](../reports/prior%20art.md)):
+- **Key files on everything that changes the bytes**, not only the tokens. The header holds:
+  - a format version;
+  - the model path and a hash of its weights;
+  - `T`, `unit_bytes`, `state_units`, conv bytes and delta bytes;
+  - the prefill path (`gpu`, or `ane` + its weight format). LUT weights give other K/V.
+
+  Plus the parent hash and the node's T token ids, verified on load. A file that exists is not proof of a spill: compare headers. Leave other models' files alone.
+- **The checksum covers the whole payload**, not the size. `F_PREALLOCATE` gives a full-length file even when the `pwrite` never finished. Write under a per-writer tmp name, then rename.
+- **The spill unit is a node with its snapshot.** Pages without the snapshot below them are useless to a hybrid model: S drops to 0. A load brings pages [0, S) plus one snapshot (the deepest), never every snapshot on the chain.
+- **CPU I/O is not covered by the GPU event.** `pending` is gated on decode steps, so a `pread` into a unit needs its own ref until it returns. A cancel mid-load must not let the unit go free under it. Loads go through `admit`, not `fits`.
+- **Every load failure is a miss.** That covers a missing file, a bad checksum, a short read and an unmounted volume. Drop the node and its subtree, and keep the refcounts balanced.
+- **Drop the cache's refs only after `pwrite` succeeded.** On `ENOSPC` or `EIO` the node stays in memory, not spilled. The space budget counts every file in the directory, tmp files included, and re-reads free space.
+
 ### Budget example (64 GB, a ~27B mixed-attention model)
 | Item | GB |
 |---|---|
@@ -176,6 +190,10 @@ The arena size is the one memory setting. It is rounded down to a whole number o
 | 8-bit KV layout | Kernel benchmark shows the decode win |
 | Draft model state in the same arena | Speculative decoding proves worth it |
 | More than one step encoded ahead (K+1 step-table copies) | GPU-side sampling removes the per-token CPU round trip |
+| Eviction skips leaves a live request holds. Today the oldest leaf goes even when that frees only its snapshot, which destroys a hot entry (SGLang `lock_ref`, mistral.rs b95c8ecb). Fall back to any leaf so `admit` still terminates | Hit rate under load falls below what the arena could hold |
+| Admitting the queue head doesn't evict prefixes the next waiters will match (touch their matches first: SGLang 20d1f3f56a) | Same |
+| Random hash root per process, and cache salt per user (offline collisions block a prefix from caching; TTFT shows hits: vLLM 73b35cca7, 77073c77b) | Serving more than one user |
+| Top-up with fed steps: step N+1 needs its page before N's top-up runs (SGLang 01e3b3f3a3); preemption keeps the linear state, not only K/V (SGLang 54ec2c4699) | Generation top-up or preemption gets built |
 
 ## Build order
 1. Throwaway attention benchmark: a hand-filled step table over shuffled units, 16/32/64/128 tokens per page against contiguous, fp16 against 8-bit. Fixes tokens per page and KV precision. *Read side done (`tools/kv_gather_bench.swift`); 8-bit dequant cost still to measure in the real kernel (step 4).*

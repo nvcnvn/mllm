@@ -52,7 +52,14 @@ int main() {
         assert(solo.back() == golden_ids[i]);
     }
     printf("solo: 3 x %d greedy tokens equal golden\n", N);
-    // 2. all at once (batched decode) == each alone
+    // 2. all at once (batched decode) == each alone; every unit nothing holds is NaN first (bf16 0xFFFF): a kernel that
+    // reads a reused unit past what this request wrote (masked K/V, a cold state) would show it (llama.cpp 0a7675746)
+    {
+        const mllm::Arena& a = e.mem.arena;
+        for (uint32_t u = 0; u < a.n_units; u++)
+            if (!a.req_refs[u] && !a.cache_refs[u])
+                memset((uint8_t*)e.mem.arena_buffer.contents + (size_t)u * a.unit_bytes, 0xFF, a.unit_bytes);
+    }
     assert(run(e, prompts) == solo);
     printf("batched: equal solo\n");
 

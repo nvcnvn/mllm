@@ -248,6 +248,8 @@ uint32_t Engine::alloc(Request& r) {
         decode.wait();  // admit counted units still pending on the step in flight
         a.retire(decode.signaled());
     }
+    // demand() must cover every alloc, or this request quietly takes another's reservation (vLLM 0ff1bf9bb)
+    assert(r.reserved > 0 && "request allocates past its reservation");
     r.reserved--;
     return a.alloc();
 }
@@ -335,6 +337,9 @@ void Engine::abort(const std::vector<Request*>& rows) {
 }
 
 void Engine::finish(Request& r) {
+    // pending reclaim follows decode steps only: a unit a prefill chunk still reads must not be released (cancel waits
+    // for the chunk; abort zeroes in_flight once the lane let go of it)
+    assert((r.in_flight == 0 || r.state == State::DECODE) && "released while a prefill chunk reads its units");
     Arena& a = mem.arena;
     a.unreserve(r.reserved);
     std::vector<uint32_t> all = r.pages;
