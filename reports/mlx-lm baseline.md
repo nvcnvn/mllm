@@ -109,9 +109,8 @@ Same day and load (java ~400% CPU), interleaved GPU/ANE runs, 2 rounds. `--strea
   stream's own rate (1,136–1,204 tok/s) is limited by the per-layer GPU round trips; pipelining two chunks (ANE dense
   of one while the GPU runs attn of the other) is the next step.
 
-**Since then (g11): two chunks in flight, tails on the GPU.** The table above is from before; its rows and §2's ANE
-column wait for a rerun on an idle machine (`g11-bench.sh`: the rows above and serve_bench with `--prefill ane`,
-interleaved with a `poc` build).
+**Since then (g11): two chunks in flight, tails on the GPU.** The table above is from before g11; the measured
+comparison is under "g11 measured" below and §2's "ANE prefill after g11".
 - The ANE lane's thread keeps two chunks in flight (any requests, a request's next chunk too): while the GPU runs
   `attn(i)` of one, the ANE runs `dense` of the other. It waits only for the command buffer its next `predict` needs,
   not after every layer. K/V and state are bit-exact with one chunk at a time.
@@ -121,6 +120,29 @@ interleaved with a `poc` build).
   - crossover: GPU prefill 47.5 ms at n = 256, 58.5 at 320, 83.8 at 448, 95.6 at 512, against one ANE chunk at
     85.9 ms alone or 56.8 ms per chunk with two in flight. So the GPU wins below ~310–460 tokens. The threshold
     stays at 256: below both, and it leaves more of the GPU to decode.
+
+**g11 measured** (2026-11-23, `g11-bench.sh`: g11 468f1bb against poc 5839ac4, interleaved, 3 rounds with the
+order alternating; java ~70% CPU and a VM ~50% throughout, nothing else on the GPU). Per round, `mllm bench` averages
+(3 trials each), shown as round 1 / 2 / 3:
+
+| run, `--prefill ane` unless noted | prefill tok/s g11 | prefill tok/s poc | decode tok/s g11 | decode tok/s poc | stream g11 | stream poc |
+|---|---|---|---|---|---|---|
+| P=512 G=128 B=1 | 5666 / 4739 / 5304 | 5678 / 4761 / 5491 | 335 / 298 / 315 | 336 / 285 / 311 | | |
+| P=2048 G=128 B=1 | **9002 / 8036 / 8524** | 5555 / 5053 / 5526 | 323 / 307 / 304 | 325 / 302 / 315 | | |
+| P=600 G=128 B=1 (512 + an 87-token tail) | **5475 / 5153 / 5353** | 3686 / 3471 / 3597 | 333 / 316 / 324 | 333 / 317 / 318 | | |
+| P=512 G=512 B=8 | **4426 / 3986 / 4086** | 2505 / 2355 / 2408 | 959 / 881 / 831 | 873 / 816 / 829 | | |
+| P=512 G=512 B=8, ANE stream | **4357 / 3887 / 4082** | 2506 / 2406 / 2405 | 847 / 830 / 826 | 785 / 783 / 784 | 1207 / 1175 / 1175 | 1128 / 1122 / 1118 |
+| P=512 G=512 B=8, GPU prefill + GPU stream | 3607 / 3347 / 3734 | 3663 / 3474 / 3525 | 254 / 262 / 262 | 272 / 261 / 267 | 3076 / 3146 / 3170 | 3281 / 3146 / 3207 |
+| P=512 G=2048 B=8, GPU prefill (pure decode) | 4330 / 4265 / 4200 | 4225 / 4101 / 4246 | 906 / 903 / 888 | 927 / 905 / 917 | | |
+| P=512 G=2048 B=8, ANE stream | **3180 / 3549 / 3508** | 2219 / 2266 / 2219 | 852 / 848 / 857 | 835 / 850 / 844 | 1084 / 1206 / 1218 | 1245 / 1260 / 1216 |
+
+- Two chunks in flight lift ANE prefill from ~5,500 to ~8,000–9,000 tok/s when there are 2+ chunks (P=2048),
+  and from ~2,400 to ~4,000–4,400 tok/s under B=8 decode. The 87-token tail no longer costs a full ANE chunk
+  (P=600: 3,600 → 5,300).
+- Decode next to an ANE prefill stream stays where it was (−5…−8% against pure decode); `--prefill gpu` rows are
+  unchanged within noise. The ANE stream's own rate is flat (1,080–1,210 vs 1,120–1,260): with one stream request
+  of 512 tokens (511 prefilled: one ANE chunk, no tail), there is never a second chunk to overlap.
+- Cost: peak memory +35–41 MB (the second chunk's own buffers; GPU scratch is shared).
 
 ## 2. Serving: `mlx_lm.server` under concurrent clients
 
@@ -191,10 +213,31 @@ Why:
   So 8 × 512 is ~16 slow ANE chunks in series, about 2.5 s for the last client. The payoff is decode: the ANE leaves
   the GPU to decode, so each client gets 204–250 tok/s at every load (GPU prefill: 42–110), but total tok/s is lower
   because new clients wait longer to join the batch.
-- **Ways to close it** (not done): tail chunks below about half a chunk on the GPU, not padded on the ANE; pipeline the ANE
-  lane (ANE `dense(i + 1)` of one chunk while the GPU runs `attn(i)` of another) so it stops waiting for the GPU each
-  layer; and for p90, prefill several waiting prompts per GPU submission as mlx-lm does, or give the first chunk of
-  each waiting prompt priority over later chunks (shortest-first scheduling instead of FIFO).
+- **Ways to close it:** tails on the GPU and a pipelined ANE lane are **done in g11** (below). Still open, for p90:
+  prefill several waiting prompts per GPU submission as mlx-lm does, or give the first chunk of each waiting prompt
+  priority over later chunks (shortest-first scheduling instead of FIFO).
+
+**ANE prefill after g11** (2026-11-23, `--prefill ane`, g11 468f1bb against poc 5839ac4 interleaved, 3 rounds of
+serve_bench per build, alternating order; median of the 9 trials per row; java ~70% CPU and a VM ~50% throughout).
+mlx-lm and GPU-prefill columns are from the table above (earlier session):
+
+| prompt | clients | ttft s (median / p90), ANE g11 | ANE poc | GPU prefill | mlx-lm | tok/s per client, g11 / poc | total tok/s, g11 / poc |
+|---:|---:|---:|---:|---:|---:|---:|---:|
+| 512 | 1 | 0.10 / 0.10 | 0.17 / 0.17 | 0.11 / 0.11 | 0.13 / 0.13 | 326 / 318 | 289 / 264 |
+| 512 | 4 | 0.27 / 0.39 | 0.63 / 0.79 | 0.37 / 0.43 | 0.48 / 0.48 | 222 / 254 | 628 / 480 |
+| 512 | 8 | **0.56 / 1.05** | 1.38 / 2.33 | 0.62 / 0.94 | 1.00 / 1.00 | 141 / 227 | 728 / 560 |
+| 512 | 16 | 1.45 / 2.74 | 2.89 / 4.90 | 1.21 / 2.03 | 2.02 / 2.05 | 102 / 231 | 737 / 549 |
+| 2048 | 1 | 0.27 / 0.27 | 0.53 / 0.53 | 0.45 / 0.45 | 0.50 / 0.50 | 316 / 308 | 188 / 137 |
+| 2048 | 8 | **1.82 / 2.84** | 2.70 / 4.32 | 2.31 / 3.60 | 4.45 / 4.45 | 218 / 263 | 288 / 173 |
+
+- TTFT halves at 512 and drops ~35% at 2048 (the 8-client medians: 1.38 → 0.56 s, 2.70 → 1.82 s). The targets are
+  now **met at the median** for ANE prefill too (0.56 < 0.99 at 8 × 512; 1.82 < 4.0 at 8 × 2048), with the 8 × 2048 p90
+  (2.84 s) below mlx-lm's 4.45 as well. The 8 × 512 p90 (1.05 s) is still level with mlx-lm's 1.00, for the FIFO
+  reason above. At 2048 ANE prefill now beats GPU prefill at both median and p90.
+- Total tok/s rises 9–66% (8 × 2048: 173 → 288). Per-client decode falls (8 × 512: 227 → 141) because clients now
+  start decoding sooner and side by side, so more rows share each step and more of each client's decode overlaps
+  other clients' prefill (the GPU tails and attn). The total is the throughput number; per-client decode was high
+  before partly because the slow ANE prefill staggered clients into a near-serial queue.
 
 ### Prefix cache (g8)
 
