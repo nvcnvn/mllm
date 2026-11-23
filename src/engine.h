@@ -41,13 +41,14 @@ struct Request {
     std::mt19937_64 rng;  // the sampler's
     Detokenizer detok;
     State state = State::WAITING;
-    int pos = 0;  // tokens whose K/V (and state) are in the arena
+    int pos = 0;   // tokens whose K/V (and state) are in the arena
+    int sent = 0;  // prefill: pos + the tokens of its chunks in flight
     int cached = 0;          // prompt tokens taken from the prefix cache (its first pos)
     std::vector<int> snaps;  // prefix cache: positions still ahead where the state is copied into the cache
     std::vector<uint32_t> pages, state_slots;
     uint32_t reserved = 0;  // units promised to this request, not yet allocated
     std::vector<int> out;
-    int in_flight = 0;  // lane work items holding it: a prefill chunk, or up to 2 decode steps (greedy rows fed)
+    int in_flight = 0;  // lane work items holding it: up to 2 prefill chunks, or up to 2 decode steps (greedy rows fed)
     bool cancelled = false;  // finish at the next poll (architecture.md: aborts wait for their chunk)
 };
 

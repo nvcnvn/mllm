@@ -39,7 +39,7 @@ Target: Mac mini M4 Pro, 64 GB. Numbers measured on this machine unless marked *
 | Weights | `mmap`ed model files (4-bit, MLX format) | Process | GPU reads |
 | ANE weights | Core ML model (4-bit LUT) | Process | Core ML / Neural Engine |
 | **Arena** | Per-token and per-request state | Process; contents churn | This design |
-| Workspace | Fixed activation buffers per chunk size (ANE I/O in IOSurfaces, GPU scratch) | Process | Reused every step |
+| Workspace | Fixed activation buffers per chunk size (ANE I/O in IOSurfaces, GPU scratch). ANE prefill's second chunk in flight adds only its own inputs / outputs (~16 MiB at chunk 512, 0.8B) and a second IOSurface set; it shares the GPU scratch (~335 MiB at max_ctx 16384) | Process | Reused every step |
 | Step tables | Small `uint32` arrays the GPU reads each step, **2 copies** | Process | CPU writes, GPU reads |
 
 ### The arena: one buffer, one unit size

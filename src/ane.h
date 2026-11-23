@@ -24,13 +24,14 @@ public:
     // builds them, if a block is missing.
     AneOps(GpuOps& gpu, Memory& mem, int S, const std::string& weights = "fp16");
 
+    // set: which of the 2 surface sets (two chunks in flight, one set each; PrefillLane uses chunk parity).
     // Encode into ws.enc: block i's inputs (ws.x, and ws.o for i > 0) into its surfaces, zero past ws.S tokens.
     // i = 0 first embeds ws.tokens into ws.x.
-    void inputs(int i, Workspace& ws);
+    void inputs(int i, Workspace& ws, int set);
     // Runs block i on the ANE (blocks the thread until done; its inputs must be on the surfaces, i.e. the command
     // buffer that encoded inputs(i) completed), then encodes into ws.enc its outputs' first ws.S tokens -> ws.x and
     // ws.q / k / v / gate or ws.qkv / z / b / a.
-    void dense(int i, Workspace& ws);
+    void dense(int i, Workspace& ws, int set);
 
     struct Surface {
         Memory::Surface s;
@@ -39,18 +40,18 @@ public:
     };
     struct Io {
         id<MTLBuffer> Workspace::*field;
-        Surface* surface;
+        Surface* surface[2];  // by set
     };
     struct Block {
         MLModel* model;
-        MLDictionaryFeatureProvider* in;
-        MLPredictionOptions* opts;  // outputBackings: every output into its surface
-        std::vector<Io> ins, outs;  // the ones converted from / to the workspace
+        MLDictionaryFeatureProvider* in[2];  // by set
+        MLPredictionOptions* opts[2];        // outputBackings: every output into its surface
+        std::vector<Io> ins, outs;           // the ones converted from / to the workspace
     };
     int S;
     std::string root;
     std::vector<Block> blocks;  // one per layer: dense(L) never runs in prefill
-    std::map<std::string, Surface> surfaces;  // by name + channels, shared by the blocks (x_out: x as an output)
+    std::map<std::string, Surface> surfaces[2];  // by name + channels, shared by the blocks (x_out: x as an output)
 
     // A copy of the engine's GpuOps (same pipelines and weights, no allocation) for the ANE lane's thread: GpuOps keeps
     // the encoder it is encoding into in members, so decode on the engine thread and prefill here can't share one.

@@ -2,11 +2,13 @@
 // the lane's own MTLCommandQueue, commits it and returns; poll checks the lane's MTLSharedEvent (never blocks) and
 // returns finished work. Both lanes live on the engine thread; prefill and decode overlap on the GPU through the two
 // queues. Lanes never touch the allocator: every unit a work item needs is allocated before submit.
-// With AneOps, PrefillLane runs each chunk on a thread of its own (Core ML's predict blocks): per layer, ANE dense(i)
-// then GPU attn(i) on the lane's queue; the engine sees the same submit / poll / event as on the GPU.
+// With AneOps, PrefillLane runs chunks on a thread of its own (Core ML's predict blocks): per layer, ANE dense(i)
+// then GPU attn(i) on the lane's queue, two chunks in flight so the ANE runs one's dense while the GPU runs the
+// other's attn; the engine sees the same submit / poll / event as on the GPU.
 #pragma once
 #import <Metal/Metal.h>
 
+#include <atomic>
 #include <condition_variable>
 #include <deque>
 #include <exception>
@@ -50,33 +52,58 @@ public:
     // ane: dense on the Neural Engine (chunk must be its compiled S), attn with ane->gpu; nullptr: all on the GPU
     PrefillLane(GpuOps& ops, Memory& mem, int chunk, int max_ctx, AneOps* ane = nullptr);
     ~PrefillLane();
-    bool busy() const { return w.has_value(); }  // one chunk in flight at a time
+    bool busy() const { return !q.empty(); }
+    // ANE: two chunks in flight, of any requests (a request's later chunk runs each layer's attn after its earlier
+    // chunk's: one queue, one fence). GPU: one.
+    bool can_submit() const { return q.size() < (ane ? 2u : 1u); }
     void submit(PrefillWork work);
-    std::vector<PrefillWork> poll();  // throws if the chunk's command buffer failed (the lane is free again)
-    void wait_oldest() const;  // until the chunk in flight is done (or 1 s: a failed one never signals)
+    // the chunks done, in submit order. Throws if one failed: every chunk in flight is dropped (after the thread
+    // let go of them), the lane is free again.
+    std::vector<PrefillWork> poll();
+    void wait_oldest() const;  // until the oldest chunk in flight is done (or 1 s: a failed one never signals)
 
     id<MTLCommandQueue> queue;
     id<MTLSharedEvent> event;  // signaled with the chunk count
+    std::atomic<bool> fail_next = false;  // tests: the ANE thread's next layer throws (a failed predict)
+    int fail_submit = 0;                  // tests: the fail_submit-th submit from now throws
+    // ANE: a chunk of fewer tokens runs on the GPU path instead (ws.S = n, no padding to S: tails and prefix-cache
+    // splits). The crossover of GPU prefill time at n against one ANE chunk (reports/mlx-lm baseline.md).
+    int gpu_below = 256;
+    int gpu_chunks = 0;  // ANE: chunks submitted to the GPU path (tests)
 
 private:
     GpuOps& ops;
     Memory& mem;
-    Workspace ws;
+    // by chunk parity (GPU: ws[0] only). ws[1] has its own inputs and outputs (tokens, x, o, q / k / v / gate,
+    // qkv / z / b / a), the GPU scratch is ws[0]'s: the lane's command buffers run one after another (one queue, the
+    // fence) and no scratch is live from one to the next
+    Workspace ws[2];
     StepTables tables;
     uint64_t n = 0;  // chunks committed
     id<MTLCommandBuffer> cb;
-    std::optional<PrefillWork> w;
+    std::deque<PrefillWork> q;  // in flight, oldest first: chunks n - q.size() + 1 .. n
 
-    // ANE: the engine hands chunk number `todo` to the thread; the thread signals `event` with it when done (or
-    // failed: err set first)
+    // ANE: the engine queues chunk k in `todo` (its workspace and surface set: k % 2); the thread signals `event`
+    // with k when done (or failed: err set first), in submit order. A GPU chunk also runs on this thread: its
+    // request's earlier chunk must have committed every layer first (one queue orders them).
+    struct Chunk {
+        uint64_t k;
+        int req;
+        bool gpu;                // all layers on the GPU, in one command buffer
+        int layer = -1;          // layers whose attn is committed (-1: not started)
+        id<MTLCommandBuffer> cb;  // the last one committed
+    };
     AneOps* ane;
+    id<MTLFence> fence;  // the untracked arena's K/V and state: each command buffer after the one before
     std::mutex m;
     std::condition_variable cv;
-    uint64_t todo = 0, done = 0;  // done: the last chunk the thread finished (read under m: memory ordering)
+    std::deque<Chunk> todo;
+    uint64_t done = 0;  // the last chunk the thread finished (read under m: memory ordering)
     bool stop = false;
     std::exception_ptr err;
     std::thread thread;
     void run();
+    bool turn(Chunk& c, const std::deque<Chunk>& others);
 };
 
 class DecodeLane {

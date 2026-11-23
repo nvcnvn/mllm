@@ -23,7 +23,7 @@ AneOps::AneOps(GpuOps& gpu, Memory& mem, int S, const std::string& weights)
       gpu(gpu), from_ane_ps(gpu.pipeline(@"from_ane")), to_ane_ps(gpu.pipeline(@"to_ane")) {
     this->gpu.merge = false;  // dense runs here and writes every workspace field: attn must read those
     // The surface for a feature: shared by every block with the same name and channels
-    auto surface = [&](const std::string& name, MLFeatureDescription* d, const std::string& where) -> Surface& {
+    auto surface = [&](int set, const std::string& name, MLFeatureDescription* d, const std::string& where) -> Surface* {
         MLMultiArrayConstraint* c = d.multiArrayConstraint;
         NSArray<NSNumber*>* shape = c.shape;
         if (!c || c.dataType != MLMultiArrayDataTypeFloat16 || shape.count != 4 || shape[0].intValue != 1 ||
@@ -31,16 +31,16 @@ AneOps::AneOps(GpuOps& gpu, Memory& mem, int S, const std::string& weights)
             throw std::runtime_error(where + ": " + name + " is not fp16 (1, C, H, " + std::to_string(S) + ")");
         const int C = shape[1].intValue * shape[2].intValue;
         const std::string key = name + std::to_string(C);
-        auto it = surfaces.find(key);
-        if (it == surfaces.end()) {
+        auto it = surfaces[set].find(key);
+        if (it == surfaces[set].end()) {
             Memory::Surface m = mem.surface(C, S);
             MLMultiArray* a = [[MLMultiArray alloc] initWithPixelBuffer:(__bridge CVPixelBufferRef)m.pixel_buffer
                                                                   shape:shape];
-            it = surfaces.emplace(key, Surface{m, a, C}).first;
+            it = surfaces[set].emplace(key, Surface{m, a, C}).first;
         }
         if (it->second.C != C || ![it->second.array.shape isEqualToArray:shape])
             throw std::runtime_error(where + ": " + name + " changes shape between blocks");
-        return it->second;
+        return &it->second;
     };
     if (weights != "fp16" && weights != "int8" && weights != "lut6" && weights != "lut4")  // ane.py _compress
         throw std::invalid_argument("ane_weights: fp16, int8, lut6 or lut4, not " + weights);
@@ -65,62 +65,67 @@ AneOps::AneOps(GpuOps& gpu, Memory& mem, int S, const std::string& weights)
         MLModel* m = [MLModel modelWithContentsOfURL:[NSURL fileURLWithPath:@((dir + "/model.mlmodelc").c_str())]
                                        configuration:cfg error:&err];
         if (!m) throw error(dir + ": cannot load", err);
-        Block b{m, nil, [MLPredictionOptions new], {}, {}};
-        NSMutableDictionary* feed = [NSMutableDictionary new];
-        for (NSString* k in m.modelDescription.inputDescriptionsByName) {
+        Block b{m, {}, {[MLPredictionOptions new], [MLPredictionOptions new]}, {}, {}};
+        NSMutableDictionary* feed[2] = {[NSMutableDictionary new], [NSMutableDictionary new]};
+        NSMutableDictionary* backings[2] = {[NSMutableDictionary new], [NSMutableDictionary new]};
+        NSDictionary* in = m.modelDescription.inputDescriptionsByName;
+        for (NSString* k in in) {
             const std::string name = k.UTF8String;
             if (name != "x" && name != "o") throw std::runtime_error(dir + ": unknown input " + name);
-            Surface& sf = surface(name, m.modelDescription.inputDescriptionsByName[k], dir);
-            feed[k] = sf.array;
-            b.ins.push_back({FIELDS.at(name), &sf});
+            Io io{FIELDS.at(name), {surface(0, name, in[k], dir), surface(1, name, in[k], dir)}};
+            for (int set = 0; set < 2; set++) feed[set][k] = io.surface[set]->array;
+            b.ins.push_back(io);
         }
-        b.in = [[MLDictionaryFeatureProvider alloc] initWithDictionary:feed error:&err];
-        if (!b.in) throw error(dir + ": inputs", err);
-        NSMutableDictionary* backings = [NSMutableDictionary new];
         NSDictionary<NSString*, NSString*>* ours = j[@"outputs"];
-        for (NSString* k in m.modelDescription.outputDescriptionsByName) {
+        NSDictionary* out = m.modelDescription.outputDescriptionsByName;
+        for (NSString* k in out) {
             if (!ours[k] || !FIELDS.count(ours[k].UTF8String)) throw error(dir + "/io.json: no name for an output", nil);
-            const std::string name = ours[k].UTF8String;
-            Surface& sf = surface(name == "x" ? "x_out" : name, m.modelDescription.outputDescriptionsByName[k], dir);
-            backings[k] = sf.array;
-            b.outs.push_back({FIELDS.at(name), &sf});
+            const std::string name = ours[k].UTF8String, sf = name == "x" ? "x_out" : name;
+            Io io{FIELDS.at(name), {surface(0, sf, out[k], dir), surface(1, sf, out[k], dir)}};
+            for (int set = 0; set < 2; set++) backings[set][k] = io.surface[set]->array;
+            b.outs.push_back(io);
         }
-        b.opts.outputBackings = backings;
+        for (int set = 0; set < 2; set++) {
+            b.in[set] = [[MLDictionaryFeatureProvider alloc] initWithDictionary:feed[set] error:&err];
+            if (!b.in[set]) throw error(dir + ": inputs", err);
+            b.opts[set].outputBackings = backings[set];
+        }
         blocks.push_back(b);
     }
 }
 
-void AneOps::inputs(int i, Workspace& ws) {
-    assert(ws.B == 1 && ws.S > 0 && ws.S <= S);
+void AneOps::inputs(int i, Workspace& ws, int set) {
+    assert(ws.B == 1 && ws.S > 0 && ws.S <= S && (set == 0 || set == 1));
     gpu.use(ws);
     if (i == 0) gpu.embed({ws.tokens}, {ws.x}, ws.S);
     for (const Io& io : blocks[i].ins) {
         [ws.enc setComputePipelineState:to_ane_ps];
         [ws.enc setBuffer:ws.*io.field offset:0 atIndex:0];
-        [ws.enc setBuffer:io.surface->s.buffer offset:0 atIndex:1];
-        [ws.enc setBytes:&io.surface->s.row length:4 atIndex:2];
+        [ws.enc setBuffer:io.surface[set]->s.buffer offset:0 atIndex:1];
+        [ws.enc setBytes:&io.surface[set]->s.row length:4 atIndex:2];
         const uint32_t n = ws.S;
         [ws.enc setBytes:&n length:4 atIndex:3];
-        [ws.enc dispatchThreads:MTLSizeMake(io.surface->C, S, 1) threadsPerThreadgroup:MTLSizeMake(32, 8, 1)];
+        [ws.enc dispatchThreads:MTLSizeMake(io.surface[set]->C, S, 1) threadsPerThreadgroup:MTLSizeMake(32, 8, 1)];
     }
 }
 
-void AneOps::dense(int i, Workspace& ws) {
-    assert(ws.B == 1 && ws.S > 0 && ws.S <= S);
+void AneOps::dense(int i, Workspace& ws, int set) {
+    assert(ws.B == 1 && ws.S > 0 && ws.S <= S && (set == 0 || set == 1));
     const Block& b = blocks[i];
     NSError* err = nil;
-    id<MLFeatureProvider> r = [b.model predictionFromFeatures:b.in options:b.opts error:&err];
+    id<MLFeatureProvider> r = [b.model predictionFromFeatures:b.in[set] options:b.opts[set] error:&err];
     if (!r) throw error("ANE dense block " + std::to_string(i), err);
     // Core ML copies into a fresh buffer when it can't use a backing: our surfaces would then hold stale data
-    for (NSString* k in b.opts.outputBackings)
-        if ([r featureValueForName:k].multiArrayValue.pixelBuffer != ((MLMultiArray*)b.opts.outputBackings[k]).pixelBuffer)
+    NSDictionary* backings = b.opts[set].outputBackings;
+    for (NSString* k in backings)
+        if ([r featureValueForName:k].multiArrayValue.pixelBuffer != ((MLMultiArray*)backings[k]).pixelBuffer)
             throw std::runtime_error("ANE dense block " + std::to_string(i) + ": output not written in place");
     for (const Io& io : b.outs) {
         [ws.enc setComputePipelineState:from_ane_ps];
-        [ws.enc setBuffer:io.surface->s.buffer offset:0 atIndex:0];
+        [ws.enc setBuffer:io.surface[set]->s.buffer offset:0 atIndex:0];
         [ws.enc setBuffer:ws.*io.field offset:0 atIndex:1];
-        [ws.enc setBytes:&io.surface->s.row length:4 atIndex:2];
-        [ws.enc dispatchThreads:MTLSizeMake(io.surface->C, ws.S, 1) threadsPerThreadgroup:MTLSizeMake(32, 8, 1)];
+        [ws.enc setBytes:&io.surface[set]->s.row length:4 atIndex:2];
+        [ws.enc dispatchThreads:MTLSizeMake(io.surface[set]->C, ws.S, 1) threadsPerThreadgroup:MTLSizeMake(32, 8, 1)];
     }
 }
 

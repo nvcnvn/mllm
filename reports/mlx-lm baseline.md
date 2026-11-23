@@ -109,6 +109,18 @@ Same day and load (java ~400% CPU), interleaved GPU/ANE runs, 2 rounds. `--strea
   stream's own rate (1,136–1,204 tok/s) is limited by the per-layer GPU round trips; pipelining two chunks (ANE dense
   of one while the GPU runs attn of the other) is the next step.
 
+**Since then (g11): two chunks in flight, tails on the GPU.** The table above is from before; its rows and §2's ANE
+column wait for a rerun on an idle machine (`g11-bench.sh`: the rows above and serve_bench with `--prefill ane`,
+interleaved with a `poc` build).
+- The ANE lane's thread keeps two chunks in flight (any requests, a request's next chunk too): while the GPU runs
+  `attn(i)` of one, the ANE runs `dense` of the other. It waits only for the command buffer its next `predict` needs,
+  not after every layer. K/V and state are bit-exact with one chunk at a time.
+- A chunk under 256 tokens (a tail, or a prefix-cache split) runs on the GPU path (`ws.S = n`, no padding to 512).
+- Noisy timings (the GPU was shared; lane only, no decode running, best of 3–5):
+  - two 512 chunks back to back: 180–222 ms one at a time (the old schedule), 118–125 ms with two in flight;
+  - crossover: GPU prefill 47.5 ms at n = 256, 58.5 at 320, 83.8 at 448, 95.6 at 512, against one ANE chunk at
+    85.9 ms alone or 56.8 ms per chunk with two in flight. So the GPU wins below ~310–460 tokens. The threshold
+    stays at 256: below both, and it leaves more of the GPU to decode.
 
 ## 2. Serving: `mlx_lm.server` under concurrent clients
 

@@ -86,9 +86,9 @@ std::vector<Event> Engine::step() {
         progress |= !chunks.empty();
         for (const PrefillWork& w : chunks) {
             Request& r = reqs.at(w.req_id);
-            r.in_flight = 0;
+            r.in_flight--;
             if (r.cancelled) {
-                finish(r);
+                if (!r.in_flight) finish(r);
                 continue;
             }
             r.pos += w.n_valid();
@@ -134,24 +134,33 @@ std::vector<Event> Engine::step() {
             progress = true;
         }
 
-        if (!prefill.busy()) {
-            auto it = std::find_if(reqs.begin(), reqs.end(),
-                                   [](auto& kv) { return kv.second.state == State::PREFILL && !kv.second.in_flight; });
-            if (it != reqs.end()) {
-                Request& r = it->second;
-                int end = std::min(r.pos + chunk, (int)r.ids.size() - 1);
-                if (!r.snaps.empty()) end = std::min(end, r.snaps.front());
-                const int n = end - r.pos;
-                ensure_pages(r, r.pos + n);
-                r.in_flight = 1, progress = true;
-                try {
-                    prefill.submit({r.id, std::vector<int>(r.ids.begin() + r.pos, r.ids.begin() + r.pos + n), r.pos,
-                                    r.pages, r.state_slots});
-                } catch (...) {
+        // the oldest request with tokens left to send; a second chunk of the same one too, unless the first ends at a
+        // snapshot point (the copy needs that chunk done and the next one not started)
+        while (prefill.can_submit()) {
+            auto it = std::find_if(reqs.begin(), reqs.end(), [](auto& kv) {
+                const Request& r = kv.second;
+                return r.state == State::PREFILL && !r.cancelled && r.sent < (int)r.ids.size() - 1 &&
+                       !(r.in_flight && !r.snaps.empty() && r.sent == r.snaps.front());
+            });
+            if (it == reqs.end()) break;
+            Request& r = it->second;
+            int end = std::min(r.sent + chunk, (int)r.ids.size() - 1);
+            if (!r.snaps.empty()) end = std::min(end, r.snaps.front());
+            ensure_pages(r, end);
+            r.in_flight++, progress = true;
+            try {
+                prefill.submit({r.id, std::vector<int>(r.ids.begin() + r.sent, r.ids.begin() + end), r.sent, r.pages,
+                                r.state_slots});
+            } catch (...) {
+                if (--r.in_flight == 0) {
                     abort({&r});
-                    throw;
+                } else {  // its other chunk is still in the lane: end it like a cancel, poll finishes it
+                    r.cancelled = true;
+                    emit({r.id, -1, "", true});
                 }
+                throw;
             }
+            r.sent = end;
         }
 
         // A greedy request still in the step in flight joins the next one too: its token is fed on the GPU. Unless
@@ -270,7 +279,7 @@ bool Engine::admit(Request& r) {
         a.release(m.pages), a.release(m.snapshot);
         return false;
     }
-    r.reserved = n, r.pages = m.pages, r.pos = r.cached = m.S * T, r.snaps = std::move(snaps);
+    r.reserved = n, r.pages = m.pages, r.pos = r.sent = r.cached = m.S * T, r.snaps = std::move(snaps);
     for (uint32_t j = 0; j < mem.state_units; j++) r.state_slots.push_back(alloc(r));
     if (m.S) {
         copy_units(r.state_slots, m.snapshot);  // requests update their state in place
