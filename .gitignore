@@ -71,3 +71,7 @@ Testing/
 # Python
 .venv/
 __pycache__/
+
+# Python packaging
+dist/
+*.egg-info/

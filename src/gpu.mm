@@ -2,6 +2,9 @@
 
 #include "mlx/mlx/backend/metal/kernels/steel/gemm/params.h"
 
+#include <mach-o/dyld.h>
+#include <mach-o/getsect.h>
+
 #include <algorithm>
 #include <cassert>
 #include <climits>
@@ -62,7 +65,10 @@ GpuOps::GpuOps(Memory& mem, const Weights& weights) : spec(mem.spec), mem(mem), 
         throw error(std::string("GpuOps: dispatch rules not ported for ") + arch.UTF8String, nil);
 
     NSError* err = nil;
-    library = [device newLibraryWithURL:[NSURL fileURLWithPath:@METALLIB] error:&err];
+    unsigned long n = 0;  // build/mllm carries the metallib in a section (Makefile); other binaries load the file
+    const uint8_t* embedded = getsectiondata((const mach_header_64*)_dyld_get_image_header(0), "__TEXT", "__metallib", &n);
+    library = embedded ? [device newLibraryWithData:dispatch_data_create(embedded, n, nullptr, ^{}) error:&err]
+                       : [device newLibraryWithURL:[NSURL fileURLWithPath:@METALLIB] error:&err];
     if (!library) throw error(std::string("cannot load ") + METALLIB, err);
 
     qmv_fast = pipeline(@"affine_qmv_fast_bfloat16_t_gs_64_b_4_batch_0_pr_0_hgs_0_r_4");

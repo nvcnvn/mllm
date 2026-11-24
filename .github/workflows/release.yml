@@ -1,0 +1,19 @@
+# Tag v* -> build the wheel on Apple silicon -> PyPI via Trusted Publishing (pypi.org: nvcnvn/mmmllm, release.yml).
+# Wheel only: the sdist needs Xcode to build, so on unsupported machines pip should find nothing rather than try.
+name: release
+on:
+  push:
+    tags: ["v*"]
+jobs:
+  pypi:
+    runs-on: macos-latest
+    permissions:
+      id-token: write
+    steps:
+      - uses: actions/checkout@v4
+      - name: Metal Toolchain
+        run: xcrun -sdk macosx metal --version || xcodebuild -downloadComponent MetalToolchain
+      - name: Tag matches pyproject version
+        run: grep -q "^version = \"${GITHUB_REF_NAME#v}\"$" pyproject.toml
+      - run: pipx run build --wheel --outdir dist
+      - uses: pypa/gh-action-pypi-publish@release/v1
