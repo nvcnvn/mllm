@@ -16,4 +16,5 @@ jobs:
       - name: Tag matches pyproject version
         run: grep -q "^version = \"${GITHUB_REF_NAME#v}\"$" pyproject.toml
       - run: pipx run build --wheel --outdir dist
-      - uses: pypa/gh-action-pypi-publish@release/v1
+      - name: Publish (Trusted Publishing; pypa/gh-action-pypi-publish runs on Linux only)
+        run: pipx run uv publish --trusted-publishing always dist/*.whl
