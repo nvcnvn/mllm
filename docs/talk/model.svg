@@ -1,0 +1,52 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="-10 -10 910 230" width="910" height="230" font-family="Inter, sans-serif">
+<g data-node="attn0">
+<rect x="350" y="40" width="100" height="40" rx="8" fill="#E8F0FE" stroke="#1A73E8" stroke-width="1"/>
+<text x="400" y="65" text-anchor="middle" fill="#202124" font-size="14">attn</text>
+</g>
+<g data-node="dense0">
+<rect x="170" y="30" width="120" height="60" rx="8" fill="#E8F0FE" stroke="#1A73E8" stroke-width="1"/>
+<text x="230" y="55" text-anchor="middle" fill="#202124" font-size="14">dense</text>
+<text x="230" y="75" text-anchor="middle" fill="#202124" font-size="14">pure matmuls</text>
+</g>
+<g data-node="memory">
+<path d="M510 17 L510 93 A100 7 0 0 0 710 93 L710 17 A100 7 0 0 0 510 17 Z" fill="#FEF7E0" stroke="#E37400" stroke-width="1"/>
+<path d="M510 17 A100 7 0 0 0 710 17" fill="none" stroke="#E37400" stroke-width="1"/>
+<text x="610" y="54" text-anchor="middle" fill="#202124" font-size="14">per-request memory</text>
+<text x="610" y="74" text-anchor="middle" fill="#202124" font-size="14">KV (grows) + state (fixed)</text>
+</g>
+<g data-node="more">
+<rect x="560" y="140" width="110" height="60" fill="#FFFFFF" stroke="#3C4043" stroke-width="1"/>
+<text x="615" y="165" text-anchor="middle" fill="#202124" font-size="14">… the same,</text>
+<text x="615" y="185" text-anchor="middle" fill="#202124" font-size="14">24–64 layers</text>
+</g>
+<g data-node="next">
+<rect x="770" y="150" width="110" height="40" rx="20" fill="#FFFFFF" stroke="#3C4043" stroke-width="1"/>
+<text x="825" y="175" text-anchor="middle" fill="#202124" font-size="14">next token</text>
+</g>
+<g data-node="tokens">
+<rect x="10" y="40" width="100" height="40" rx="20" fill="#FFFFFF" stroke="#3C4043" stroke-width="1"/>
+<text x="60" y="65" text-anchor="middle" fill="#202124" font-size="14">tokens</text>
+</g>
+<g data-edge="a0-mem">
+<path d="M450 58 L510 58" fill="none" stroke="#3C4043" stroke-width="1.5" stroke-dasharray="6 4"/>
+<path d="M500 63 L510 58 L500 53" fill="none" stroke="#3C4043" stroke-width="1.5"/>
+<rect x="412" y="37" width="100" height="17" fill="#FFFFFF"/>
+<text x="462" y="50" text-anchor="middle" fill="#202124" font-size="12">read + append</text>
+</g>
+<g data-edge="a0-more">
+<path d="M400 80 L400 170 L560 170" fill="none" stroke="#3C4043" stroke-width="1.5"/>
+<path d="M550 175 L560 170 L550 165" fill="none" stroke="#3C4043" stroke-width="1.5"/>
+</g>
+<g data-edge="d0-a0">
+<path d="M290 60 L350 60" fill="none" stroke="#3C4043" stroke-width="1.5"/>
+<path d="M340 65 L350 60 L340 55" fill="none" stroke="#3C4043" stroke-width="1.5"/>
+</g>
+<g data-edge="more-next">
+<path d="M670 170 L770 170" fill="none" stroke="#3C4043" stroke-width="1.5"/>
+<path d="M760 175 L770 170 L760 165" fill="none" stroke="#3C4043" stroke-width="1.5"/>
+</g>
+<g data-edge="t-d0">
+<path d="M110 60 L170 60" fill="none" stroke="#3C4043" stroke-width="1.5"/>
+<path d="M160 65 L170 60 L160 55" fill="none" stroke="#3C4043" stroke-width="1.5"/>
+</g>
+</svg>
