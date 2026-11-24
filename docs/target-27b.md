@@ -24,7 +24,37 @@ Expected shape (*estimates* from the 0.8B numbers, replaced by measurements as i
 - [ ] Prefill chunk 512 vs 1024 (>= 2048 needs steel attention, not ported; *estimate* < 3%). **Check:** interleaved A/B recorded; chunk 1024 the 27B default if it wins.
 
 ## 4. Memory, under real conditions (g15: budget and long context done, see the report)
-- [ ] The memory-design "To verify" item: does `mlock` on the mmapped weights keep them in RAM under pressure? **Check:** the pressure test from `tools/residency_check.swift` at 27B size, with and without `mlock`. *Waits for the user: this Mac has crashed under memory pressure, and other sessions run on it; needs an idle machine (each pressure test grew swap by 7-10 GiB).*
+- [ ] The memory-design "To verify" item: does `mlock` on the mmapped weights keep them in RAM under pressure? **Check:** the pressure test from `tools/residency_check.swift` at 27B size, with and without `mlock`. *Waits for the user: this Mac has crashed under memory pressure, and other sessions run on it; needs an idle machine (each pressure test grew swap by 7-10 GiB).* Notes below.
+
+### Memory-pressure test: notes (2026-11-24, not run)
+**Why it matters at 27B.**
+- **Weights:** the 15.13 GB of weights are file-backed (mmapped, no copy since g13), so macOS can evict them like any file cache.
+- **Residency sets aren't a pin.** The earlier residency test showed that an `MTLResidencySet` doesn't pin memory: under pressure, file-backed pages fell from 100% to 60% resident and anonymous pages to 0%.
+- **The cost of eviction:** an idle server would lose its weights to a browser, then pay for re-reading them from the T5 (USB) on the next request. The first warm-up after a cold start took 46 s at 27B (g13b).
+- **What the 27B holds:** wired memory while serving was 29.5-31.6 GiB (12 GiB arena + workspace + Metal) against `vm.user_wire_limit` = 52.5 GB, so `mlock` of the 15 GB of weights fits under the limit on paper.
+
+**What `tools/residency_check.swift` does today.**
+- It builds two files of N GiB each (default 4) on the weights volume. File A sits in a residency set; file B is the control.
+- It adds 1 GiB of incompressible anonymous memory at a time.
+- It reports the fraction of each still resident (`mincore`) and the GPU read speed afterwards.
+- It stops at the first of: B < 10% resident, pressure level critical, swap growth > 2 GiB, or 52 GiB allocated. GPU reads under pressure page memory back in, so swap has grown to 7-10 GiB anyway.
+- It has no `mlock` mode yet: one more mode is needed, where A is `mlock`ed instead of (or as well as) being in the residency set.
+
+**How to run it safely.**
+- **Idle machine only:** the user present, no other sessions running heavy jobs, and the shared lock free (`lsof /Users/nvcnvn/.cache/rock-solid/heavy.lock`). Message the storage-engine and mobile-app sessions first, and take the lock (`/Volumes/T5/cache/heavy pressure ...`) so nothing starts during the run.
+- **Close the big apps first:** VMs (a 16 GB Virtualization VM and a qemu VM ran all night) and Docker. Note the starting swap (`sysctl vm.swapusage`) and the internal disk's free space; swap lands on the internal SSD.
+- **Start at 27B-like sizes in steps:** a 4 GiB file first, then 16 GiB (the weights' size), not the whole sweep at once. Watch `memory_pressure` from a second terminal. If the system goes yellow or red for more than a few seconds, kill the test's PID; it frees everything on exit.
+- **Run each mode once:** file / residency set (the baseline, already known), file / `mlock`, and anon.
+
+**What to record.**
+- **Residency:** the fraction of A still resident, with and without `mlock`, at the moment B falls under 10%.
+- **Speed:** GPU read speed of A afterwards.
+- **Swap:** growth during the run.
+- **Duration:** how long the machine stayed slow.
+
+**Decides.** If `mlock` holds, `mllm serve` should `mlock` the weights at load (behind a flag, default on for serve). If it doesn't, the fallback is anonymous memory plus re-reading on demand, or accepting a cold first request after pressure.
+
+**Also untested:** what the server does when macOS evicts its weights mid-session. Measure TTFT and decode-step times after a pressure event.
 
 ## 5. ANE prefill at 27B (architecture.md "Open questions")
 - [ ] Weight format: LUT4 built from the **bf16 original** weights (LUT4 from the 4-bit MLX weights failed on 0.8B, cos 0.93). **Check:** per-block cos against fp32 reference; whole-model greedy tokens against GPU prefill; total weights (GPU 4-bit + ANE) next to a 12 GiB arena and ~16 GB for macOS fit in 64 GB.
@@ -33,5 +63,52 @@ Expected shape (*estimates* from the 0.8B numbers, replaced by measurements as i
 
 ## 6. Prefix cache at 27B (g15: done, see the report)
 
-## 7. Close out
+## 7. Lower-bit weights (g16, in progress, not on main)
+The idea: decode at B = 1 is bandwidth-bound (64.4 ms per step reading 14.4 GB), so 3-bit (~11.5 GB, *estimate*) or 2-bit (~8 GB, *estimate*) weights should decode proportionally faster and leave room for longer context, if the quality holds.
+
+**Done so far**, on branch `g16` in worktree `/Volumes/T5/Codes/mllm-g16`: WIP commits bdbbb66 and e65a6f3 on top of 7836048, not merged.
+- Per-tensor bit widths of 3, 4 and 6, read from the packed shapes; 2 and 8 bits are a small list change.
+- Mixed recipes run their unmerged parts (e.g. `v_proj` at 6 bits next to 3-bit q/k) one by one into the same output row.
+- `mlx_lm.convert` tensor names are renamed in the weights cache.
+- **Tests:** all pass on a 0.8B mixed_3_6 model (B = 1 bit-exact against new golden data). The one exception is test_engine's "batched equals solo" check, which fails because the model is badly damaged: mlx-lm's own B = 8 vs B = 1 on it shows the same spread.
+- **Not run on that branch:** the full gate and any 27B test.
+
+**0.8B dry run**, which says little about 27B:
+
+| | KL vs bf16 | top-1 | perplexity |
+|---|---|---|---|
+| 4-bit | 0.021 | 90.6% | 31 |
+| 3-bit | 2.27 | 33% | 233 |
+| mixed_3_6 | 2.01 | 38% | 186 |
+
+The reference's own perplexity is 30.4.
+
+**Not done:**
+- [ ] 27B conversions from the bf16 original (Qwen/Qwen3.6-27B, 55.6 GB, in the HF cache): 8-bit (quality reference), 3-bit, mixed_3_6, 2-bit, mixed_2_6.
+  - The GPU convert hit "GPU Timeout Error" reading cold bf16 shards from the T5. The CPU convert is untested at 27B: the 3-bit run was stopped after ~1 min, still reading.
+  - The scripts (convert with a 30 GiB watchdog, quality, benchmark, table) are in `tools/g16/` (`chain_all.sh` runs all of step 1; logs go to /Volumes/T5/cache/mllm/g16/logs).
+  - **Check:** per variant, KL / top-1 / perplexity against the 8-bit reference on ~4k tokens of real text, greedy 64-token agreement on the 3 golden prompts, and mlx-lm decode tok/s and peak memory, run twice. A variant passes if KL ≤ ~2× the 4-bit's and top-1 ≥ 95%.
+- [ ] For the variants that pass:
+  - 27B golden data;
+  - the 27B tests with `MLLM_MODEL` set to the variant;
+  - the gate;
+  - engine vs mlx-lm decode at B = 1/4 and prefill at 512/2048, interleaved.
+  - If none passes, the next step is calibrated quantization (DWQ/AWQ-style).
+
+## 8. Other gaps found on the way (2026-11-23/24)
+- **Prefill vs decode trade-off (g15):** an 8-layer command-buffer chain keeps decode gaps under 1 s but raised the mixed session's mean TTFT from 35.8 to 49.8 s. Untried: splitting only while a decode lane is active, so a lone prefill runs whole.
+- **Workspace at 128k:** 4.2 GiB, of which 3 GiB is `scores` from MLX's unfused attention fallback. A bit-exact fix loops the fallback over KV heads (`scores` 4× smaller).
+- **Long-context decode against mlx-lm:** not compared. The engine gives 12.95 tok/s at 32k and 8.49 at 128k, at 86% of a bound that reads K/V as fast as the weights.
+- **Unmeasured:**
+  - Cold load with an empty page cache (needs `sudo purge`). The weights-cache rewrite (~2 min) and the warm start (~4 s) are measured.
+  - A full 30-minute mixed session: QA ran 23 min to fit a lock hold.
+  - test_engine_cache `stress32` at 27B on the final g15 build: `cache` and `stress512` passed.
+- **Untested error path:** the prefill chain's failure handling (`PrefillLane::poll`). Nothing can make a GPU command buffer fail in tests; a deliberately faulting kernel would.
+- **Tests that don't run at 27B:**
+  - test_concurrent: skips at 2 MiB units, about 400 GB of memcpy at 27B.
+  - test_ane: waits on §5.
+- **Batched speed:** engine vs mlx-lm at B = 4/8 hasn't been rerun on a quiet machine. Only bench-ops' GPU step times exist: 91.5 / 115.9 ms.
+- **Old weight caches:** they're deleted. Only `-v3` dirs remain under `/Volumes/T5/cache/mllm/weights/`.
+
+## 9. Close out
 - [ ] 27B numbers in the reports; architecture.md's open questions closed with what was measured; the estimates table above replaced by measurements.
