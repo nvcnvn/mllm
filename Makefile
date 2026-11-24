@@ -8,7 +8,6 @@ OBJCFLAGS := -fobjc-arc -DMETALLIB='"$(METALLIB)"'
 # MLX's own kernel flags (mlx/backend/metal/kernels/CMakeLists.txt): no fast math, or results drift from MLX's
 METALFLAGS := -Wall -Wextra $(WERROR) -fno-fast-math -Wno-c++17-extensions -Wno-c++20-extensions -Isrc/vendor/mlx
 LDLIBS := -framework Metal -framework Foundation -framework CoreML -framework CoreVideo -framework IOSurface
-export HF_HOME ?= /Volumes/T5/huggingface
 
 LIB_SRC := $(filter-out src/main.mm,$(wildcard src/*.cpp src/*.mm src/vendor/*/*.cpp))
 LIB_OBJ := $(LIB_SRC:src/%=$(B)/obj/%.o)
