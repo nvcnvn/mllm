@@ -428,14 +428,14 @@ static TokensByPrompt check_gpu_chunk_32(const TestPrompts& prompts) {
     mllm::Engine off(golden::MODEL, ARENA_BYTES, 32, 32, 16, 16384, "gpu", false);
     mllm::Engine on(golden::MODEL, ARENA_BYTES, 32, 32, 16, 16384, "gpu", true);
     for (const auto& prompt : prompts.all) off_tokens[prompt] = run_alone(off, prompt).tokens;
-    for (const auto& prompt : {prompts.long_question, prompts.haiku_question, prompts.departure_question,
-                               prompts.grain_question, prompts.long_question}) {
+    for (const std::vector<int>* each : {&prompts.long_question, &prompts.haiku_question, &prompts.departure_question,
+                                         &prompts.grain_question, &prompts.long_question}) {
+        const std::vector<int>& prompt = *each;  // by address, so the checks below can tell which prompt this is
         RunResult hit = run_alone(on, prompt), hit_once = run_alone(on, prompt, 1), off_once = run_alone(off, prompt, 1);
         printf("  chunk 32, len %zu: cached %d then %d\n", prompt.size(), hit.cached, hit_once.cached);
         assert(hit.tokens == off_tokens[prompt] && hit_once.tokens == off_once.tokens &&
                hit_once.keys_values == off_once.keys_values && hit_once.state == off_once.state);
         assert(hit_once.cached == ((int)prompt.size() - 1) / 32 * 32);
-        // the braced list holds copies, so &prompt is never &prompts.grain_question: this part never runs
         assert(&prompt != &prompts.grain_question || hit.cached == prompts.branch_point);
     }
     check_idle_arena(on);
@@ -447,14 +447,14 @@ static TokensByPrompt check_gpu_chunk_32(const TestPrompts& prompts) {
 static void check_ane_prefill(const TestPrompts& prompts) {
     mllm::Engine off(golden::MODEL, ARENA_BYTES, CHUNK_TOKENS, 32, 16, 16384, "ane", false);
     mllm::Engine on(golden::MODEL, ARENA_BYTES, CHUNK_TOKENS, 32, 16, 16384, "ane", true);
-    for (const auto& prompt : {prompts.long_text_1300, prompts.long_question, prompts.haiku_question,
-                               prompts.departure_question, prompts.timber_question}) {
+    for (const std::vector<int>* each : {&prompts.long_text_1300, &prompts.long_question, &prompts.haiku_question,
+                                         &prompts.departure_question, &prompts.timber_question}) {
+        const std::vector<int>& prompt = *each;  // by address, so the checks below can tell which prompt this is
         RunResult off_run = run_alone(off, prompt), cold = run_alone(on, prompt), hit = run_alone(on, prompt);
         const int last_full_page = ((int)prompt.size() - 1) / 32 * 32;
         printf("  ane len %4zu: cached %d then %d, tokens equal cache off up to %zu, %zu of 64\n", prompt.size(),
                cold.cached, hit.cached, matching_prefix_length(cold.tokens, off_run.tokens),
                matching_prefix_length(hit.tokens, off_run.tokens));
-        // the braced list holds copies, so &prompt never equals a member's address: the parts after || never run
         assert(hit.cached == last_full_page &&
                (&prompt != &prompts.timber_question || cold.cached == prompts.branch_point));
         assert(&prompt != &prompts.long_text_1300 || (cold.tokens == off_run.tokens && hit.tokens == off_run.tokens));
