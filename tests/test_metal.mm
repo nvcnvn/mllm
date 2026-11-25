@@ -4,27 +4,27 @@
 #include <cassert>
 
 int main() {
-    id<MTLDevice> dev = MTLCreateSystemDefaultDevice();
-    NSError* err = nil;
-    id<MTLLibrary> lib = [dev newLibraryWithURL:[NSURL fileURLWithPath:@METALLIB] error:&err];
-    if (!lib) fprintf(stderr, "%s\n", err.localizedDescription.UTF8String);
-    assert(lib);
-    id<MTLComputePipelineState> ps = [dev newComputePipelineStateWithFunction:[lib newFunctionWithName:@"add_one"]
-                                                                        error:&err];
-    assert(ps);
-    const int n = 1024;
-    id<MTLBuffer> buf = [dev newBufferWithLength:n * sizeof(float) options:MTLResourceStorageModeShared];
-    float* x = (float*)buf.contents;
-    for (int i = 0; i < n; i++) x[i] = i;
-    id<MTLCommandQueue> q = [dev newCommandQueue];
-    id<MTLCommandBuffer> cb = [q commandBuffer];
-    id<MTLComputeCommandEncoder> enc = [cb computeCommandEncoder];
-    [enc setComputePipelineState:ps];
-    [enc setBuffer:buf offset:0 atIndex:0];
-    [enc dispatchThreads:MTLSizeMake(n, 1, 1) threadsPerThreadgroup:MTLSizeMake(256, 1, 1)];
-    [enc endEncoding];
-    [cb commit];
-    [cb waitUntilCompleted];
-    for (int i = 0; i < n; i++) assert(x[i] == i + 1);
+    id<MTLDevice> device = MTLCreateSystemDefaultDevice();
+    NSError* error = nil;
+    id<MTLLibrary> library = [device newLibraryWithURL:[NSURL fileURLWithPath:@METALLIB] error:&error];
+    if (!library) fprintf(stderr, "%s\n", error.localizedDescription.UTF8String);
+    assert(library);
+    id<MTLComputePipelineState> add_one =
+        [device newComputePipelineStateWithFunction:[library newFunctionWithName:@"add_one"] error:&error];
+    assert(add_one);
+    const int count = 1024;
+    id<MTLBuffer> buffer = [device newBufferWithLength:count * sizeof(float) options:MTLResourceStorageModeShared];
+    float* values = (float*)buffer.contents;
+    for (int i = 0; i < count; i++) values[i] = i;
+    id<MTLCommandQueue> queue = [device newCommandQueue];
+    id<MTLCommandBuffer> command_buffer = [queue commandBuffer];
+    id<MTLComputeCommandEncoder> encoder = [command_buffer computeCommandEncoder];
+    [encoder setComputePipelineState:add_one];
+    [encoder setBuffer:buffer offset:0 atIndex:0];
+    [encoder dispatchThreads:MTLSizeMake(count, 1, 1) threadsPerThreadgroup:MTLSizeMake(256, 1, 1)];
+    [encoder endEncoding];
+    [command_buffer commit];
+    [command_buffer waitUntilCompleted];
+    for (int i = 0; i < count; i++) assert(values[i] == i + 1);
     printf("PASS\n");
 }

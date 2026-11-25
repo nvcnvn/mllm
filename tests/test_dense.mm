@@ -1,7 +1,8 @@
-// dense(i) check: for every dense(i) call in the golden trace (147: prefill never runs dense(n_layers)), load its inputs from golden
-// (tokens, or x from dense(i - 1) and o from attn(i - 1)), run GpuOps::dense, compare every field it wrote.
+// apply_weights(i) check: for every apply_weights(i) call in the golden trace (147: prefill never runs
+// apply_weights(layers)), load its inputs from golden (tokens, or the residual from apply_weights(i - 1) and the
+// attention result from apply_attention(i - 1)), run GpuOps::apply_weights, compare every field it wrote.
 // Pass: cosine >= 0.99999. Prints per field how many calls were bit-exact and the worst max |diff|.
-// Covers: embedding (L00 x), RMSNorm (input norm feeds every projection; q/k norm; final norm = L24 x),
+// Covers: embedding (L00 x), RMSNorm (the attention norm feeds every projection; query / key norm; final norm = L24 x),
 // every projection kind and both qmv_wide (decode, 2 rows) and qmm_t_splitk (prefill, 24-32 rows).
 #include <cassert>
 #include <fstream>
@@ -11,142 +12,200 @@
 #include "golden.h"
 #include "lanes.h"
 
-int main() {
-    mllm::ModelSpec s = mllm::spec::load(golden::MODEL);
-    std::string d = golden::dir(s);
-    nlohmann::json g = nlohmann::json::parse(std::ifstream(d + "/spec.json"));
-    mllm::Safetensors tr(d + "/trace.safetensors");
-    id<MTLDevice> dev = MTLCreateSystemDefaultDevice();
-    mllm::Weights w(s.path, dev);
-    mllm::Memory mem(s, dev, 64 << 20);
-    int chunk = g["chunk"].get<int>(), max_batch = 2;
-    mllm::GpuOps ops(mem, w);
-    mllm::Workspace ws = ops.workspace(chunk, max_batch, 64);
-    id<MTLCommandQueue> q = [dev newCommandQueue];
-    mem.freeze();
+struct FieldStats {
+    int calls = 0, exact = 0;
+    double worst_cos = 1, max_abs = 0;
+};
 
-    std::map<std::string, id<MTLBuffer>> field = {{"x", ws.residual}, {"q", ws.query}, {"k", ws.key}, {"v", ws.value},
-        {"gate", ws.query_gate}, {"qkv", ws.query_key_value}, {"z", ws.output_gate}, {"b", ws.update_rate_input}, {"a", ws.decay_input}};
-    auto load = [&](const std::string& key, id<MTLBuffer> dst) {
-        const mllm::Tensor& t = tr.at(key);
-        assert(t.nbytes <= dst.length);
-        memcpy(dst.contents, tr.data(t), t.nbytes);
-    };
-    struct Stat {
-        int calls = 0, exact = 0;
-        double worst_cos = 1, max_abs = 0;
-    };
-    std::map<std::string, Stat> stats;
+// golden [requests, heads, tokens, head_dim]; ours [requests, tokens, heads, head_dim]: ours in golden's order
+static void reorder_heads_like_golden(const mllm::Tensor& tensor, const uint8_t* ours, std::vector<uint8_t>& reordered) {
+    int64_t requests = tensor.shape[0], heads = tensor.shape[1], tokens = tensor.shape[2], head_dim = tensor.shape[3];
+    for (int64_t request = 0; request < requests; request++)
+        for (int64_t head = 0; head < heads; head++)
+            for (int64_t token = 0; token < tokens; token++)
+                memcpy(&reordered[(((request * heads + head) * tokens + token) * head_dim) * 2],
+                       ours + (((request * tokens + token) * heads + head) * head_dim) * 2, head_dim * 2);
+}
+
+struct DenseTest {
+    const mllm::ModelSpec& model;
+    const mllm::Safetensors& trace;
+    mllm::GpuOps& ops;
+    mllm::Workspace& workspace;
+    id<MTLCommandQueue> queue;
+    std::map<std::string, FieldStats> stats;
     bool ok = true;
-    const int L = s.n_layers();
-    int runs = 0;
-    std::vector<uint8_t> got;
-    for (const auto& call : g["calls"]) {
-        std::string c = call["name"].get<std::string>();
-        const mllm::Tensor& tok = tr.at(c + "/tokens");
-        ws.request_count = (int)tok.shape[0], ws.tokens_per_request = (int)tok.shape[1];
-        for (int i = 0; i <= L; i++) {
-            char li[8], lp[8];
-            snprintf(li, sizeof li, "L%02d", i), snprintf(lp, sizeof lp, "L%02d", i - 1);
-            if (!tr.tensors.count(c + "/" + li + "/dense/x")) continue;  // dense(L) in a prefill call
-            if (i && !tr.tensors.count(c + "/" + lp + "/attn/o")) continue;  // big models: a few layers (dump_golden)
-            runs++;
-            if (i == 0) {
-                load(c + "/tokens", ws.token_ids);
-            } else {
-                load(c + "/" + lp + "/dense/x", ws.residual);
-                load(c + "/" + lp + "/attn/o", ws.attention_result);
-            }
-            @autoreleasepool {
-                mllm::encode_and_wait(q, ws, [&] {
-                    ops.apply_weights(i, ws);
-                });
-            }
 
-            std::string pre = c + "/" + li + "/dense/";
-            for (const auto& [name, buf] : field) {
-                auto it = tr.tensors.find(pre + name);
-                if (it == tr.tensors.end()) continue;
-                const mllm::Tensor& t = it->second;
-                const uint8_t* src = (const uint8_t*)buf.contents;
-                got.assign(src, src + t.nbytes);
-                if (t.shape.size() == 4 && (name == "q" || name == "k" || name == "v")) {
-                    // golden [B, H, S, D]; ours [B, S, H, D]: bring ours to golden's order
-                    int64_t B = t.shape[0], H = t.shape[1], S = t.shape[2], D = t.shape[3];
-                    for (int64_t b = 0; b < B; b++)
-                        for (int64_t h = 0; h < H; h++)
-                            for (int64_t si = 0; si < S; si++)
-                                memcpy(&got[(((b * H + h) * S + si) * D) * 2], src + (((b * S + si) * H + h) * D) * 2, D * 2);
-                }
-                Stat& st = stats[name];
-                st.calls++;
-                const uint8_t* want = tr.data(t);
-                if (!memcmp(got.data(), want, t.nbytes)) {
-                    st.exact++;
-                    continue;
-                }
-                double dot = 0, gg = 0, ww = 0;
-                for (size_t e = 0; e < t.numel(); e++) {
-                    double a = golden::to_double("BF16", got.data(), e), b = golden::to_double("BF16", want, e);
-                    dot += a * b, gg += a * a, ww += b * b;
-                    st.max_abs = std::fmax(st.max_abs, std::fabs(a - b));
-                }
-                st.worst_cos = std::fmin(st.worst_cos, dot / std::sqrt(gg * ww));
-                if (!golden::matches(pre + name, t, want, got.data(), 0.99999, INFINITY)) ok = false;
-            }
+    void load(const std::string& key, id<MTLBuffer> destination) {
+        const mllm::Tensor& tensor = trace.at(key);
+        assert(tensor.nbytes <= destination.length);
+        memcpy(destination.contents, trace.data(tensor), tensor.nbytes);
+    }
+
+    // apply_weights(layer)'s inputs from golden call `call_name`: tokens for layer 0, else the layer before's residual
+    // and attention result (previous_layer: "LNN" of layer - 1)
+    void load_inputs(const std::string& call_name, int layer, const std::string& previous_layer) {
+        if (layer == 0) {
+            load(call_name + "/tokens", workspace.token_ids);
+        } else {
+            load(call_name + "/" + previous_layer + "/dense/x", workspace.residual);
+            load(call_name + "/" + previous_layer + "/attn/o", workspace.attention_result);
         }
     }
-    for (const auto& [name, st] : stats)
-        printf("%-5s bit-exact %3d/%3d  worst cos %.7f  max |diff| %g\n", name.c_str(), st.exact, st.calls,
-               st.worst_cos, st.max_abs);
-    int prefills = 0;
-    for (const auto& call : g["calls"]) prefills += call["name"].get<std::string>().starts_with("prefill");
-    assert((L > 24 || runs == (int)g["calls"].size() * (L + 1) - prefills) && runs && stats["x"].calls == runs);
-    assert(ok);
 
-    // M = 1 (no golden call has it): the merged matmuls (GpuOps::merge) give the same bytes as the separate ones.
-    // Row 0 of decode0's inputs; z / b / a / v are read where the merged row leaves them (ws.query_key_value, ws.query_and_gate).
-    const size_t E = 2, C = s.conv_dim(), vd = (size_t)s.linear_value_heads * s.linear_value_dim, Hv = s.linear_value_heads;
-    const size_t qd = (size_t)s.query_heads * s.head_dim, kvd = (size_t)s.key_value_heads * s.head_dim;
-    ws.request_count = 1, ws.tokens_per_request = 1;
-    int m1_checked = 0;
-    for (int i = 0; i <= L; i++) {
-        char lp[8];
-        snprintf(lp, sizeof lp, "L%02d", i - 1);
-        if (i && !tr.tensors.count(std::string("decode0/") + lp + "/attn/o")) continue;
-        const bool lin = i < L && s.kinds[i] == "linear", full = i < L && !lin;
-        // (name, separate path's buffer, merged path's buffer and byte offset, bytes)
-        std::vector<std::tuple<std::string, id<MTLBuffer>, id<MTLBuffer>, size_t, size_t>> f = {
-            {"x", ws.residual, ws.residual, 0, s.hidden * E}};
-        if (lin)
-            f.insert(f.end(), {{"qkv", ws.query_key_value, ws.query_key_value, 0, C * E}, {"z", ws.output_gate, ws.query_key_value, C * E, vd * E},
-                               {"b", ws.update_rate_input, ws.query_key_value, (C + vd) * E, Hv * E}, {"a", ws.decay_input, ws.query_key_value, (C + vd + Hv) * E, Hv * E}});
+    void run_apply_weights(int layer) {
+        @autoreleasepool {
+            mllm::encode_and_wait(queue, workspace, [&] { ops.apply_weights(layer, workspace); });
+        }
+    }
+
+    // One field the call wrote (golden name `name`, in buffer) against golden `prefix + name`
+    void compare_field(const std::string& prefix, const std::string& name, id<MTLBuffer> buffer, std::vector<uint8_t>& got) {
+        auto found = trace.tensors.find(prefix + name);
+        if (found == trace.tensors.end()) return;
+        const mllm::Tensor& tensor = found->second;
+        const uint8_t* ours = (const uint8_t*)buffer.contents;
+        got.assign(ours, ours + tensor.nbytes);
+        if (tensor.shape.size() == 4 && (name == "q" || name == "k" || name == "v"))
+            reorder_heads_like_golden(tensor, ours, got);
+        FieldStats& field = stats[name];
+        field.calls++;
+        const uint8_t* want = trace.data(tensor);
+        if (!memcmp(got.data(), want, tensor.nbytes)) {
+            field.exact++;
+            return;
+        }
+        double dot = 0, got_squared = 0, want_squared = 0;
+        for (size_t e = 0; e < tensor.numel(); e++) {
+            double got_value = golden::to_double("BF16", got.data(), e), want_value = golden::to_double("BF16", want, e);
+            dot += got_value * want_value, got_squared += got_value * got_value, want_squared += want_value * want_value;
+            field.max_abs = std::fmax(field.max_abs, std::fabs(got_value - want_value));
+        }
+        field.worst_cos = std::fmin(field.worst_cos, dot / std::sqrt(got_squared * want_squared));
+        if (!golden::matches(prefix + name, tensor, want, got.data(), 0.99999, INFINITY)) ok = false;
+    }
+
+    // Every apply_weights call of the trace; returns how many ran
+    int check_traced_calls(const nlohmann::json& calls) {
+        const std::map<std::string, id<MTLBuffer>> fields = {{"x", workspace.residual}, {"q", workspace.query},
+            {"k", workspace.key}, {"v", workspace.value}, {"gate", workspace.query_gate},
+            {"qkv", workspace.query_key_value}, {"z", workspace.output_gate}, {"b", workspace.update_rate_input},
+            {"a", workspace.decay_input}};
+        const int layers = model.n_layers();
+        int runs = 0;
+        std::vector<uint8_t> got;
+        for (const auto& call : calls) {
+            std::string call_name = call["name"].get<std::string>();
+            const mllm::Tensor& token_ids = trace.at(call_name + "/tokens");
+            workspace.request_count = (int)token_ids.shape[0], workspace.tokens_per_request = (int)token_ids.shape[1];
+            for (int i = 0; i <= layers; i++) {
+                char layer_name[8], previous_layer[8];
+                snprintf(layer_name, sizeof layer_name, "L%02d", i), snprintf(previous_layer, sizeof previous_layer, "L%02d", i - 1);
+                if (!trace.tensors.count(call_name + "/" + layer_name + "/dense/x")) continue;  // apply_weights(layers) in a prefill call
+                if (i && !trace.tensors.count(call_name + "/" + previous_layer + "/attn/o")) continue;  // big models: a few layers (dump_golden)
+                runs++;
+                load_inputs(call_name, i, previous_layer);
+                run_apply_weights(i);
+                for (const auto& [name, buffer] : fields) compare_field(call_name + "/" + layer_name + "/dense/", name, buffer, got);
+            }
+        }
+        return runs;
+    }
+
+    // One row (no golden call has it): the merged multiplies (GpuOps::merge_projections) give the same bytes as the
+    // separate ones. Row 0 of decode0's inputs; output_gate / update_rate / decay / value are read where the merged row
+    // leaves them (workspace.query_key_value, workspace.query_and_gate). Returns how many layers were checked.
+    int check_merged_single_row() {
+        const int layers = model.n_layers();
+        workspace.request_count = 1, workspace.tokens_per_request = 1;
+        int checked = 0;
+        for (int i = 0; i <= layers; i++) {
+            char previous_layer[8];
+            snprintf(previous_layer, sizeof previous_layer, "L%02d", i - 1);
+            if (i && !trace.tensors.count(std::string("decode0/") + previous_layer + "/attn/o")) continue;
+            check_merged_layer(i, previous_layer);
+            checked++;
+        }
+        return checked;
+    }
+
+    // (name, the separate path's buffer, the merged path's buffer and byte offset, bytes)
+    using MergedField = std::tuple<std::string, id<MTLBuffer>, id<MTLBuffer>, size_t, size_t>;
+
+    std::vector<MergedField> merged_fields(int layer) const {
+        const int layers = model.n_layers();
+        const size_t element = 2, conv_dim = model.conv_dim();
+        const size_t linear_value_size = (size_t)model.linear_value_heads * model.linear_value_dim;
+        const size_t linear_value_heads = model.linear_value_heads;
+        const size_t query_size = (size_t)model.query_heads * model.head_dim;
+        const size_t key_value_size = (size_t)model.key_value_heads * model.head_dim;
+        const bool linear = layer < layers && model.kinds[layer] == "linear", full = layer < layers && !linear;
+        std::vector<MergedField> fields = {{"x", workspace.residual, workspace.residual, 0, model.hidden * element}};
+        if (linear)
+            fields.insert(fields.end(),
+                {{"qkv", workspace.query_key_value, workspace.query_key_value, 0, conv_dim * element},
+                 {"z", workspace.output_gate, workspace.query_key_value, conv_dim * element, linear_value_size * element},
+                 {"b", workspace.update_rate_input, workspace.query_key_value, (conv_dim + linear_value_size) * element,
+                  linear_value_heads * element},
+                 {"a", workspace.decay_input, workspace.query_key_value, (conv_dim + linear_value_size + linear_value_heads) * element,
+                  linear_value_heads * element}});
         if (full)
-            f.insert(f.end(), {{"q", ws.query, ws.query, 0, qd * E}, {"gate", ws.query_gate, ws.query_gate, 0, qd * E}, {"k", ws.key, ws.key, 0, kvd * E},
-                               {"v", ws.value, ws.query_and_gate, (2 * qd + kvd) * E, kvd * E}});
+            fields.insert(fields.end(),
+                {{"q", workspace.query, workspace.query, 0, query_size * element},
+                 {"gate", workspace.query_gate, workspace.query_gate, 0, query_size * element},
+                 {"k", workspace.key, workspace.key, 0, key_value_size * element},
+                 {"v", workspace.value, workspace.query_and_gate, (2 * query_size + key_value_size) * element, key_value_size * element}});
+        return fields;
+    }
+
+    void check_merged_layer(int layer, const char* previous_layer) {
+        std::vector<MergedField> fields = merged_fields(layer);
         std::vector<std::vector<uint8_t>> want;
         for (bool merge : {false, true}) {
-            if (i == 0) {
-                load("decode0/tokens", ws.token_ids);
-            } else {
-                load(std::string("decode0/") + lp + "/dense/x", ws.residual);
-                load(std::string("decode0/") + lp + "/attn/o", ws.attention_result);
-            }
-            for (auto& [name, sep, mb, off, n] : f) memset((uint8_t*)mb.contents + off, 0xFF, n), memset(sep.contents, 0xFF, n);
+            load_inputs("decode0", layer, previous_layer);
+            for (auto& [name, separate, merged, offset, bytes] : fields)
+                memset((uint8_t*)merged.contents + offset, 0xFF, bytes), memset(separate.contents, 0xFF, bytes);
             ops.merge_projections = merge;
-            @autoreleasepool {
-                mllm::encode_and_wait(q, ws, [&] { ops.apply_weights(i, ws); });
-            }
-            for (size_t k = 0; k < f.size(); k++) {
-                auto& [name, sep, mb, off, n] = f[k];
-                const uint8_t* p = merge ? (const uint8_t*)mb.contents + off : (const uint8_t*)sep.contents;
-                if (!merge) want.emplace_back(p, p + n);
-                else if (memcmp(p, want[k].data(), n)) printf("L%02d %s: merged M = 1 differs\n", i, name.c_str()), ok = false;
+            run_apply_weights(layer);
+            for (size_t k = 0; k < fields.size(); k++) {
+                auto& [name, separate, merged, offset, bytes] = fields[k];
+                const uint8_t* output = merge ? (const uint8_t*)merged.contents + offset : (const uint8_t*)separate.contents;
+                if (!merge) want.emplace_back(output, output + bytes);
+                else if (memcmp(output, want[k].data(), bytes))
+                    printf("L%02d %s: merged one-row multiply differs\n", layer, name.c_str()), ok = false;
             }
         }
-        m1_checked++;
     }
-    assert(ok && (L > 24 || m1_checked == L + 1) && m1_checked);
-    printf("M = 1 merged == separate, %d dense calls\n", m1_checked);
+};
+
+int main() {
+    mllm::ModelSpec model = mllm::spec::load(golden::MODEL);
+    std::string directory = golden::dir(model);
+    nlohmann::json golden_spec = nlohmann::json::parse(std::ifstream(directory + "/spec.json"));
+    mllm::Safetensors trace(directory + "/trace.safetensors");
+    id<MTLDevice> device = MTLCreateSystemDefaultDevice();
+    mllm::Weights weights(model.path, device);
+    mllm::Memory memory(model, device, 64 << 20);
+    int chunk = golden_spec["chunk"].get<int>(), max_batch = 2;
+    mllm::GpuOps ops(memory, weights);
+    mllm::Workspace workspace = ops.workspace(chunk, max_batch, 64);
+    id<MTLCommandQueue> queue = [device newCommandQueue];
+    memory.freeze();
+    DenseTest test{model, trace, ops, workspace, queue, {}, true};
+    const int layers = model.n_layers();
+
+    const int runs = test.check_traced_calls(golden_spec["calls"]);
+    for (const auto& [name, field] : test.stats)
+        printf("%-5s bit-exact %3d/%3d  worst cos %.7f  max |diff| %g\n", name.c_str(), field.exact, field.calls,
+               field.worst_cos, field.max_abs);
+    int prefills = 0;
+    for (const auto& call : golden_spec["calls"]) prefills += call["name"].get<std::string>().starts_with("prefill");
+    assert((layers > 24 || runs == (int)golden_spec["calls"].size() * (layers + 1) - prefills) && runs &&
+           test.stats["x"].calls == runs);
+    assert(test.ok);
+
+    const int checked = test.check_merged_single_row();
+    assert(test.ok && (layers > 24 || checked == layers + 1) && checked);
+    printf("one row: merged == separate, %d apply_weights calls\n", checked);
     printf("PASS\n");
 }

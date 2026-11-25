@@ -4,26 +4,32 @@
 
 #include "golden.h"
 
+// A copy of the tensor with its middle element changed
+static std::vector<uint8_t> changed_copy(const mllm::Tensor& tensor, const uint8_t* data) {
+    std::vector<uint8_t> copy(data, data + tensor.nbytes);
+    size_t middle = tensor.numel() / 2;
+    if (tensor.dtype == "I32") ((int32_t*)copy.data())[middle] += 1;
+    else if (tensor.dtype == "F32") ((float*)copy.data())[middle] += 1 + std::fabs(((float*)copy.data())[middle]);
+    else if (tensor.dtype == "BF16") ((uint16_t*)copy.data())[middle] ^= 0x4000;  // flip the exponent's top bit
+    else assert(!"unexpected golden dtype");
+    return copy;
+}
+
 int main() {
-    std::string d = golden::dir(mllm::spec::load(golden::MODEL));
-    int n = 0;
-    for (const char* f : {"tokens.safetensors", "trace.safetensors"}) {
-        mllm::Safetensors st(d + "/" + f);
-        for (const auto& [name, t] : st.tensors) {
-            const uint8_t* p = st.data(t);
-            assert(golden::matches(name, t, p, p));
-            if (!t.numel()) continue;
-            std::vector<uint8_t> c(p, p + t.nbytes);
-            size_t i = t.numel() / 2;
-            if (t.dtype == "I32") ((int32_t*)c.data())[i] += 1;
-            else if (t.dtype == "F32") ((float*)c.data())[i] += 1 + std::fabs(((float*)c.data())[i]);
-            else if (t.dtype == "BF16") ((uint16_t*)c.data())[i] ^= 0x4000;  // flip the exponent's top bit
-            else assert(!"unexpected golden dtype");
+    std::string directory = golden::dir(mllm::spec::load(golden::MODEL));
+    int checked = 0;
+    for (const char* file : {"tokens.safetensors", "trace.safetensors"}) {
+        mllm::Safetensors tensors(directory + "/" + file);
+        for (const auto& [name, tensor] : tensors.tensors) {
+            const uint8_t* data = tensors.data(tensor);
+            assert(golden::matches(name, tensor, data, data));
+            if (!tensor.numel()) continue;
+            std::vector<uint8_t> copy = changed_copy(tensor, data);
             golden::quiet = true;
-            assert(!golden::matches(name, t, p, c.data()));
+            assert(!golden::matches(name, tensor, data, copy.data()));
             golden::quiet = false;
-            n++;
+            checked++;
         }
     }
-    printf("%d tensors: self match, perturbed copy fails\nPASS\n", n);
+    printf("%d tensors: self match, perturbed copy fails\nPASS\n", checked);
 }
