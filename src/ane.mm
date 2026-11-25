@@ -15,200 +15,233 @@ static std::runtime_error error(const std::string& what, NSError* err) {
     return std::runtime_error(what + (err ? std::string(": ") + err.localizedDescription.UTF8String : ""));
 }
 
-static const std::map<std::string, id<MTLBuffer> Workspace::*> FIELDS = {
-    {"q", &Workspace::query},     {"k", &Workspace::key},     {"v", &Workspace::value}, {"gate", &Workspace::query_gate},
-    {"qkv", &Workspace::query_key_value}, {"z", &Workspace::output_gate},     {"b", &Workspace::update_rate_input}, {"a", &Workspace::decay_input},
-    {"x", &Workspace::residual},     {"o", &Workspace::attention_result}};
+// Core ML feature names (ane.py's) -> the workspace field each one is copied from / to
+static const std::map<std::string, id<MTLBuffer> Workspace::*> WORKSPACE_FIELD_BY_NAME = {
+    {"q", &Workspace::query},
+    {"k", &Workspace::key},
+    {"v", &Workspace::value},
+    {"gate", &Workspace::query_gate},
+    {"qkv", &Workspace::query_key_value},
+    {"z", &Workspace::output_gate},
+    {"b", &Workspace::update_rate_input},
+    {"a", &Workspace::decay_input},
+    {"x", &Workspace::residual},
+    {"o", &Workspace::attention_result}};
 
-AneOps::AneOps(GpuOps& gpu, Memory& mem, int S)
-    : S(S), gpu(gpu), from_rows_ps(gpu.pipeline(@"from_rows")), to_rows_ps(gpu.pipeline(@"to_rows")),
-      dequant_ps(gpu.pipeline(@"dequant_q4")) {
-    this->gpu.merge_projections = false;  // dense runs here and writes every workspace field: attn must read those
-    const ModelSpec& sp = mem.spec;
-    if (S % 32 || S < 32) throw std::invalid_argument("ANE: chunk must be a multiple of 32");
-    sizes = S > 512 ? std::vector<int>{512, S} : std::vector<int>{S};
-    for (int i = 0; i < sp.n_layers(); i++)
-        kind_of.push_back((i ? sp.kinds[i - 1] : std::string("none")) + "_" + sp.kinds[i]);
-    const std::string base = spec::cache_dir() + "/ane/" + spec::model_key(sp.path);
-    root = base + "/shared_S" + std::to_string(S);
-    std::string list;
-    for (int Sk : sizes) list += (list.empty() ? "" : ", ") + std::to_string(Sk);
-    MLModelConfiguration* cfg = [MLModelConfiguration new];
-    cfg.computeUnits = MLComputeUnitsCPUAndNeuralEngine;
-    for (int Sk : sizes)
-        for (const std::string& kind : std::set<std::string>(kind_of.begin(), kind_of.end())) {
-            const std::string dir = base + "/shared_S" + std::to_string(Sk) + "/" + kind;
-            if (!fs::exists(dir + "/model.mlmodelc") || !fs::exists(dir + "/io.json"))
-                throw std::runtime_error(
-                    "ANE model missing: " + dir + "\nBuild the blocks with Python (~30 s):\n  HF_HOME=" +
-                    (getenv("HF_HOME") ? getenv("HF_HOME") : "/Volumes/T5/huggingface") +
-                    " .venv/bin/python -c \"import sys; sys.path.insert(0, 'py'); from mllm.ane import build; "
-                    "build('" + sp.path + "', [" + list + "])\"");
-            blocks.emplace(std::pair{Sk, kind}, load(mem, dir, Sk, cfg));
-        }
-    for (int i = 0; i < sp.n_layers(); i++) params.push_back(layer_params(i, sp));
+// The error for a block that isn't built: says how to build every chunk size with Python
+static std::runtime_error missing_block_error(const std::string& dir, const std::string& model_path,
+                                              const std::vector<int>& chunk_sizes) {
+    std::string size_list;
+    for (int size : chunk_sizes) size_list += (size_list.empty() ? "" : ", ") + std::to_string(size);
+    return std::runtime_error("ANE model missing: " + dir + "\nBuild the blocks with Python (~30 s):\n  HF_HOME=" +
+                              (getenv("HF_HOME") ? getenv("HF_HOME") : "/Volumes/T5/huggingface") +
+                              " .venv/bin/python -c \"import sys; sys.path.insert(0, 'py'); from mllm.ane import build; "
+                              "build('" + model_path + "', [" + size_list + "])\"");
 }
 
-// Activations by name and S, weights / gammas by name and shape (the same for every S), all fp16 [rows, cols].
-AneOps::Surface* AneOps::surface(Memory& mem, int set, const std::string& key, int rows, int cols) {
-    auto it = surfaces[set].find(key);
-    if (it == surfaces[set].end()) {
-        Memory::Surface m = mem.surface(rows, cols);
-        MLMultiArray* a = [[MLMultiArray alloc] initWithPixelBuffer:(__bridge CVPixelBufferRef)m.pixel_buffer
-                                                              shape:@[@(rows), @(cols)]];
-        it = surfaces[set].emplace(key, Surface{m, a, cols}).first;
+AneOps::AneOps(GpuOps& engine_gpu, Memory& memory, int chunk_size)
+    : S(chunk_size), gpu(engine_gpu), copy_from_surface_pipeline(engine_gpu.pipeline(@"from_rows")),
+      copy_to_surface_pipeline(engine_gpu.pipeline(@"to_rows")), dequantize_pipeline(engine_gpu.pipeline(@"dequant_q4")) {
+    // apply_weights runs here and writes every workspace field: apply_attention must read those, not merged outputs
+    this->gpu.merge_projections = false;
+    const ModelSpec& model = memory.spec;
+    if (S % 32 || S < 32) throw std::invalid_argument("ANE: chunk must be a multiple of 32");
+    chunk_sizes = S > 512 ? std::vector<int>{512, S} : std::vector<int>{S};
+    for (int layer = 0; layer < model.n_layers(); layer++)
+        block_kind.push_back((layer ? model.kinds[layer - 1] : std::string("none")) + "_" + model.kinds[layer]);
+    const std::string base = spec::cache_dir() + "/ane/" + spec::model_key(model.path);
+    root = base + "/shared_S" + std::to_string(S);
+    MLModelConfiguration* config = [MLModelConfiguration new];
+    config.computeUnits = MLComputeUnitsCPUAndNeuralEngine;
+    for (int size : chunk_sizes)
+        for (const std::string& kind : std::set<std::string>(block_kind.begin(), block_kind.end())) {
+            const std::string dir = base + "/shared_S" + std::to_string(size) + "/" + kind;
+            if (!fs::exists(dir + "/model.mlmodelc") || !fs::exists(dir + "/io.json"))
+                throw missing_block_error(dir, model.path, chunk_sizes);
+            blocks.emplace(std::pair{size, kind}, load_block(memory, dir, size, config));
+        }
+    for (int layer = 0; layer < model.n_layers(); layer++) weight_inputs.push_back(layer_weight_inputs(layer, model));
+}
+
+// Activations by name and chunk size, weights / norm scales by name and shape (the same for every chunk size), all
+// fp16 [rows, cols]. Made on first use.
+AneOps::Surface* AneOps::find_or_make_surface(Memory& memory, int set, const std::string& key, int rows, int cols) {
+    auto found = surfaces[set].find(key);
+    if (found == surfaces[set].end()) {
+        Memory::Surface backing = memory.surface(rows, cols);
+        MLMultiArray* array = [[MLMultiArray alloc] initWithPixelBuffer:(__bridge CVPixelBufferRef)backing.pixel_buffer
+                                                                  shape:@[@(rows), @(cols)]];
+        found = surfaces[set].emplace(key, Surface{backing, array, cols}).first;
     }
-    return &it->second;
+    return &found->second;
 }
 
 // One block: its model, and a surface per input and output (both sets), outputs written in place (outputBackings).
-AneOps::Block AneOps::load(Memory& mem, const std::string& dir, int Sk, MLModelConfiguration* cfg) {
+AneOps::Block AneOps::load_block(Memory& memory, const std::string& dir, int chunk_size, MLModelConfiguration* config) {
     NSError* err = nil;
-    NSData* io = [NSData dataWithContentsOfFile:@((dir + "/io.json").c_str())];
-    NSDictionary* j = io ? [NSJSONSerialization JSONObjectWithData:io options:0 error:&err] : nil;
-    if (![j isKindOfClass:NSDictionary.class] || ![j[@"outputs"] isKindOfClass:NSDictionary.class])
+    NSData* io_file = [NSData dataWithContentsOfFile:@((dir + "/io.json").c_str())];
+    NSDictionary* io_json = io_file ? [NSJSONSerialization JSONObjectWithData:io_file options:0 error:&err] : nil;
+    if (![io_json isKindOfClass:NSDictionary.class] || ![io_json[@"outputs"] isKindOfClass:NSDictionary.class])
         throw error(dir + "/io.json: unreadable", err);
-    MLModel* m = [MLModel modelWithContentsOfURL:[NSURL fileURLWithPath:@((dir + "/model.mlmodelc").c_str())]
-                                   configuration:cfg error:&err];
-    if (!m) throw error(dir + ": cannot load", err);
-    Block b{Sk, m, {}, {[MLPredictionOptions new], [MLPredictionOptions new]}, {}, {}};
-    NSMutableDictionary* feed[2] = {[NSMutableDictionary new], [NSMutableDictionary new]};
+    MLModel* model = [MLModel modelWithContentsOfURL:[NSURL fileURLWithPath:@((dir + "/model.mlmodelc").c_str())]
+                                       configuration:config error:&err];
+    if (!model) throw error(dir + ": cannot load", err);
+    Block block{chunk_size, model, {}, {[MLPredictionOptions new], [MLPredictionOptions new]}, {}, {}};
+    NSMutableDictionary* features[2] = {[NSMutableDictionary new], [NSMutableDictionary new]};
     NSMutableDictionary* backings[2] = {[NSMutableDictionary new], [NSMutableDictionary new]};
-    auto dims = [&](MLFeatureDescription* d, const std::string& name) {
-        MLMultiArrayConstraint* c = d.multiArrayConstraint;
-        if (!c || c.dataType != MLMultiArrayDataTypeFloat16 || c.shape.count != 2)
+    auto shape_of = [&](MLFeatureDescription* description, const std::string& name) {
+        MLMultiArrayConstraint* constraint = description.multiArrayConstraint;
+        if (!constraint || constraint.dataType != MLMultiArrayDataTypeFloat16 || constraint.shape.count != 2)
             throw std::runtime_error(dir + ": " + name + " is not fp16 [rows, cols]");
-        return std::pair{c.shape[0].intValue, c.shape[1].intValue};
+        return std::pair{constraint.shape[0].intValue, constraint.shape[1].intValue};
     };
-    auto both = [&](const std::string& key, int rows, int cols) {
-        return std::array<Surface*, 2>{surface(mem, 0, key, rows, cols), surface(mem, 1, key, rows, cols)};
+    auto both_sets = [&](const std::string& key, int rows, int cols) {
+        return std::array<Surface*, 2>{find_or_make_surface(memory, 0, key, rows, cols),
+                                       find_or_make_surface(memory, 1, key, rows, cols)};
     };
 
-    // inputs: activations x / o (from the workspace), weights w_* and gammas g_* (written by inputs(i))
-    NSDictionary* in = m.modelDescription.inputDescriptionsByName;
-    for (NSString* k in in) {
-        const std::string name = k.UTF8String;
-        const auto [rows, cols] = dims(in[k], name);
-        const bool act = name == "x" || name == "o";
-        if (act && rows != Sk) throw std::runtime_error(dir + ": " + name + " has " + std::to_string(rows) + " rows");
-        if (!act && name.rfind("w_", 0) && name.rfind("g_", 0)) throw std::runtime_error(dir + ": unknown input " + name);
-        const std::string key =
-            act ? name + "@" + std::to_string(Sk) : name + ":" + std::to_string(rows) + "x" + std::to_string(cols);
-        const auto sf = both(key, rows, cols);
-        for (int set = 0; set < 2; set++) feed[set][k] = sf[set]->array;
-        if (act) b.ins.push_back({FIELDS.at(name), {sf[0], sf[1]}});
+    // inputs: activations x / o (from the workspace), weights w_* and norm scales g_* (written by prepare_inputs)
+    NSDictionary* inputs = model.modelDescription.inputDescriptionsByName;
+    for (NSString* feature in inputs) {
+        const std::string name = feature.UTF8String;
+        const auto [rows, cols] = shape_of(inputs[feature], name);
+        const bool activation = name == "x" || name == "o";
+        if (activation && rows != chunk_size)
+            throw std::runtime_error(dir + ": " + name + " has " + std::to_string(rows) + " rows");
+        if (!activation && name.rfind("w_", 0) && name.rfind("g_", 0))
+            throw std::runtime_error(dir + ": unknown input " + name);
+        const std::string key = activation ? name + "@" + std::to_string(chunk_size)
+                                           : name + ":" + std::to_string(rows) + "x" + std::to_string(cols);
+        const auto surface = both_sets(key, rows, cols);
+        for (int set = 0; set < 2; set++) features[set][feature] = surface[set]->array;
+        if (activation) block.inputs_from_workspace.push_back({WORKSPACE_FIELD_BY_NAME.at(name), {surface[0], surface[1]}});
     }
     // outputs: io.json names the workspace field each Core ML output goes to
-    NSDictionary<NSString*, NSString*>* ours = j[@"outputs"];
-    NSDictionary* out = m.modelDescription.outputDescriptionsByName;
-    for (NSString* k in out) {
-        if (!ours[k] || !FIELDS.count(ours[k].UTF8String)) throw error(dir + "/io.json: no name for an output", nil);
-        const std::string name = ours[k].UTF8String;
-        const auto [rows, cols] = dims(out[k], name);
-        const auto sf = both(name + "_out@" + std::to_string(Sk), rows, cols);
-        for (int set = 0; set < 2; set++) backings[set][k] = sf[set]->array;
-        b.outs.push_back({FIELDS.at(name), {sf[0], sf[1]}});
+    NSDictionary<NSString*, NSString*>* field_names = io_json[@"outputs"];
+    NSDictionary* outputs = model.modelDescription.outputDescriptionsByName;
+    for (NSString* feature in outputs) {
+        if (!field_names[feature] || !WORKSPACE_FIELD_BY_NAME.count(field_names[feature].UTF8String))
+            throw error(dir + "/io.json: no name for an output", nil);
+        const std::string name = field_names[feature].UTF8String;
+        const auto [rows, cols] = shape_of(outputs[feature], name);
+        const auto surface = both_sets(name + "_out@" + std::to_string(chunk_size), rows, cols);
+        for (int set = 0; set < 2; set++) backings[set][feature] = surface[set]->array;
+        block.outputs_to_workspace.push_back({WORKSPACE_FIELD_BY_NAME.at(name), {surface[0], surface[1]}});
     }
     for (int set = 0; set < 2; set++) {
-        b.in[set] = [[MLDictionaryFeatureProvider alloc] initWithDictionary:feed[set] error:&err];
-        if (!b.in[set]) throw error(dir + ": inputs", err);
-        b.opts[set].outputBackings = backings[set];
+        block.input_features[set] = [[MLDictionaryFeatureProvider alloc] initWithDictionary:features[set] error:&err];
+        if (!block.input_features[set]) throw error(dir + ": inputs", err);
+        block.prediction_options[set].outputBackings = backings[set];
     }
-    return b;
+    return block;
 }
 
-// What inputs(i) writes for layer i's block: the previous layer's o_proj, FFN and post norm (block i finishes layer
-// i - 1), then layer i's input norm and q/k/v (full) or qkv/z/b/a (linear) projections. Each goes into the weight
-// surface load() made for that name and shape.
-std::vector<AneOps::Param> AneOps::layer_params(int i, const ModelSpec& sp) {
+// What prepare_inputs(layer) writes for the layer's block: the previous layer's attention output projection,
+// feed-forward weights and feed-forward norm (the block for layer i finishes layer i - 1), then the layer's attention
+// norm and its query / key / value (full attention) or query_key_value / output_gate / update_rate / decay (linear
+// attention) projections. Each goes into the weight surface load_block() made for that name and shape.
+std::vector<AneOps::WeightInput> AneOps::layer_weight_inputs(int layer, const ModelSpec& model) {
     auto find = [&](int set, const std::string& name, int rows, int cols) {
-        auto it = surfaces[set].find(name + ":" + std::to_string(rows) + "x" + std::to_string(cols));
-        if (it == surfaces[set].end())
+        auto found = surfaces[set].find(name + ":" + std::to_string(rows) + "x" + std::to_string(cols));
+        if (found == surfaces[set].end())
             throw std::runtime_error(root + ": no block input " + name + " [" + std::to_string(rows) + ", " +
                                      std::to_string(cols) + "] (blocks built for another model?)");
-        return &it->second;
+        return &found->second;
     };
-    auto weight = [&](const std::string& name, const QuantizedWeights& w) {
-        if (w.in_size % 64) throw std::runtime_error("ANE: K not a multiple of the group size 64");
-        return Param{&w, {}, 0, {find(0, name, w.out_size, w.in_size), find(1, name, w.out_size, w.in_size)}};
+    auto weights = [&](const std::string& name, const QuantizedWeights& matrix) {
+        if (matrix.in_size % 64) throw std::runtime_error("ANE: K not a multiple of the group size 64");
+        return WeightInput{&matrix, {}, 0,
+                           {find(0, name, matrix.out_size, matrix.in_size), find(1, name, matrix.out_size, matrix.in_size)}};
     };
-    auto gamma = [&](const std::string& name, Buf g, int dim) {
-        return Param{nullptr, g, dim, {find(0, name, 1, dim), find(1, name, 1, dim)}};
+    auto norm_scale = [&](const std::string& name, Buf scale, int size) {
+        return WeightInput{nullptr, scale, size, {find(0, name, 1, size), find(1, name, 1, size)}};
     };
-    std::vector<Param> ps;
-    if (i > 0) {
-        const GpuOps::Layer& p = gpu.layers[i - 1];
-        ps = {weight("w_o", p.attention_output), weight("w_gate", p.feed_forward_gate), weight("w_up", p.feed_forward_up),
-              weight("w_down", p.feed_forward_down), gamma("g_post", p.feed_forward_norm, sp.hidden)};
+    std::vector<WeightInput> inputs;
+    if (layer > 0) {
+        const GpuOps::Layer& previous = gpu.layers[layer - 1];
+        inputs = {weights("w_o", previous.attention_output), weights("w_gate", previous.feed_forward_gate),
+                  weights("w_up", previous.feed_forward_up), weights("w_down", previous.feed_forward_down),
+                  norm_scale("g_post", previous.feed_forward_norm, model.hidden)};
     }
-    const GpuOps::Layer& l = gpu.layers[i];
-    ps.push_back(gamma("g_in", l.attention_norm, sp.hidden));
-    if (l.is_linear) {
-        ps.push_back(weight("w_qkv", l.query_key_value_projection)), ps.push_back(weight("w_z", l.output_gate_projection));
-        ps.push_back(weight("w_b", l.update_rate_projection)), ps.push_back(weight("w_a", l.decay_projection));
+    const GpuOps::Layer& current = gpu.layers[layer];
+    inputs.push_back(norm_scale("g_in", current.attention_norm, model.hidden));
+    if (current.is_linear) {
+        inputs.push_back(weights("w_qkv", current.query_key_value_projection));
+        inputs.push_back(weights("w_z", current.output_gate_projection));
+        inputs.push_back(weights("w_b", current.update_rate_projection));
+        inputs.push_back(weights("w_a", current.decay_projection));
     } else {
-        ps.push_back(weight("w_q", l.query_projection)), ps.push_back(weight("w_k", l.key_projection));
-        ps.push_back(weight("w_v", l.value_projection));
-        ps.push_back(gamma("g_q", l.query_norm, sp.head_dim)), ps.push_back(gamma("g_k", l.key_norm, sp.head_dim));
+        inputs.push_back(weights("w_q", current.query_projection));
+        inputs.push_back(weights("w_k", current.key_projection));
+        inputs.push_back(weights("w_v", current.value_projection));
+        inputs.push_back(norm_scale("g_q", current.query_norm, model.head_dim));
+        inputs.push_back(norm_scale("g_k", current.key_norm, model.head_dim));
     }
-    return ps;
+    return inputs;
 }
 
-const AneOps::Block& AneOps::block(int i, int n) const {
-    return blocks.at({*std::lower_bound(sizes.begin(), sizes.end(), n), kind_of[i]});
+const AneOps::Block& AneOps::block(int layer, int tokens) const {
+    return blocks.at({*std::lower_bound(chunk_sizes.begin(), chunk_sizes.end(), tokens), block_kind[layer]});
 }
 
-void AneOps::prepare_inputs(int i, Workspace& ws, int set) {
+void AneOps::prepare_inputs(int layer, Workspace& ws, int set) {
     assert(ws.request_count == 1 && ws.tokens_per_request > 0 && ws.tokens_per_request <= S && (set == 0 || set == 1));
     gpu.begin(ws);
-    if (i == 0) gpu.look_up_embeddings({ws.token_ids}, {ws.residual}, ws.tokens_per_request);
-    const Block& b = block(i, ws.tokens_per_request);
-    for (const Io& io : b.ins) to_rows(ws, {ws.*io.field}, *io.surface[set], ws.tokens_per_request, b.S);
-    // block i's weights and gammas into this set's weight surfaces (the ANE is done with them: this set's last
-    // predict returned before this command buffer was encoded)
-    for (const Param& p : params[i]) {
-        const Memory::Surface& d = p.surface[set]->s;
-        if (!p.w) {
-            to_rows(ws, p.gamma, *p.surface[set], 1, 1);
-            continue;
-        }
-        [ws.encoder setComputePipelineState:dequant_ps];
-        [ws.encoder setBuffer:p.w->packed.buffer offset:p.w->packed.offset atIndex:0];
-        [ws.encoder setBuffer:p.w->scales.buffer offset:p.w->scales.offset atIndex:1];
-        [ws.encoder setBuffer:p.w->biases.buffer offset:p.w->biases.offset atIndex:2];
-        [ws.encoder setBuffer:d.buffer offset:0 atIndex:3];
-        [ws.encoder setBytes:&d.row length:4 atIndex:4];
-        [ws.encoder dispatchThreads:MTLSizeMake(p.w->in_size / 8, p.w->out_size, 1) threadsPerThreadgroup:MTLSizeMake(32, 8, 1)];
+    if (layer == 0) gpu.look_up_embeddings({ws.token_ids}, {ws.residual}, ws.tokens_per_request);
+    const Block& current = block(layer, ws.tokens_per_request);
+    for (const Activation& input : current.inputs_from_workspace)
+        copy_to_surface(ws, {ws.*input.field}, *input.surface[set], ws.tokens_per_request, current.chunk_size);
+    // the layer's weights and norm scales into this set's weight surfaces (the ANE is done with them: this set's last
+    // prediction returned before this command buffer was encoded)
+    for (const WeightInput& input : weight_inputs[layer]) {
+        if (input.weights) dequantize_to_surface(ws, *input.weights, *input.surface[set]);
+        else copy_to_surface(ws, input.norm_scale, *input.surface[set], 1, 1);
     }
 }
 
-// bf16 [n, dst.C] at src -> dst's first `rows` fp16 rows, zero in rows n .. rows
-void AneOps::to_rows(Workspace& ws, Buf src, const Surface& dst, uint32_t n, int rows) {
-    [ws.encoder setComputePipelineState:to_rows_ps];
-    [ws.encoder setBuffer:src.buffer offset:src.offset atIndex:0];
-    [ws.encoder setBuffer:dst.s.buffer offset:0 atIndex:1];
-    [ws.encoder setBytes:&dst.s.row length:4 atIndex:2];
-    [ws.encoder setBytes:&n length:4 atIndex:3];
-    [ws.encoder dispatchThreads:MTLSizeMake(dst.C, rows, 1) threadsPerThreadgroup:MTLSizeMake(32, rows > 1 ? 8 : 1, 1)];
+// bf16 [tokens, target.cols] at source -> target's first `rows` fp16 rows, zero in rows tokens .. rows
+void AneOps::copy_to_surface(Workspace& ws, Buf source, const Surface& target, uint32_t tokens, int rows) {
+    [ws.encoder setComputePipelineState:copy_to_surface_pipeline];
+    [ws.encoder setBuffer:source.buffer offset:source.offset atIndex:0];
+    [ws.encoder setBuffer:target.backing.buffer offset:0 atIndex:1];
+    [ws.encoder setBytes:&target.backing.row length:4 atIndex:2];
+    [ws.encoder setBytes:&tokens length:4 atIndex:3];
+    [ws.encoder dispatchThreads:MTLSizeMake(target.cols, rows, 1) threadsPerThreadgroup:MTLSizeMake(32, rows > 1 ? 8 : 1, 1)];
 }
 
-void AneOps::apply_weights(int i, Workspace& ws, int set) {
+// 4-bit weights [out_size, in_size] -> target's fp16 rows; one thread per 8 weights
+void AneOps::dequantize_to_surface(Workspace& ws, const QuantizedWeights& weights, const Surface& target) {
+    [ws.encoder setComputePipelineState:dequantize_pipeline];
+    [ws.encoder setBuffer:weights.packed.buffer offset:weights.packed.offset atIndex:0];
+    [ws.encoder setBuffer:weights.scales.buffer offset:weights.scales.offset atIndex:1];
+    [ws.encoder setBuffer:weights.biases.buffer offset:weights.biases.offset atIndex:2];
+    [ws.encoder setBuffer:target.backing.buffer offset:0 atIndex:3];
+    [ws.encoder setBytes:&target.backing.row length:4 atIndex:4];
+    [ws.encoder dispatchThreads:MTLSizeMake(weights.in_size / 8, weights.out_size, 1)
+          threadsPerThreadgroup:MTLSizeMake(32, 8, 1)];
+}
+
+void AneOps::apply_weights(int layer, Workspace& ws, int set) {
     assert(ws.request_count == 1 && ws.tokens_per_request > 0 && ws.tokens_per_request <= S && (set == 0 || set == 1));
-    const Block& b = block(i, ws.tokens_per_request);
+    const Block& current = block(layer, ws.tokens_per_request);
     NSError* err = nil;
-    id<MLFeatureProvider> r = [b.model predictionFromFeatures:b.in[set] options:b.opts[set] error:&err];
-    if (!r) throw error("ANE dense block " + std::to_string(i), err);
+    id<MLFeatureProvider> result = [current.model predictionFromFeatures:current.input_features[set]
+                                                                 options:current.prediction_options[set]
+                                                                   error:&err];
+    if (!result) throw error("ANE dense block " + std::to_string(layer), err);
     // Core ML copies into a fresh buffer when it can't use a backing: our surfaces would then hold stale data
-    NSDictionary* backings = b.opts[set].outputBackings;
-    for (NSString* k in backings)
-        if ([r featureValueForName:k].multiArrayValue.pixelBuffer != ((MLMultiArray*)backings[k]).pixelBuffer)
-            throw std::runtime_error("ANE dense block " + std::to_string(i) + ": output not written in place");
-    for (const Io& io : b.outs) {
-        [ws.encoder setComputePipelineState:from_rows_ps];
-        [ws.encoder setBuffer:io.surface[set]->s.buffer offset:0 atIndex:0];
-        [ws.encoder setBuffer:ws.*io.field offset:0 atIndex:1];
-        [ws.encoder setBytes:&io.surface[set]->s.row length:4 atIndex:2];
-        [ws.encoder dispatchThreads:MTLSizeMake(io.surface[set]->C, ws.tokens_per_request, 1) threadsPerThreadgroup:MTLSizeMake(32, 8, 1)];
+    NSDictionary* backings = current.prediction_options[set].outputBackings;
+    for (NSString* feature in backings)
+        if ([result featureValueForName:feature].multiArrayValue.pixelBuffer != ((MLMultiArray*)backings[feature]).pixelBuffer)
+            throw std::runtime_error("ANE dense block " + std::to_string(layer) + ": output not written in place");
+    for (const Activation& output : current.outputs_to_workspace) {
+        const Surface& source = *output.surface[set];
+        [ws.encoder setComputePipelineState:copy_from_surface_pipeline];
+        [ws.encoder setBuffer:source.backing.buffer offset:0 atIndex:0];
+        [ws.encoder setBuffer:ws.*output.field offset:0 atIndex:1];
+        [ws.encoder setBytes:&source.backing.row length:4 atIndex:2];
+        [ws.encoder dispatchThreads:MTLSizeMake(source.cols, ws.tokens_per_request, 1)
+              threadsPerThreadgroup:MTLSizeMake(32, 8, 1)];
     }
 }
 

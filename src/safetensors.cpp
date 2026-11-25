@@ -15,77 +15,90 @@ namespace fs = std::filesystem;
 
 namespace mllm {
 
-size_t dtype_size(const std::string& d) {
+size_t dtype_size(const std::string& dtype) {
     static const std::map<std::string, size_t> sizes = {
         {"BOOL", 1}, {"U8", 1}, {"I8", 1}, {"F8_E4M3", 1}, {"F8_E5M2", 1}, {"BF16", 2}, {"F16", 2}, {"I16", 2},
         {"U16", 2},  {"F32", 4}, {"I32", 4}, {"U32", 4},      {"F64", 8},      {"I64", 8},  {"U64", 8}};
-    auto it = sizes.find(d);
-    if (it == sizes.end()) throw std::runtime_error("unknown safetensors dtype " + d);
-    return it->second;
+    auto found = sizes.find(dtype);
+    if (found == sizes.end()) throw std::runtime_error("unknown safetensors dtype " + dtype);
+    return found->second;
 }
 
 size_t Tensor::numel() const {
-    size_t n = 1;
-    for (auto s : shape) n *= (size_t)s;
-    return n;
+    size_t count = 1;
+    for (auto size : shape) count *= (size_t)size;
+    return count;
 }
 
 std::vector<std::string> files_in(const std::string& path) {
     if (!fs::is_directory(path)) return {path};
     std::vector<std::string> paths;
-    for (const auto& e : fs::directory_iterator(path))
-        if (e.path().extension() == ".safetensors") paths.push_back(e.path().string());
+    for (const auto& entry : fs::directory_iterator(path))
+        if (entry.path().extension() == ".safetensors") paths.push_back(entry.path().string());
     std::sort(paths.begin(), paths.end());
     if (paths.empty()) throw std::runtime_error(path + ": no *.safetensors");
     return paths;
 }
 
+// Maps the whole file read-only, rounded up to PAGE; sets file_size. Throws for a file under 8 bytes (no header length).
+static Mapping map_file(const std::string& path, size_t& file_size) {
+    int file = open(path.c_str(), O_RDONLY);
+    if (file < 0) throw std::runtime_error(path + ": " + strerror(errno));
+    struct stat status;
+    if (fstat(file, &status)) {
+        close(file);
+        throw std::runtime_error(path + ": " + strerror(errno));
+    }
+    file_size = (size_t)status.st_size;
+    const size_t mapped_size = (file_size + PAGE - 1) / PAGE * PAGE;
+    void* base = file_size < 8 ? MAP_FAILED : mmap(nullptr, mapped_size, PROT_READ, MAP_PRIVATE, file, 0);
+    close(file);
+    if (base == MAP_FAILED) throw std::runtime_error(path + ": cannot map");
+    return {path, base, mapped_size};
+}
+
+// The mapped file at base: an 8-byte header length, the JSON header, then the tensors' data. Adds a view of each tensor
+// to tensors.
+static void read_tensors(const std::string& path, const char* base, size_t file_size, int file_index,
+                         std::map<std::string, Tensor>& tensors) {
+    uint64_t header_length;
+    memcpy(&header_length, base, 8);
+    if (header_length > file_size - 8) throw std::runtime_error(path + ": bad header length");
+    auto header = nlohmann::json::parse(base + 8, base + 8 + header_length);
+    size_t data_start = 8 + header_length;
+    for (const auto& [name, entry] : header.items()) {
+        if (name == "__metadata__") continue;
+        Tensor tensor{entry.at("dtype"), entry.at("shape").get<std::vector<int64_t>>(), file_index, 0, 0};
+        size_t begin = entry.at("data_offsets")[0], end = entry.at("data_offsets")[1];
+        if (begin > end || end > file_size - data_start || end - begin != tensor.numel() * dtype_size(tensor.dtype))
+            throw std::runtime_error(path + ": bad offsets for " + name);
+        tensor.offset = data_start + begin;
+        tensor.nbytes = end - begin;
+        if (!tensors.emplace(name, std::move(tensor)).second) throw std::runtime_error(path + ": duplicate " + name);
+    }
+}
+
 Safetensors::Safetensors(const std::vector<std::string>& paths) {
     try {
-        for (const auto& p : paths) {
-            int fd = open(p.c_str(), O_RDONLY);
-            if (fd < 0) throw std::runtime_error(p + ": " + strerror(errno));
-            struct stat st;
-            if (fstat(fd, &st)) {
-                close(fd);
-                throw std::runtime_error(p + ": " + strerror(errno));
-            }
-            size_t fsize = (size_t)st.st_size, size = (fsize + PAGE - 1) / PAGE * PAGE;
-            void* base = fsize < 8 ? MAP_FAILED : mmap(nullptr, size, PROT_READ, MAP_PRIVATE, fd, 0);
-            close(fd);
-            if (base == MAP_FAILED) throw std::runtime_error(p + ": cannot map");
-            files.push_back({p, base, size});
-
-            uint64_t hlen;
-            memcpy(&hlen, base, 8);
-            if (hlen > fsize - 8) throw std::runtime_error(p + ": bad header length");
-            auto h = nlohmann::json::parse((const char*)base + 8, (const char*)base + 8 + hlen);
-            size_t data0 = 8 + hlen;
-            for (const auto& [name, v] : h.items()) {
-                if (name == "__metadata__") continue;
-                Tensor t{v.at("dtype"), v.at("shape").get<std::vector<int64_t>>(), (int)files.size() - 1, 0, 0};
-                size_t a = v.at("data_offsets")[0], b = v.at("data_offsets")[1];
-                if (a > b || b > fsize - data0 || b - a != t.numel() * dtype_size(t.dtype))
-                    throw std::runtime_error(p + ": bad offsets for " + name);
-                t.offset = data0 + a;
-                t.nbytes = b - a;
-                if (!tensors.emplace(name, std::move(t)).second) throw std::runtime_error(p + ": duplicate " + name);
-            }
+        for (const auto& path : paths) {
+            size_t file_size;
+            files.push_back(map_file(path, file_size));
+            read_tensors(path, (const char*)files.back().base, file_size, (int)files.size() - 1, tensors);
         }
     } catch (...) {  // the destructor doesn't run for a throwing constructor
-        for (auto& m : files) munmap(m.base, m.size);
+        for (auto& mapping : files) munmap(mapping.base, mapping.size);
         throw;
     }
 }
 
 Safetensors::~Safetensors() {
-    for (auto& m : files) munmap(m.base, m.size);
+    for (auto& mapping : files) munmap(mapping.base, mapping.size);
 }
 
 const Tensor& Safetensors::at(const std::string& name) const {
-    auto it = tensors.find(name);
-    if (it == tensors.end()) throw std::runtime_error("no tensor " + name);
-    return it->second;
+    auto found = tensors.find(name);
+    if (found == tensors.end()) throw std::runtime_error("no tensor " + name);
+    return found->second;
 }
 
 }  // namespace mllm

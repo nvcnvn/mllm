@@ -3,11 +3,12 @@
 // GET /v1/models. One engine thread owns the Engine (architecture.md rule 3); httplib's handler threads only queue
 // requests and read their text. A client that disconnects cancels its request.
 //
-//   mllm::Server s(engine, "mlx-community/Qwen3.5-0.8B-4bit");
-//   s.listen("127.0.0.1", 8080);  // blocks until s.stop() from another thread
+//   mllm::Server server(engine, "mlx-community/Qwen3.5-0.8B-4bit");
+//   server.listen("127.0.0.1", 8080);  // blocks until server.stop() from another thread
 #pragma once
 #include <condition_variable>
 #include <deque>
+#include <map>
 #include <memory>
 #include <mutex>
 #include <string>
@@ -24,7 +25,7 @@ namespace mllm {
 
 class Server {
 public:
-    Server(Engine& e, std::string model_name);
+    Server(Engine& engine, std::string model_name);
     ~Server();
     bool listen(const std::string& host, int port);  // blocks until stop(); false if the port can't be bound
     void wait_until_ready() const;
@@ -36,17 +37,24 @@ public:
     struct Stream;  // one request: its prompt in, its events out
 
 private:
-    void loop();  // the engine thread
-    void handle(const httplib::Request& req, httplib::Response& res, bool chat);
+    void run_engine();  // the engine thread
+    void handle_request(const httplib::Request& request, httplib::Response& response, bool chat);
+    void queue_cancel(const std::shared_ptr<Stream>& stream);  // the engine thread cancels it on its next loop
+    // The engine thread's steps: tokenize and submit new streams (or reject them), cancel the cancelled ones, hand
+    // one engine event to its stream
+    void start_streams(const std::deque<std::shared_ptr<Stream>>& streams);
+    void cancel_streams(const std::deque<std::shared_ptr<Stream>>& streams);
+    void deliver(const Event& event);
 
-    Engine& e;
-    std::string model;
+    Engine& engine;
+    std::map<int, std::shared_ptr<Stream>> live_streams;  // engine thread only: engine request id -> its stream
+    std::string model_name;
     std::unique_ptr<httplib::Server> http;
-    std::mutex m;  // guards jobs, cancels, stopping, n_live
-    std::condition_variable cv;
-    std::deque<std::shared_ptr<Stream>> jobs, cancels;
+    std::mutex mutex;  // guards new_streams, cancelled_streams, stopping, live_count
+    std::condition_variable wake_engine;
+    std::deque<std::shared_ptr<Stream>> new_streams, cancelled_streams;
     bool stopping = false;
-    size_t n_live = 0;
+    size_t live_count = 0;
 };
 
 }  // namespace mllm

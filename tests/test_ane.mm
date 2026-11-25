@@ -60,7 +60,7 @@ int main() {
     auto t0 = std::chrono::steady_clock::now();
     const int S = 1024, max_ctx = 3072;
     mllm::AneOps ane(ops, mem, S);
-    assert(ane.sizes == std::vector<int>({512, 1024}) && (int)ane.params.size() == s.n_layers());
+    assert(ane.chunk_sizes == std::vector<int>({512, 1024}) && (int)ane.weight_inputs.size() == s.n_layers());
     printf("a. loaded %zu blocks in %.1f s, %zu surfaces per set\n", ane.blocks.size(),
            std::chrono::duration<double>(std::chrono::steady_clock::now() - t0).count(), ane.surfaces[0].size());
     mllm::Workspace ws = ops.workspace(S, 1, S);
@@ -81,7 +81,7 @@ int main() {
         memcpy(ws.token_ids.contents, tr.data(tok), tok.nbytes);
         for (int i : {0, 3, 4}) {
             const mllm::AneOps::Block& b = ane.block(i, n);
-            assert(b.S == 512);
+            assert(b.chunk_size == 512);
             char L[8];
             snprintf(L, sizeof L, "L%02d", i - 1);
             if (i > 0) {
@@ -89,18 +89,18 @@ int main() {
                 put(ws.attention_result, "prefill0/" + std::string(L) + "/attn/o");
             }
             mllm::encode_and_wait(q, ws, [&] { ane.prepare_inputs(i, ws, 0); });
-            for (const mllm::AneOps::Io& io : b.ins) {  // padding: zero past n
-                const uint16_t* p = (const uint16_t*)io.surface[0]->s.buffer.contents;
-                for (size_t t = n; t < (size_t)b.S; t++)
-                    for (int c = 0; c < io.surface[0]->C; c++) assert(p[t * io.surface[0]->s.row + c] == 0);
+            for (const mllm::AneOps::Activation& io : b.inputs_from_workspace) {  // padding: zero past n
+                const uint16_t* p = (const uint16_t*)io.surface[0]->backing.buffer.contents;
+                for (size_t t = n; t < (size_t)b.chunk_size; t++)
+                    for (int c = 0; c < io.surface[0]->cols; c++) assert(p[t * io.surface[0]->backing.row + c] == 0);
             }
             mllm::encode_and_wait(q, ws, [&] { ane.apply_weights(i, ws, 0); });
             snprintf(L, sizeof L, "L%02d", i);
-            for (const mllm::AneOps::Io& io : b.outs) {
+            for (const mllm::AneOps::Activation& io : b.outputs_to_workspace) {
                 std::string name;
                 for (const auto& [f, field] : FIELDS)
                     if (ws.*io.field == ws.*field) name = f;
-                const int C = io.surface[0]->C;
+                const int C = io.surface[0]->cols;
                 const uint16_t* got = (const uint16_t*)(ws.*io.field).contents;
                 // golden, gpu.py layout: q / k / v are [1, H, n, D], the rest [1, n, C]
                 const mllm::Tensor& g = tr.at("prefill0/" + std::string(L) + "/dense/" + name);
