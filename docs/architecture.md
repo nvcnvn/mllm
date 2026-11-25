@@ -58,7 +58,7 @@ Your `attn()` / `ffn()` split, cut where the hardware cuts:
 
 | Phase | `dense` | `attn` | Sampling |
 |---|---|---|---|
-| Prefill | ANE (`--prefill ane`; fp16 or int8 blocks, LUT4 fails on the 0.8B) or GPU (default), same interface | GPU | — |
+| Prefill | ANE (`--prefill ane`; fp16 or int8 blocks, LUT4 fails on the 0.8B; or `--ane-weights shared`: no weight copy of its own, the GPU feeds it its 4-bit weights per layer, 1024-token chunks, target-27b.md §5) or GPU (default), same interface | GPU | — |
 | Decode | GPU, 4-bit affine (MLX format) | GPU, paged | GPU |
 
 ## Components

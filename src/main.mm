@@ -266,10 +266,15 @@ static double arena_gib = 0;
 static int max_ctx = 16384;
 static const char* prog = "mllm";  // argv[0]'s name: mmmllm through the package
 static size_t arena(double def_gib) { return (size_t)((arena_gib ? arena_gib : def_gib) * (1 << 30)); }
+// prefill chunk: shared-weight ANE blocks run 1024-token chunks (1.5x GPU prefill at 27B vs 1.3x at 512,
+// target-27b.md §5; shorter ones run the 512 block); 2048 needs steel attention (engine.mm)
+static int chunk(const std::string& on, const std::string& ane_weights) {
+    return on == "ane" && ane_weights == "shared" ? 1024 : 512;
+}
 
 static void generate(const std::string& model, const std::string& prompt, mllm::GenParams p, const std::string& on,
                      const std::string& ane_weights, bool prefix_cache) {
-    mllm::Engine e(model, arena(1), 512, 32, 16, max_ctx, on, ane_weights, prefix_cache);
+    mllm::Engine e(model, arena(1), chunk(on, ane_weights), 32, 16, max_ctx, on, ane_weights, prefix_cache);
     e.generate({{"user", prompt}}, p, [](const std::string& t) {
         fputs(t.c_str(), stdout);
         fflush(stdout);
@@ -285,7 +290,7 @@ static std::atomic<bool> interrupted;
 
 static void chat(const std::string& model, mllm::GenParams p, bool default_max, const std::string& on,
                  const std::string& ane_weights, bool prefix_cache) {
-    mllm::Engine e(model, arena(1), 512, 32, 16, max_ctx, on, ane_weights, prefix_cache);
+    mllm::Engine e(model, arena(1), chunk(on, ane_weights), 32, 16, max_ctx, on, ane_weights, prefix_cache);
     const bool tty = isatty(0);
     if (tty) fprintf(stderr, "%s chat: Ctrl-C stops a reply, Ctrl-D quits\n", prog);
     std::vector<mllm::Message> history;
@@ -346,7 +351,7 @@ static void chat(const std::string& model, mllm::GenParams p, bool default_max, 
 // what a concurrent prefill costs decode (architecture.md "Concurrency").
 static void bench(const std::string& model, int P, int G, int B, int n, const std::string& on,
                   const std::string& ane_weights, int stream, bool prefix_cache) {
-    mllm::Engine e(model, arena(1), 512, 32, 16, max_ctx, on, ane_weights, prefix_cache);
+    mllm::Engine e(model, arena(1), chunk(on, ane_weights), 32, 16, max_ctx, on, ane_weights, prefix_cache);
     e.tok.eos.clear();  // as mlx_lm.benchmark: never stop early
     std::mt19937 rng(0);
     std::uniform_int_distribution<int> tok(0, e.spec.vocab - 1);
@@ -412,7 +417,7 @@ static void bench(const std::string& model, int P, int G, int B, int n, const st
 // mllm serve: /v1/completions on 127.0.0.1 until killed. A 2 GiB arena: 32 requests of 512 + 256 tokens need 0.9.
 static int serve(const std::string& model, int port, const std::string& on, const std::string& ane_weights,
                  int max_batch, bool prefix_cache) {
-    mllm::Engine e(model, arena(2), 512, 32, max_batch, max_ctx, on, ane_weights, prefix_cache);
+    mllm::Engine e(model, arena(2), chunk(on, ane_weights), 32, max_batch, max_ctx, on, ane_weights, prefix_cache);
     mllm::Server s(e, model);
     fprintf(stderr, "%s serve: http://127.0.0.1:%d/v1 (chat/completions, completions; prefill on %s, max batch %d, "
             "prefix cache %s)\n", prog, port, on.c_str(), max_batch, prefix_cache ? "on" : "off");
@@ -431,8 +436,9 @@ static int usage() {
             "         /v1/completions on 127.0.0.1\n"
             "       %1$s bench-ops MODEL                      GPU time per op and per decode step, next to the roofline\n"
             "MODEL: repo id under $HF_HOME, or a local dir\n"
-            "PREFILL: [--prefill gpu|ane] [--ane-weights fp16|int8|lut6|lut4]: dense blocks of prefill on the Neural\n"
-            "         Engine (Core ML models built by py/mllm/ane.py for S = 512)\n"
+            "PREFILL: [--prefill gpu|ane] [--ane-weights fp16|int8|lut6|lut4|shared]: dense blocks of prefill on the\n"
+            "         Neural Engine (Core ML models built by py/mllm/ane.py). shared: no weight copy of its own (the GPU\n"
+            "         feeds it its weights a layer at a time; the 27B's option), 1024-token chunks\n"
             "         [--prefix-cache on|off]: reuse prompt prefixes across requests (default on; off for bench, whose\n"
             "         trials repeat the same prompts)\n"
             "ENGINE (generate, bench, serve): [--arena-gib G] (default 1, serve 2; 12 at 2 MiB units, the 27B)\n"

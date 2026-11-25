@@ -29,6 +29,12 @@ curl -N localhost:8080/v1/completions -d '{"prompt": "The capital of France is",
 
 `mmmllm` with no arguments lists every command and flag (`--port`, `--max-batch`, `--max-ctx`, `--arena-gib`, ...).
 
+**Neural Engine prefill** (from a checkout: the Core ML blocks are built with coremltools): `--prefill ane
+--ane-weights shared` runs prefill's matmuls on the Neural Engine, with the GPU feeding it its own 4-bit weights a layer
+at a time (no second copy; ~3 GB more memory at 27B). At 27B on an M4 Pro: 4096-token prompts 191 vs 131 tok/s, and
+decode next to a long prefill keeps 12 tok/s instead of 3 ([target-27b.md](docs/target-27b.md) §5). The first run
+prints the command that builds the blocks (~30 s).
+
 ## Verify the benchmark on your Mac
 
 ```sh

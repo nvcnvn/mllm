@@ -237,3 +237,31 @@ template [[host_name("conv_norm_qk_4")]] [[kernel]] decltype(conv_norm_qk<4>) co
                        uint2 i [[thread_position_in_grid]], uint2 g [[threads_per_grid]]) {
   dst[size_t(i.x) * row + i.y] = i.y < n ? static_cast<half>(static_cast<float>(src[size_t(i.y) * g.x + i.x])) : 0.0h;
 }
+
+// AneOps "shared" (row-major blocks, py/mllm/ane.py build_shared). Workspace bf16 [n, C] -> fp16 surface [S, row],
+// zero in rows n .. S. Grid: (C, S). Also a norm's gamma (n = S = 1).
+[[kernel]] void to_rows(const device bfloat16_t* src [[buffer(0)]], device half* dst [[buffer(1)]],
+                        constant uint& row [[buffer(2)]], constant uint& n [[buffer(3)]],
+                        uint2 i [[thread_position_in_grid]], uint2 g [[threads_per_grid]]) {
+  dst[size_t(i.y) * row + i.x] = i.y < n ? static_cast<half>(static_cast<float>(src[size_t(i.y) * g.x + i.x])) : 0.0h;
+}
+
+// fp16 surface [*, row] -> workspace bf16 [n, C], rounded to nearest even. Grid: (C, n).
+[[kernel]] void from_rows(const device half* src [[buffer(0)]], device bfloat16_t* dst [[buffer(1)]],
+                          constant uint& row [[buffer(2)]], uint2 i [[thread_position_in_grid]],
+                          uint2 g [[threads_per_grid]]) {
+  dst[size_t(i.y) * g.x + i.x] = static_cast<bfloat16_t>(static_cast<float>(src[size_t(i.y) * row + i.x]));
+}
+
+// 4-bit affine weight, MLX format (w U32 [N, K / 8], 8 values per word from the low bits; scales / biases bf16
+// [N, K / 64]) -> fp16 [N, row]: scale * q + bias in float, as mx.dequantize before its bf16 rounding. Grid: (K / 8, N).
+[[kernel]] void dequant_q4(const device uint* w [[buffer(0)]], const device bfloat16_t* scales [[buffer(1)]],
+                           const device bfloat16_t* biases [[buffer(2)]], device half* dst [[buffer(3)]],
+                           constant uint& row [[buffer(4)]], uint2 i [[thread_position_in_grid]],
+                           uint2 g [[threads_per_grid]]) {
+  const size_t gi = size_t(i.y) * (g.x / 8) + i.x / 8;  // group of 64 = 8 words
+  const float s = static_cast<float>(scales[gi]), b = static_cast<float>(biases[gi]);
+  uint q = w[size_t(i.y) * g.x + i.x];
+  device half* d = dst + size_t(i.y) * row + i.x * 8;
+  for (int j = 0; j < 8; j++, q >>= 4) d[j] = static_cast<half>(s * float(q & 0xf) + b);
+}

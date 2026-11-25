@@ -7,6 +7,12 @@
 // row-major bf16 [n, C]; GPU attn then runs on the n valid tokens (ws.S = n) as usual. The residual x goes through
 // ws.x between blocks too, rounded to bf16 as in ane.py: keeping it fp16 on the ANE side drifted further from the
 // GPU path (worst state cos 0.99868 vs 0.99884 on golden chat/0; ane.py: 0.99884).
+//
+// weights "shared" (target-27b.md §5): no weight copy of the ANE's own. One model per block kind (previous layer's
+// kind, this layer's) and chunk size (ane.py build_shared: <cache>/ane/<model_key>/shared_S<S>/<kind>/), every
+// linear weight and norm gamma an input. inputs(i) also dequantizes block i's 4-bit weights from the GPU's copy into
+// fp16 weight surfaces (one set per chunk in flight); layout row-major [S, C], the workspace's. S is the largest
+// chunk size (512 and S are built); a chunk runs on the smallest that holds it.
 #pragma once
 #import <CoreML/CoreML.h>
 
@@ -21,7 +27,7 @@ namespace mllm {
 class AneOps {
 public:
     // Loads every block (compute units CPU + NE) and allocates its surfaces. Throws, naming the Python command that
-    // builds them, if a block is missing.
+    // builds them, if a block is missing. weights: fp16, int8, lut6, lut4 (baked into per-layer blocks) or shared.
     AneOps(GpuOps& gpu, Memory& mem, int S, const std::string& weights = "fp16");
 
     // set: which of the 2 surface sets (two chunks in flight, one set each; PrefillLane uses chunk parity).
@@ -43,6 +49,7 @@ public:
         Surface* surface[2];  // by set
     };
     struct Block {
+        int S;  // compiled chunk size
         MLModel* model;
         MLDictionaryFeatureProvider* in[2];  // by set
         MLPredictionOptions* opts[2];        // outputBackings: every output into its surface
@@ -50,7 +57,19 @@ public:
     };
     int S;
     std::string root;
-    std::vector<Block> blocks;  // one per layer: dense(L) never runs in prefill
+    std::vector<Block> blocks;  // one per layer: dense(L) never runs in prefill (shared: empty)
+    // shared: the blocks by (S, kind), the compiled sizes (ascending), and per layer what inputs(i) writes into the
+    // weight surfaces: a 4-bit weight (w) or a norm's bf16 gamma of dim values
+    bool shared = false;
+    std::map<std::pair<int, std::string>, Block> kinds;
+    std::vector<int> sizes;
+    struct Param {
+        const QLinear* w;
+        Buf gamma;
+        int dim;
+        Surface* surface[2];
+    };
+    std::vector<std::vector<Param>> params;
     std::map<std::string, Surface> surfaces[2];  // by name + channels, shared by the blocks (x_out: x as an output)
 
     // A copy of the engine's GpuOps (same pipelines and weights, no allocation) for the ANE lane's thread: GpuOps keeps
@@ -58,7 +77,10 @@ public:
     GpuOps gpu;
 
 private:
-    id<MTLComputePipelineState> from_ane_ps, to_ane_ps;
+    id<MTLComputePipelineState> from_ane_ps, to_ane_ps, from_rows_ps, to_rows_ps, dequant_ps;
+    std::vector<std::string> kind_of;  // shared: layer i's block kind
+    void load_shared(Memory& mem);
+    const Block& block(int i, int n) const;  // the block that runs layer i's dense on a chunk of n tokens
 };
 
 }  // namespace mllm
