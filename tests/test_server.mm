@@ -117,6 +117,9 @@ int main() {
     json d = json::parse(r->body);
     assert(d["choices"][0]["text"] == want && d["choices"][0]["finish_reason"] == finish &&
            d["usage"]["completion_tokens"] == completion);
+    printf("usage: ttft %.1f ms, %.1f tok/s\n", d["usage"]["ttft_ms"].get<double>(),
+           d["usage"]["tokens_per_second"].get<double>());
+    assert(d["usage"]["ttft_ms"] > 0 && d["usage"]["tokens_per_second"] > 0);
 
     // chat: the same tokens (generate templates the same message); reasoning is the text before "</think>"
     std::string want_reasoning = want, want_content;

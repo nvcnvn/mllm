@@ -8,7 +8,8 @@ So people can try it with the tools they already have. Every item ends in a **Ch
   *Done:* the reply's reasoning (the template opens `<think>`) comes as `reasoning_content`, the rest as `content`,
   the DeepSeek / vLLM / llama.cpp convention chat UIs read; text parts and `max_completion_tokens` accepted; no
   `max_tokens` = up to 4096 within max_ctx. tests/test_server covers both forms (same tokens as `generate`).
-  Open WebUI not tried.
+  openai-python passes (chat and completions, streamed and not, `stop`); `usage` adds `ttft_ms` and
+  `tokens_per_second`. Open WebUI not tried.
 - [x] `mmmllm chat MODEL`: interactive multi-turn chat in the terminal, engine in-process (like `mlx_lm.chat`,
   `ollama run`). History re-templated each turn; the prefix cache makes each turn prefill only the new message.
   **Check:** a second turn's prefill tokens = the new message's, not the whole history; Ctrl-C stops a reply, not

@@ -3,6 +3,7 @@
 #include <cpp-httplib/httplib.h>
 #include <nlohmann/json.hpp>
 
+#include <cmath>
 #include <cstdio>
 #include <ctime>
 #include <limits>
@@ -71,6 +72,7 @@ struct Server::Stream {
     std::vector<Message> messages;
     GenParams p;
     bool default_max = false;  // chat without max_tokens: up to 4096, within max_ctx
+    std::chrono::steady_clock::time_point t0 = std::chrono::steady_clock::now(), t_first, t_end;  // arrival, tokens
     Splitter split;  // engine thread only
     int id = -1;     // engine request id, set before started
 
@@ -181,10 +183,14 @@ void Server::handle(const httplib::Request& req, httplib::Response& res, bool ch
     const json head = {{"id", (chat ? "chatcmpl-" : "cmpl-") + std::to_string(s->id)},
                        {"object", chat ? (stream ? "chat.completion.chunk" : "chat.completion") : "text_completion"},
                        {"created", (long)std::time(nullptr)}, {"model", model}};
+    // OpenAI's fields, plus ttft_ms (arrival to first token) and tokens_per_second (after the first token)
     auto usage_json = [s] {
-        return json{{"prompt_tokens", s->prompt_tokens}, {"completion_tokens", s->completion_tokens},
-                    {"total_tokens", s->prompt_tokens + s->completion_tokens},
-                    {"prompt_tokens_details", {{"cached_tokens", s->cached}}}};
+        auto sec = [](auto d) { return std::chrono::duration<double>(d).count(); };
+        const int n = s->completion_tokens;
+        return json{{"prompt_tokens", s->prompt_tokens}, {"completion_tokens", n},
+                    {"total_tokens", s->prompt_tokens + n}, {"prompt_tokens_details", {{"cached_tokens", s->cached}}},
+                    {"ttft_ms", n ? std::round(sec(s->t_first - s->t0) * 1e4) / 10 : 0.0},
+                    {"tokens_per_second", n > 1 ? std::round((n - 1) / sec(s->t_end - s->t_first) * 10) / 10 : 0.0}};
     };
     auto choice = [chat](const std::string& text, bool reasoning, const json& finish) {
         if (!chat) return json{{"index", 0}, {"text", text}, {"logprobs", nullptr}, {"finish_reason", finish}};
@@ -355,14 +361,25 @@ void Server::loop() {
                                        : stopped || (ev.done && e.tok.eos.count(ev.token)) ? "stop"
                                        : ev.done                                           ? "length"
                                                                                            : "";
+            const auto now = std::chrono::steady_clock::now();
             s.put([&] {
-                s.completion_tokens += ev.token >= 0;
+                if (ev.token >= 0 && !s.completion_tokens++) s.t_first = now;
+                s.t_end = now;
                 s.cached = ev.cached;
                 for (auto& p : pieces) s.q.push_back(std::move(p));
                 s.finish = finish;
             });
             if (stopped && !ev.done) e.cancel(ev.req_id);
-            if (!finish.empty()) live.erase(it);
+            if (finish.empty()) continue;
+            {
+                std::lock_guard l(s.m);  // handler threads only read these
+                auto sec = [](auto d) { return std::chrono::duration<double>(d).count(); };
+                const int n = s.completion_tokens;
+                fprintf(stderr, "mllm serve: request %d: prompt %d tokens, %d cached, first token %.3f s; %d tokens at "
+                        "%.1f tok/s, %s\n", s.id, s.prompt_tokens, s.cached, n ? sec(s.t_first - s.t0) : 0.0, n,
+                        n > 1 ? (n - 1) / sec(s.t_end - s.t_first) : 0.0, finish.c_str());
+            }
+            live.erase(it);
         }
     }
 }

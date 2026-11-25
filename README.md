@@ -19,6 +19,8 @@ pip install mmmllm                                       # or install it; the co
 Repo ids download to the Hugging Face cache on first use. `serve` speaks the OpenAI API (`/v1/chat/completions`,
 `/v1/completions`, `/v1/models`; streamed or not, `stop` strings), so the openai clients and chat UIs work with
 `base_url="http://127.0.0.1:8080/v1"`. The model thinks first: chat replies carry that part as `reasoning_content`.
+`usage` adds `ttft_ms` (arrival to first token) and `tokens_per_second` (decode, after the first token); the server
+logs the same per request on stderr, and `chat` prints them after each reply.
 
 ```sh
 curl localhost:8080/v1/chat/completions -d '{"messages": [{"role": "user", "content": "Hi!"}]}'
