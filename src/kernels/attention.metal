@@ -162,6 +162,24 @@ template <typename T, int D>
   }
 }
 
+// This lane's share of q . k (k prefetched into registers), summed left to right; simd_sum finishes it.
+template <int N, typename T>
+static inline float partial_qk(thread const float* q, thread const T* k) {
+  float score = 0;
+  for (int j = 0; j < N; j++) {
+    score += q[j] * static_cast<float>(k[j]);
+  }
+  return score;
+}
+
+// o = o * factor + exp_score * v over this lane's share (v prefetched into registers).
+template <int N, typename T>
+static inline void rescale_add_v(thread float* o, float factor, float exp_score, thread const T* v) {
+  for (int j = 0; j < N; j++) {
+    o[j] = o[j] * factor + exp_score * static_cast<float>(v[j]);
+  }
+}
+
 // sdpa_vector_2pass_1, no mask / sinks, causal always applied. blocks is MLX's function constant 26, passed here as
 // n_blocks. Grid (Hkv, B, n_blocks), threadgroup (32, gqa, S). Partials [B, H, S, n_blocks, D]; sums, maxs fp32
 // [B, H, S, n_blocks]. MLX's sdpa_vector_2pass_2 (verbatim) reduces them.
@@ -250,10 +268,7 @@ template <typename T, int D, int TK>
       int ii = i + t * blocks;
       bool use_key = ii <= (N - q_seq_len + int(q_seq_idx));
       if (use_key) {
-        U score = 0;
-        for (int j = 0; j < qk_per_thread; j++) {
-          score += q[j] * static_cast<U>(k_reg[t][j]);
-        }
+        U score = partial_qk<qk_per_thread>(q, k_reg[t]);
         score = simd_sum(score);
 
         U new_max = max(max_score, score);
@@ -261,9 +276,7 @@ template <typename T, int D, int TK>
         U exp_score = fast::exp(score - new_max);
         max_score = new_max;
         sum_exp_score = sum_exp_score * factor + exp_score;
-        for (int j = 0; j < v_per_thread; j++) {
-          o[j] = o[j] * factor + exp_score * static_cast<U>(v_reg[t][j]);
-        }
+        rescale_add_v<v_per_thread>(o, factor, exp_score, v_reg[t]);
       }
     }
   }

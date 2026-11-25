@@ -1,18 +1,15 @@
-// AneOps: dense(i) as one Core ML model per dense block, run on the Neural Engine (py/mllm/ane.py). Prefill only:
-// each block is compiled for a static chunk of S tokens; a shorter chunk is zero-padded. The models are built and
-// cached by Python only (ane.py _build): <cache>/ane/<model_key>/S<S>_<weights>/dense_<iii>/{model.mlmodelc, io.json}.
+// AneOps: GpuOps::apply_weights on the Neural Engine with no weight copy of its own (target-27b.md §5). Prefill only.
 //
-// Every block input and output is an IOSurface (Memory::surface), fp16 channels-first (1, C, 1, S) (q / k:
-// (1, H, D, S), the same bytes as [C = H * D, S]). Two GPU kernels move data between them and the workspace's
-// row-major bf16 [n, C]; GPU attn then runs on the n valid tokens (ws.S = n) as usual. The residual x goes through
-// ws.x between blocks too, rounded to bf16 as in ane.py: keeping it fp16 on the ANE side drifted further from the
-// GPU path (worst state cos 0.99868 vs 0.99884 on golden chat/0; ane.py: 0.99884).
+// One Core ML model ("block") per block kind (the previous layer's kind, this layer's: none_linear, linear_full, ...)
+// and chunk size, built by Python (ane.py build: <cache>/ane/<model_key>/shared_S<chunk size>/<kind>/{model.mlmodelc,
+// io.json}). Every weight matrix and norm scale is a model input: prepare_inputs(layer) dequantizes that layer's block's
+// 4-bit weights from the GPU's copy into fp16 weight surfaces (one set per chunk in flight, ~0.9 GB a set at 27B) next
+// to the block's activations. Every input and output is an IOSurface (Memory::surface), fp16 row-major [rows, cols]
+// like the workspace's bf16 [tokens, cols]. S is the largest chunk size (512 and S are built); a chunk runs on the
+// smallest block that holds it, zero-padded.
 //
-// weights "shared" (target-27b.md §5): no weight copy of the ANE's own. One model per block kind (previous layer's
-// kind, this layer's) and chunk size (ane.py build_shared: <cache>/ane/<model_key>/shared_S<S>/<kind>/), every
-// linear weight and norm gamma an input. inputs(i) also dequantizes block i's 4-bit weights from the GPU's copy into
-// fp16 weight surfaces (one set per chunk in flight); layout row-major [S, C], the workspace's. S is the largest
-// chunk size (512 and S are built); a chunk runs on the smallest that holds it.
+// The residual goes through ws.residual (bf16) between blocks: keeping it fp16 on the ANE side drifted further from the
+// GPU path (worst state cos 0.99868 vs 0.99884 on golden chat/0 with the earlier baked-weight blocks).
 #pragma once
 #import <CoreML/CoreML.h>
 
@@ -26,61 +23,70 @@ namespace mllm {
 
 class AneOps {
 public:
-    // Loads every block (compute units CPU + NE) and allocates its surfaces. Throws, naming the Python command that
-    // builds them, if a block is missing. weights: fp16, int8, lut6, lut4 (baked into per-layer blocks) or shared.
-    AneOps(GpuOps& gpu, Memory& mem, int S, const std::string& weights = "shared");
+    // Loads every block (compute units CPU + Neural Engine) and allocates its surfaces. Throws, naming the Python
+    // command that builds them, if a block is missing.
+    AneOps(GpuOps& engine_gpu, Memory& memory, int chunk_size);
 
     // set: which of the 2 surface sets (two chunks in flight, one set each; PrefillLane uses chunk parity).
-    // Encode into ws.enc: block i's inputs (ws.x, and ws.o for i > 0) into its surfaces, zero past ws.S tokens.
-    // i = 0 first embeds ws.tokens into ws.x.
-    void inputs(int i, Workspace& ws, int set);
-    // Runs block i on the ANE (blocks the thread until done; its inputs must be on the surfaces, i.e. the command
-    // buffer that encoded inputs(i) completed), then encodes into ws.enc its outputs' first ws.S tokens -> ws.x and
-    // ws.q / k / v / gate or ws.qkv / z / b / a.
-    void dense(int i, Workspace& ws, int set);
+    // Encodes into ws.encoder: the layer's block inputs (ws.residual, and ws.attention_result for layer > 0) into its
+    // surfaces, zero past ws.tokens_per_request tokens, and its weights and norm scales into the set's weight surfaces.
+    // Layer 0 first looks up ws.token_ids' embeddings into ws.residual.
+    void prepare_inputs(int layer, Workspace& ws, int set);
+    // Runs the layer's block on the ANE (blocks the thread until done; its inputs must be on the surfaces, i.e. the
+    // command buffer that encoded prepare_inputs(layer) completed), then encodes into ws.encoder the copy of its
+    // outputs' first ws.tokens_per_request tokens -> ws.residual and ws.query / key / value / query_gate (full
+    // attention) or ws.query_key_value / output_gate / update_rate_input / decay_input (linear attention).
+    void apply_weights(int layer, Workspace& ws, int set);
 
     struct Surface {
-        Memory::Surface s;
-        MLMultiArray* array;  // over s.pixel_buffer, in the model's shape
-        int C;                // channels (rows of the surface)
+        Memory::Surface backing;  // the IOSurface and its Metal buffer
+        MLMultiArray* array;      // over backing.pixel_buffer, [rows, cols]
+        int cols;
     };
-    struct Io {
+    // A block input or output that is copied from / to a workspace field
+    struct Activation {
         id<MTLBuffer> Workspace::*field;
         Surface* surface[2];  // by set
     };
     struct Block {
-        int S;  // compiled chunk size
+        int chunk_size;  // compiled chunk size
         MLModel* model;
-        MLDictionaryFeatureProvider* in[2];  // by set
-        MLPredictionOptions* opts[2];        // outputBackings: every output into its surface
-        std::vector<Io> ins, outs;           // the ones converted from / to the workspace
+        MLDictionaryFeatureProvider* input_features[2];  // by set
+        MLPredictionOptions* prediction_options[2];      // outputBackings: every output into its surface
+        std::vector<Activation> inputs_from_workspace, outputs_to_workspace;
     };
-    int S;
-    std::string root;
-    std::vector<Block> blocks;  // one per layer: dense(L) never runs in prefill (shared: empty)
-    // shared: the blocks by (S, kind), the compiled sizes (ascending), and per layer what inputs(i) writes into the
-    // weight surfaces: a 4-bit weight (w) or a norm's bf16 gamma of dim values
-    bool shared = false;
-    std::map<std::pair<int, std::string>, Block> kinds;
-    std::vector<int> sizes;
-    struct Param {
-        const QLinear* w;
-        Buf gamma;
-        int dim;
-        Surface* surface[2];
+    // What prepare_inputs(layer) writes into a weight surface: a 4-bit weight matrix, or (weights == nullptr) a norm's
+    // bf16 scale of norm_size values
+    struct WeightInput {
+        const QuantizedWeights* weights;
+        Buf norm_scale;
+        int norm_size;
+        Surface* surface[2];  // by set
     };
-    std::vector<std::vector<Param>> params;
-    std::map<std::string, Surface> surfaces[2];  // by name + channels, shared by the blocks (x_out: x as an output)
+    int S;                         // the largest compiled chunk size
+    std::vector<int> chunk_sizes;  // compiled chunk sizes, ascending
+    std::string root;              // the blocks' directory for chunk size S
+    std::map<std::pair<int, std::string>, Block> blocks;  // by (chunk size, kind)
+    std::vector<std::vector<WeightInput>> weight_inputs;  // per layer
+    // activations by name and chunk size, weights / norm scales by name and shape (shared by every chunk size)
+    std::map<std::string, Surface> surfaces[2];
+    const Block& block(int layer, int tokens) const;  // the block that runs `layer` on a chunk of `tokens` tokens
 
     // A copy of the engine's GpuOps (same pipelines and weights, no allocation) for the ANE lane's thread: GpuOps keeps
     // the encoder it is encoding into in members, so decode on the engine thread and prefill here can't share one.
     GpuOps gpu;
 
 private:
-    id<MTLComputePipelineState> from_ane_ps, to_ane_ps, from_rows_ps, to_rows_ps, dequant_ps;
-    std::vector<std::string> kind_of;  // shared: layer i's block kind
-    void load_shared(Memory& mem);
-    const Block& block(int i, int n) const;  // the block that runs layer i's dense on a chunk of n tokens
+    id<MTLComputePipelineState> copy_from_surface_pipeline;  // kernel "from_rows": fp16 surface -> bf16 workspace
+    id<MTLComputePipelineState> copy_to_surface_pipeline;    // kernel "to_rows": bf16 workspace -> fp16 surface
+    id<MTLComputePipelineState> dequantize_pipeline;         // kernel "dequant_q4": 4-bit weights -> fp16 surface
+    std::vector<std::string> block_kind;                     // per layer
+
+    Surface* find_or_make_surface(Memory& memory, int set, const std::string& key, int rows, int cols);
+    Block load_block(Memory& memory, const std::string& dir, int chunk_size, MLModelConfiguration* config);
+    std::vector<WeightInput> layer_weight_inputs(int layer, const ModelSpec& model);
+    void copy_to_surface(Workspace& ws, Buf source, const Surface& target, uint32_t tokens, int rows);
+    void dequantize_to_surface(Workspace& ws, const QuantizedWeights& weights, const Surface& target);
 };
 
 }  // namespace mllm

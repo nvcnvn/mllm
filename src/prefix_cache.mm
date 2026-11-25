@@ -5,80 +5,82 @@
 
 namespace mllm {
 
-uint64_t PrefixCache::hash(uint64_t prev, const int* page) const {  // FNV-1a over prev, then the page's ids
-    uint64_t h = ROOT;
-    auto mix = [&](const void* p, size_t n) {
-        for (size_t i = 0; i < n; i++) h = (h ^ ((const uint8_t*)p)[i]) * 1099511628211ull;
+uint64_t PrefixCache::hash(uint64_t parent_hash, const int* page) const {  // FNV-1a over the parent, then the page's ids
+    uint64_t result = ROOT_HASH;
+    auto mix = [&](const void* bytes, size_t byte_count) {
+        for (size_t i = 0; i < byte_count; i++) result = (result ^ ((const uint8_t*)bytes)[i]) * 1099511628211ull;
     };
-    mix(&prev, 8);
-    mix(page, T * sizeof(int));
-    return h;
+    mix(&parent_hash, 8);
+    mix(page, page_tokens * sizeof(int));
+    return result;
 }
 
-const PrefixCache::Node* PrefixCache::find(uint64_t prev, const int* page, uint64_t& h) const {
-    h = hash(prev, page);
-    auto it = nodes.find(h);
-    if (it == nodes.end() || it->second.parent != prev || !std::equal(page, page + T, it->second.tokens.begin()))
+const PrefixCache::Node* PrefixCache::find(uint64_t parent_hash, const int* page, uint64_t& page_hash) const {
+    page_hash = hash(parent_hash, page);
+    auto it = nodes.find(page_hash);
+    if (it == nodes.end() || it->second.parent != parent_hash ||
+        !std::equal(page, page + page_tokens, it->second.tokens.begin()))
         return nullptr;
     return &it->second;
 }
 
-PrefixCache::Match PrefixCache::match(const std::vector<int>& ids) {
-    Match m;
-    tick++;
-    const int n = ids.empty() ? 0 : ((int)ids.size() - 1) / T;
-    uint64_t prev = ROOT, h;
-    for (int i = 0; i < n; i++, prev = h) {
-        const Node* node = find(prev, ids.data() + i * T, h);
+PrefixCache::Match PrefixCache::match(const std::vector<int>& prompt) {
+    Match found;
+    use_clock++;
+    const int full_pages = prompt.empty() ? 0 : ((int)prompt.size() - 1) / page_tokens;
+    uint64_t parent_hash = ROOT_HASH, page_hash;
+    for (int i = 0; i < full_pages; i++, parent_hash = page_hash) {
+        const Node* node = find(parent_hash, prompt.data() + i * page_tokens, page_hash);
         if (!node) break;
-        nodes.at(h).used = tick;
-        m.L = i + 1;
-        m.pages.push_back(node->unit);
-        if (!node->snapshot.empty()) m.S = m.L, m.snapshot = node->snapshot;
+        nodes.at(page_hash).last_used = use_clock;
+        found.matched_pages = i + 1;
+        found.pages.push_back(node->unit);
+        if (!node->snapshot.empty()) found.resume_pages = found.matched_pages, found.snapshot = node->snapshot;
     }
-    m.pages.resize(m.S);
-    return m;
+    found.pages.resize(found.resume_pages);
+    return found;
 }
 
-bool PrefixCache::has_snapshot(const std::vector<int>& ids, int n_pages) const {
-    uint64_t prev = ROOT, h;
+bool PrefixCache::has_snapshot(const std::vector<int>& prompt, int page_count) const {
+    uint64_t parent_hash = ROOT_HASH, page_hash;
     const Node* node = nullptr;
-    for (int i = 0; i < n_pages; i++, prev = h)
-        if (!(node = find(prev, ids.data() + i * T, h))) return false;
+    for (int i = 0; i < page_count; i++, parent_hash = page_hash)
+        if (!(node = find(parent_hash, prompt.data() + i * page_tokens, page_hash))) return false;
     return node && !node->snapshot.empty();
 }
 
-void PrefixCache::insert(const std::vector<int>& ids, int n_pages, const std::vector<uint32_t>& pages,
+void PrefixCache::insert(const std::vector<int>& prompt, int page_count, const std::vector<uint32_t>& pages,
                          const std::vector<uint32_t>& snapshot) {
-    assert(n_pages > 0 && n_pages * T <= (int)ids.size() && (int)pages.size() >= n_pages);
-    tick++;
-    uint64_t prev = ROOT, h = 0;
-    for (int i = 0; i < n_pages; i++, prev = h) {
-        const int* page = ids.data() + i * T;
-        if (!find(prev, page, h)) {
-            if (nodes.count(h)) return;  // ponytail: a collision; the page (and all below it) stays uncached
-            nodes.emplace(h, Node{prev, std::vector<int>(page, page + T), pages[i], {}});
+    assert(page_count > 0 && page_count * page_tokens <= (int)prompt.size() && (int)pages.size() >= page_count);
+    use_clock++;
+    uint64_t parent_hash = ROOT_HASH, page_hash = 0;
+    for (int i = 0; i < page_count; i++, parent_hash = page_hash) {
+        const int* page = prompt.data() + i * page_tokens;
+        if (!find(parent_hash, page, page_hash)) {
+            if (nodes.count(page_hash)) return;  // ponytail: a collision; the page (and all below it) stays uncached
+            nodes.emplace(page_hash, Node{parent_hash, std::vector<int>(page, page + page_tokens), pages[i], {}});
             arena.cache_ref(pages[i]);
-            if (prev != ROOT) nodes.at(prev).children++;
+            if (parent_hash != ROOT_HASH) nodes.at(parent_hash).children++;
         }
-        nodes.at(h).used = tick;
+        nodes.at(page_hash).last_used = use_clock;
     }
-    Node& last = nodes.at(h);
+    Node& last = nodes.at(page_hash);
     if (!last.snapshot.empty()) return;
     last.snapshot = snapshot;
-    for (uint32_t u : snapshot) arena.cache_ref(u);
+    for (uint32_t unit : snapshot) arena.cache_ref(unit);
 }
 
 bool PrefixCache::evict() {
     // ponytail: an O(nodes) scan per victim; a heap of leaves if admit's eviction loop shows up in profiles
     auto victim = nodes.end();
     for (auto it = nodes.begin(); it != nodes.end(); ++it)
-        if (!it->second.children && (victim == nodes.end() || it->second.used < victim->second.used)) victim = it;
+        if (!it->second.children && (victim == nodes.end() || it->second.last_used < victim->second.last_used))
+            victim = it;
     if (victim == nodes.end()) return false;
-    const Node& v = victim->second;
-    arena.cache_release(v.unit);
-    for (uint32_t u : v.snapshot) arena.cache_release(u);
-    if (v.parent != ROOT) nodes.at(v.parent).children--;
+    const Node& node = victim->second;
+    arena.cache_release(node.unit);
+    for (uint32_t unit : node.snapshot) arena.cache_release(unit);
+    if (node.parent != ROOT_HASH) nodes.at(node.parent).children--;
     nodes.erase(victim);
     return true;
 }

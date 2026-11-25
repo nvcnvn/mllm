@@ -15,13 +15,24 @@ namespace mllm {
 
 using json = nlohmann::json;
 
+static double seconds(std::chrono::steady_clock::duration duration) {
+    return std::chrono::duration<double>(duration).count();
+}
+
+// The longest k > at_least (else at_least) such that text's last k bytes are marker's first k; k < marker's size
+static size_t marker_start_at_end(const std::string& text, const std::string& marker, size_t at_least) {
+    for (size_t k = std::min(marker.size() - 1, text.size()); k > at_least; k--)
+        if (text.compare(text.size() - k, k, marker, 0, k) == 0) return k;
+    return at_least;
+}
+
 // Generated text with the markers cut out: stop strings end it, and for chat "</think>" ends the reasoning (the
 // template opens "<think>\n", so a reply starts inside it). A tail that could be the start of a marker waits for the
 // next text. Engine thread only.
 struct Splitter {
     std::vector<std::string> stops;
-    bool reasoning = false;  // chat: text so far is reasoning_content
-    bool content = false;    // any content emitted (its leading newlines are dropped)
+    bool reasoning = false;        // chat: text so far is reasoning_content
+    bool content_started = false;  // any content emitted (its leading newlines are dropped)
     std::string held;
 
     struct Piece {
@@ -29,38 +40,34 @@ struct Splitter {
         bool reasoning;
     };
     // the text to emit now; stopped = a stop string was found (it and the rest are dropped)
-    std::vector<Piece> push(const std::string& t, bool flush, bool& stopped) {
+    std::vector<Piece> push(const std::string& text, bool flush, bool& stopped) {
         std::vector<Piece> out;
-        held += t;
-        auto put = [&](std::string s) {
-            if (!reasoning && !content) s.erase(0, s.find_first_not_of('\n'));  // npos clears
-            if (s.empty()) return;
-            content |= !reasoning;
-            out.push_back({std::move(s), reasoning});
+        held += text;
+        auto emit = [&](std::string piece) {
+            if (!reasoning && !content_started) piece.erase(0, piece.find_first_not_of('\n'));  // npos clears
+            if (piece.empty()) return;
+            content_started |= !reasoning;
+            out.push_back({std::move(piece), reasoning});
         };
-        for (;;) {
-            size_t at = std::string::npos, len = 0;
-            bool think = false;
-            for (const std::string& m : stops)
-                if (size_t i = held.find(m); i < at) at = i, len = m.size();
+        for (;;) {  // the first marker in held: emit the text before it, then end (stop) or switch to content
+            size_t marker_at = std::string::npos, marker_size = 0;
+            bool think_end = false;
+            for (const std::string& stop : stops)
+                if (size_t at = held.find(stop); at < marker_at) marker_at = at, marker_size = stop.size();
             if (reasoning)
-                if (size_t i = held.find("</think>"); i < at) at = i, len = 8, think = true;
-            if (at == std::string::npos) break;
-            put(held.substr(0, at));
-            held.erase(0, at + len);
-            if (!think) return stopped = true, held.clear(), out;
+                if (size_t at = held.find("</think>"); at < marker_at) marker_at = at, marker_size = 8, think_end = true;
+            if (marker_at == std::string::npos) break;
+            emit(held.substr(0, marker_at));
+            held.erase(0, marker_at + marker_size);
+            if (!think_end) return stopped = true, held.clear(), out;
             reasoning = false;
         }
         size_t keep = 0;  // the longest tail that is a proper prefix of a marker
         if (!flush) {
-            auto tail = [&](const std::string& m) {
-                for (size_t k = std::min(m.size() - 1, held.size()); k > keep; k--)
-                    if (held.compare(held.size() - k, k, m, 0, k) == 0) return (void)(keep = k);
-            };
-            for (const std::string& m : stops) tail(m);
-            if (reasoning) tail("</think>");
+            for (const std::string& stop : stops) keep = marker_start_at_end(held, stop, keep);
+            if (reasoning) keep = marker_start_at_end(held, "</think>", keep);
         }
-        put(held.substr(0, held.size() - keep));
+        emit(held.substr(0, held.size() - keep));
         held.erase(0, held.size() - keep);
         return out;
     }
@@ -70,233 +77,264 @@ struct Server::Stream {
     bool chat = false;
     std::string prompt;
     std::vector<Message> messages;
-    GenParams p;
-    bool default_max = false;  // chat without max_tokens: up to 4096, within max_ctx
-    std::chrono::steady_clock::time_point t0 = std::chrono::steady_clock::now(), t_first, t_end;  // arrival, tokens
-    Splitter split;  // engine thread only
-    int id = -1;     // engine request id, set before started
+    GenParams params;
+    bool default_max_tokens = false;  // chat without max_tokens: up to 4096, within max_ctx
+    std::chrono::steady_clock::time_point arrived = std::chrono::steady_clock::now(), first_token_at, last_token_at;
+    Splitter splitter;    // engine thread only
+    int request_id = -1;  // engine request id, set before started
 
-    std::mutex m;  // guards the rest
-    std::condition_variable cv;
+    std::mutex mutex;  // guards the rest
+    std::condition_variable changed;
     bool started = false;  // submitted (prompt_tokens set) or rejected (error set)
-    int prompt_tokens = 0, completion_tokens = 0, cached = 0;
+    int prompt_tokens = 0, completion_tokens = 0, cached_tokens = 0;
     std::string error;
-    std::deque<Splitter::Piece> q;
-    std::string finish;  // set last: stop | length | error
+    std::deque<Splitter::Piece> pieces;
+    std::string finish_reason;  // set last: stop | length | error
 
-    void put(auto&& f) {
+    void update(auto&& change) {
         {
-            std::lock_guard l(m);
-            f();
+            std::lock_guard lock(mutex);
+            change();
         }
-        cv.notify_one();
+        changed.notify_one();
     }
 };
 
-static std::string dump(const json& j) { return j.dump(-1, ' ', false, json::error_handler_t::replace); }
+static std::string dump(const json& value) { return value.dump(-1, ' ', false, json::error_handler_t::replace); }
 
 // prompt bytes: the engine thread tokenizes (~170 ms per MB), stalling every stream meanwhile; max_ctx 16384 tokens
 // of text is well under this
-constexpr size_t MAX_BODY = 1 << 20;
+constexpr size_t MAX_BODY_BYTES = 1 << 20;
 
-static void fail(httplib::Response& res, int status, const std::string& msg) {
-    res.status = status;
-    res.set_content(dump({{"error", {{"message", msg}, {"type", "invalid_request_error"}}}}), "application/json");
+static void send_error(httplib::Response& response, int status, const std::string& message) {
+    response.status = status;
+    response.set_content(dump({{"error", {{"message", message}, {"type", "invalid_request_error"}}}}), "application/json");
 }
 
-// The request's fields into s; an error message, or "" when it is fine. null = absent (as openai-python sends).
-// ponytail: other fields (n, echo, logprobs, tools, ...) are ignored, not rejected.
-static std::string parse(json& j, Server::Stream& s, bool& stream, bool& usage) {
-    if (!j.is_object()) return "need a JSON object";
-    for (auto it = j.begin(); it != j.end();) it = it->is_null() ? j.erase(it) : std::next(it);
-    if (!s.chat && !(j.contains("prompt") && j["prompt"].is_string())) return "need a string prompt";
-    if (s.chat) {
-        if (!(j.contains("messages") && j["messages"].is_array())) return "need a messages array";
-        for (const json& m : j["messages"]) {
-            if (!(m.is_object() && m.contains("role") && m["role"].is_string())) return "messages: need a role";
-            std::string text;  // a string, or an array of text parts
-            const json c = m.value("content", json(""));
-            if (c.is_string()) text = c;
-            else if (c.is_array())
-                for (const json& part : c) {
-                    if (!(part.is_object() && part.value("type", "") == "text" && part.contains("text") &&
-                          part["text"].is_string()))
-                        return "messages: content parts must be text";
-                    text += part["text"].get<std::string>();
-                }
-            else if (!c.is_null()) return "messages: content must be a string or text parts";
-            s.messages.push_back({m["role"], text});
-        }
+// A message's content (a string, or an array of text parts) -> text; an error message, or "" when it is fine
+static std::string message_text(const json& content, std::string& text) {
+    if (content.is_string()) {
+        text = content;
+        return "";
     }
-    const char* max_key = j.contains("max_completion_tokens") ? "max_completion_tokens" : "max_tokens";
-    if (j.contains(max_key) &&
-        !(j[max_key].is_number_integer() && j[max_key] >= 1 && j[max_key] <= std::numeric_limits<int>::max()))
-        return std::string(max_key) + ": need an integer >= 1";
-    for (const char* k : {"temperature", "top_p"})
-        if (j.contains(k) && !j[k].is_number()) return std::string(k) + ": need a number";
-    if (j.contains("stop")) {
-        json st = j["stop"].is_string() ? json::array({j["stop"]}) : j["stop"];
-        if (!st.is_array() || st.size() > 4) return "stop: need a string or up to 4 strings";
-        for (const json& x : st) {
-            if (!x.is_string() || x.get<std::string>().empty()) return "stop: need non-empty strings";
-            s.split.stops.push_back(x);
-        }
+    if (content.is_null()) return "";
+    if (!content.is_array()) return "messages: content must be a string or text parts";
+    for (const json& part : content) {
+        if (!(part.is_object() && part.value("type", "") == "text" && part.contains("text") && part["text"].is_string()))
+            return "messages: content parts must be text";
+        text += part["text"].get<std::string>();
     }
-    if (!s.chat) s.prompt = j["prompt"];
-    s.default_max = s.chat && !j.contains(max_key);
-    s.p = {(int)j.value(max_key, (int64_t)256), j.value("temperature", 0.0f), j.value("top_p", 0.0f)};
-    s.split.reasoning = s.chat;
-    stream = j.value("stream", false);
-    const json opts = j.value("stream_options", json::object());
-    usage = opts.is_object() && opts.value("include_usage", false);
     return "";
 }
 
-void Server::handle(const httplib::Request& req, httplib::Response& res, bool chat) {
-    auto s = std::make_shared<Stream>();
-    s->chat = chat;
-    bool stream = false, usage = false;
-    try {
-        json j = json::parse(req.body);
-        if (std::string err = parse(j, *s, stream, usage); !err.empty()) return fail(res, 400, err);
-    } catch (const json::exception& x) {
-        return fail(res, 400, x.what());
-    }
-    {
-        std::lock_guard l(m);
-        if (stopping) return fail(res, 503, "shutting down");
-        jobs.push_back(s);
-    }
-    cv.notify_one();
-    {
-        std::unique_lock l(s->m);
-        s->cv.wait(l, [&] { return s->started; });
-        if (!s->error.empty()) return fail(res, 400, s->error);
-    }
-    auto cancel = [this, s] {
-        {
-            std::lock_guard l(m);
-            cancels.push_back(s);
+// The request's fields into stream; an error message, or "" when it is fine. null = absent (as openai-python sends).
+// ponytail: other fields (n, echo, logprobs, tools, ...) are ignored, not rejected.
+static std::string parse_request(json& body, Server::Stream& stream, bool& streamed, bool& include_usage) {
+    if (!body.is_object()) return "need a JSON object";
+    for (auto field = body.begin(); field != body.end();) field = field->is_null() ? body.erase(field) : std::next(field);
+    if (!stream.chat && !(body.contains("prompt") && body["prompt"].is_string())) return "need a string prompt";
+    if (stream.chat) {
+        if (!(body.contains("messages") && body["messages"].is_array())) return "need a messages array";
+        for (const json& message : body["messages"]) {
+            if (!(message.is_object() && message.contains("role") && message["role"].is_string()))
+                return "messages: need a role";
+            std::string text;
+            if (std::string err = message_text(message.value("content", json("")), text); !err.empty()) return err;
+            stream.messages.push_back({message["role"], text});
         }
-        cv.notify_one();
-    };
-    const json head = {{"id", (chat ? "chatcmpl-" : "cmpl-") + std::to_string(s->id)},
-                       {"object", chat ? (stream ? "chat.completion.chunk" : "chat.completion") : "text_completion"},
-                       {"created", (long)std::time(nullptr)}, {"model", model}};
-    // OpenAI's fields, plus ttft_ms (arrival to first token) and tokens_per_second (after the first token)
-    auto usage_json = [s] {
-        auto sec = [](auto d) { return std::chrono::duration<double>(d).count(); };
-        const int n = s->completion_tokens;
-        return json{{"prompt_tokens", s->prompt_tokens}, {"completion_tokens", n},
-                    {"total_tokens", s->prompt_tokens + n}, {"prompt_tokens_details", {{"cached_tokens", s->cached}}},
-                    {"ttft_ms", n ? std::round(sec(s->t_first - s->t0) * 1e4) / 10 : 0.0},
-                    {"tokens_per_second", n > 1 ? std::round((n - 1) / sec(s->t_end - s->t_first) * 10) / 10 : 0.0}};
-    };
-    auto choice = [chat](const std::string& text, bool reasoning, const json& finish) {
-        if (!chat) return json{{"index", 0}, {"text", text}, {"logprobs", nullptr}, {"finish_reason", finish}};
-        json delta = json::object();
-        if (!text.empty()) delta[reasoning ? "reasoning_content" : "content"] = text;
-        return json{{"index", 0}, {"delta", delta}, {"logprobs", nullptr}, {"finish_reason", finish}};
-    };
+    }
+    const char* max_key = body.contains("max_completion_tokens") ? "max_completion_tokens" : "max_tokens";
+    if (body.contains(max_key) &&
+        !(body[max_key].is_number_integer() && body[max_key] >= 1 && body[max_key] <= std::numeric_limits<int>::max()))
+        return std::string(max_key) + ": need an integer >= 1";
+    for (const char* key : {"temperature", "top_p"})
+        if (body.contains(key) && !body[key].is_number()) return std::string(key) + ": need a number";
+    if (body.contains("stop")) {
+        json stops = body["stop"].is_string() ? json::array({body["stop"]}) : body["stop"];
+        if (!stops.is_array() || stops.size() > 4) return "stop: need a string or up to 4 strings";
+        for (const json& stop : stops) {
+            if (!stop.is_string() || stop.get<std::string>().empty()) return "stop: need non-empty strings";
+            stream.splitter.stops.push_back(stop);
+        }
+    }
+    if (!stream.chat) stream.prompt = body["prompt"];
+    stream.default_max_tokens = stream.chat && !body.contains(max_key);
+    stream.params = {(int)body.value(max_key, (int64_t)256), body.value("temperature", 0.0f), body.value("top_p", 0.0f)};
+    stream.splitter.reasoning = stream.chat;
+    streamed = body.value("stream", false);
+    const json options = body.value("stream_options", json::object());
+    include_usage = options.is_object() && options.value("include_usage", false);
+    return "";
+}
 
-    if (!stream) {
+// OpenAI's fields, plus ttft_ms (arrival to first token) and tokens_per_second (after the first token)
+static json usage_json(const Server::Stream& stream) {
+    const int tokens = stream.completion_tokens;
+    return json{{"prompt_tokens", stream.prompt_tokens},
+                {"completion_tokens", tokens},
+                {"total_tokens", stream.prompt_tokens + tokens},
+                {"prompt_tokens_details", {{"cached_tokens", stream.cached_tokens}}},
+                {"ttft_ms", tokens ? std::round(seconds(stream.first_token_at - stream.arrived) * 1e4) / 10 : 0.0},
+                {"tokens_per_second",
+                 tokens > 1 ? std::round((tokens - 1) / seconds(stream.last_token_at - stream.first_token_at) * 10) / 10
+                            : 0.0}};
+}
+
+// One streamed choice: text (completions) or a content / reasoning_content delta (chat)
+static json choice_json(bool chat, const std::string& text, bool reasoning, const json& finish_reason) {
+    if (!chat) return json{{"index", 0}, {"text", text}, {"logprobs", nullptr}, {"finish_reason", finish_reason}};
+    json delta = json::object();
+    if (!text.empty()) delta[reasoning ? "reasoning_content" : "content"] = text;
+    return json{{"index", 0}, {"delta", delta}, {"logprobs", nullptr}, {"finish_reason", finish_reason}};
+}
+
+// One call of the streamed reply's content provider: sends what the stream has (the role first, for chat), then the
+// finish and usage chunks and [DONE] once it is finished. false: the client went away.
+static bool send_stream_events(Server::Stream& stream, const json& head, bool chat, bool include_usage, bool& role_sent,
+                               httplib::DataSink& sink) {
+    std::deque<Splitter::Piece> pieces;
+    std::string finish_reason;
+    {
+        // wake every 100 ms with nothing to send: httplib checks the peer between calls, so a client
+        // that hung up before its first token is cancelled now, not when that token comes
+        std::unique_lock lock(stream.mutex);
+        if (!stream.changed.wait_for(lock, std::chrono::milliseconds(100),
+                                     [&] { return !stream.pieces.empty() || !stream.finish_reason.empty(); }))
+            return true;
+        pieces.swap(stream.pieces);
+        finish_reason = stream.finish_reason;
+    }
+    auto send = [&](const json& chunk) {
+        const std::string line = "data: " + dump(chunk) + "\n\n";
+        return sink.write(line.data(), line.size());
+    };
+    if (chat && !std::exchange(role_sent, true)) {  // OpenAI's first chunk: the role
+        json chunk = head;
+        chunk["choices"] = {{{"index", 0}, {"delta", {{"role", "assistant"}, {"content", ""}}},
+                             {"logprobs", nullptr}, {"finish_reason", nullptr}}};
+        if (!send(chunk)) return false;
+    }
+    for (const auto& [text, reasoning] : pieces) {
+        json chunk = head;
+        chunk["choices"] = {choice_json(chat, text, reasoning, nullptr)};
+        if (!send(chunk)) return false;
+    }
+    if (finish_reason.empty()) return true;
+    json chunk = head;
+    if (finish_reason == "error") chunk["error"] = {{"message", "aborted: a lane failed"}};
+    else chunk["choices"] = {choice_json(chat, "", false, finish_reason)};
+    if (!send(chunk)) return false;
+    if (include_usage) {
+        chunk = head;
+        chunk["choices"] = json::array();
+        chunk["usage"] = usage_json(stream);
+        if (!send(chunk)) return false;
+    }
+    const std::string end = "data: [DONE]\n\n";
+    if (!sink.write(end.data(), end.size())) return false;
+    sink.done();
+    return true;
+}
+
+void Server::queue_cancel(const std::shared_ptr<Stream>& stream) {
+    {
+        std::lock_guard lock(mutex);
+        cancelled_streams.push_back(stream);
+    }
+    wake_engine.notify_one();
+}
+
+void Server::handle_request(const httplib::Request& request, httplib::Response& response, bool chat) {
+    auto stream = std::make_shared<Stream>();
+    stream->chat = chat;
+    bool streamed = false, include_usage = false;
+    try {
+        json body = json::parse(request.body);
+        if (std::string err = parse_request(body, *stream, streamed, include_usage); !err.empty())
+            return send_error(response, 400, err);
+    } catch (const json::exception& x) {
+        return send_error(response, 400, x.what());
+    }
+    {
+        std::lock_guard lock(mutex);
+        if (stopping) return send_error(response, 503, "shutting down");
+        new_streams.push_back(stream);
+    }
+    wake_engine.notify_one();
+    {
+        std::unique_lock lock(stream->mutex);
+        stream->changed.wait(lock, [&] { return stream->started; });
+        if (!stream->error.empty()) return send_error(response, 400, stream->error);
+    }
+    const json head = {{"id", (chat ? "chatcmpl-" : "cmpl-") + std::to_string(stream->request_id)},
+                       {"object", chat ? (streamed ? "chat.completion.chunk" : "chat.completion") : "text_completion"},
+                       {"created", (long)std::time(nullptr)},
+                       {"model", model_name}};
+
+    if (!streamed) {
         std::string text, reasoning;
-        std::unique_lock l(s->m);
+        std::unique_lock lock(stream->mutex);
         // wake every 100 ms: a client that hung up is cancelled, not left generating
-        while (!s->cv.wait_for(l, std::chrono::milliseconds(100), [&] { return !s->finish.empty(); }))
-            if (req.is_connection_closed()) {
-                l.unlock();
-                return cancel();
+        while (!stream->changed.wait_for(lock, std::chrono::milliseconds(100),
+                                         [&] { return !stream->finish_reason.empty(); }))
+            if (request.is_connection_closed()) {
+                lock.unlock();
+                return queue_cancel(stream);
             }
-        if (s->finish == "error") return fail(res, 500, "aborted: a lane failed");
-        for (const auto& [t, r] : s->q) (r ? reasoning : text) += t;
-        json j = head;
-        json c = {{"index", 0}, {"logprobs", nullptr}, {"finish_reason", s->finish}};
+        if (stream->finish_reason == "error") return send_error(response, 500, "aborted: a lane failed");
+        for (const auto& [piece, is_reasoning] : stream->pieces) (is_reasoning ? reasoning : text) += piece;
+        json reply = head;
+        json choice = {{"index", 0}, {"logprobs", nullptr}, {"finish_reason", stream->finish_reason}};
         if (chat) {
-            c["message"] = {{"role", "assistant"}, {"content", text}};
-            if (!reasoning.empty()) c["message"]["reasoning_content"] = reasoning;
+            choice["message"] = {{"role", "assistant"}, {"content", text}};
+            if (!reasoning.empty()) choice["message"]["reasoning_content"] = reasoning;
         } else {
-            c["text"] = text;
+            choice["text"] = text;
         }
-        j["choices"] = {c};
-        j["usage"] = usage_json();
-        res.set_content(dump(j), "application/json");
+        reply["choices"] = {choice};
+        reply["usage"] = usage_json(*stream);
+        response.set_content(dump(reply), "application/json");
         return;
     }
 
-    auto first = std::make_shared<bool>(true);
-    res.set_chunked_content_provider(
+    auto role_sent = std::make_shared<bool>(false);
+    response.set_chunked_content_provider(
         "text/event-stream",
-        [s, head, usage, chat, first, choice, usage_json](size_t, httplib::DataSink& sink) {
-            std::deque<Splitter::Piece> pieces;
-            std::string finish;
-            {
-                // wake every 100 ms with nothing to send: httplib checks the peer between calls, so a client
-                // that hung up before its first token is cancelled now, not when that token comes
-                std::unique_lock l(s->m);
-                if (!s->cv.wait_for(l, std::chrono::milliseconds(100),
-                                    [&] { return !s->q.empty() || !s->finish.empty(); }))
-                    return true;
-                pieces.swap(s->q);
-                finish = s->finish;
-            }
-            auto send = [&](const json& j) {
-                const std::string line = "data: " + dump(j) + "\n\n";
-                return sink.write(line.data(), line.size());
-            };
-            if (chat && std::exchange(*first, false)) {  // OpenAI's first chunk: the role
-                json j = head;
-                j["choices"] = {{{"index", 0}, {"delta", {{"role", "assistant"}, {"content", ""}}},
-                                 {"logprobs", nullptr}, {"finish_reason", nullptr}}};
-                if (!send(j)) return false;
-            }
-            for (const auto& [t, r] : pieces) {
-                json j = head;
-                j["choices"] = {choice(t, r, nullptr)};
-                if (!send(j)) return false;
-            }
-            if (finish.empty()) return true;
-            json j = head;
-            if (finish == "error") j["error"] = {{"message", "aborted: a lane failed"}};
-            else j["choices"] = {choice("", false, finish)};
-            if (!send(j)) return false;
-            if (usage) {
-                j = head;
-                j["choices"] = json::array();
-                j["usage"] = usage_json();
-                if (!send(j)) return false;
-            }
-            const std::string end = "data: [DONE]\n\n";
-            if (!sink.write(end.data(), end.size())) return false;
-            sink.done();
-            return true;
+        [stream, head, include_usage, chat, role_sent](size_t, httplib::DataSink& sink) {
+            return send_stream_events(*stream, head, chat, include_usage, *role_sent, sink);
         },
-        [cancel](bool success) {  // the stream ended; not cleanly = the client went away
-            if (!success) cancel();
+        [this, stream](bool success) {  // the stream ended; not cleanly = the client went away
+            if (!success) queue_cancel(stream);
         });
 }
 
-Server::Server(Engine& e, std::string model_name)
-    : e(e), model(std::move(model_name)), http(std::make_unique<httplib::Server>()) {
+Server::Server(Engine& engine, std::string model_name)
+    : engine(engine), model_name(std::move(model_name)), http(std::make_unique<httplib::Server>()) {
     // httplib's default is SO_REUSEPORT on macOS: a second server on a busy port would bind and share it
     http->set_socket_options([](socket_t sock) { httplib::set_socket_opt(sock, SOL_SOCKET, SO_REUSEADDR, 1); });
-    http->set_payload_max_length(MAX_BODY);
-    http->set_error_handler([](const httplib::Request&, httplib::Response& res) {  // httplib's own errors (413, 404)
-        if (!res.body.empty()) return httplib::Server::HandlerResponse::Unhandled;  // ours, already JSON
-        fail(res, res.status, httplib::status_message(res.status));
+    http->set_payload_max_length(MAX_BODY_BYTES);
+    // httplib's own errors (413, 404)
+    http->set_error_handler([](const httplib::Request&, httplib::Response& response) {
+        if (!response.body.empty()) return httplib::Server::HandlerResponse::Unhandled;  // ours, already JSON
+        send_error(response, response.status, httplib::status_message(response.status));
         return httplib::Server::HandlerResponse::Handled;
     });
-    http->Get("/v1/models", [this](const httplib::Request&, httplib::Response& res) {
-        res.set_content(dump({{"object", "list"}, {"data", {{{"id", model}, {"object", "model"}}}}}), "application/json");
+    http->Get("/v1/models", [this](const httplib::Request&, httplib::Response& response) {
+        response.set_content(dump({{"object", "list"}, {"data", {{{"id", this->model_name}, {"object", "model"}}}}}),
+                             "application/json");
     });
-    http->Post("/v1/completions", [this](const httplib::Request& q, httplib::Response& r) { handle(q, r, false); });
-    http->Post("/v1/chat/completions", [this](const httplib::Request& q, httplib::Response& r) { handle(q, r, true); });
+    http->Post("/v1/completions", [this](const httplib::Request& request, httplib::Response& response) {
+        handle_request(request, response, false);
+    });
+    http->Post("/v1/chat/completions", [this](const httplib::Request& request, httplib::Response& response) {
+        handle_request(request, response, true);
+    });
 }
 
 Server::~Server() = default;
 
 bool Server::listen(const std::string& host, int port) {
-    std::thread engine_thread([this] { loop(); });
+    std::thread engine_thread([this] { run_engine(); });
     const bool ok = http->listen(host, port);  // returns once stopped and every handler is done
     stop();  // a failed bind still stops the engine thread
     engine_thread.join();
@@ -306,82 +344,98 @@ bool Server::listen(const std::string& host, int port) {
 void Server::wait_until_ready() const { http->wait_until_ready(); }
 
 size_t Server::live_requests() {
-    std::lock_guard l(m);
-    return n_live;
+    std::lock_guard lock(mutex);
+    return live_count;
 }
 
 void Server::stop() {
     http->stop();
     {
-        std::lock_guard l(m);
+        std::lock_guard lock(mutex);
         stopping = true;
     }
-    cv.notify_one();
+    wake_engine.notify_one();
 }
 
-void Server::loop() {
-    std::map<int, std::shared_ptr<Stream>> live;  // engine request id -> its stream
+void Server::run_engine() {
     for (;;) {
-        std::deque<std::shared_ptr<Stream>> js, cs;
+        std::deque<std::shared_ptr<Stream>> to_start, to_cancel;
         {
-            std::unique_lock l(m);
-            n_live = e.reqs.size();
+            std::unique_lock lock(mutex);
+            live_count = engine.requests.size();
             // idle: sleep here; with live requests step() blocks on the lanes instead
-            cv.wait(l, [&] { return !e.reqs.empty() || !jobs.empty() || !cancels.empty() || stopping; });
-            if (stopping && jobs.empty() && e.reqs.empty()) return;
-            js.swap(jobs), cs.swap(cancels);
+            wake_engine.wait(lock, [&] {
+                return !engine.requests.empty() || !new_streams.empty() || !cancelled_streams.empty() || stopping;
+            });
+            if (stopping && new_streams.empty() && engine.requests.empty()) return;
+            to_start.swap(new_streams), to_cancel.swap(cancelled_streams);
         }
-        for (auto& s : js) {
-            try {
-                std::vector<int> ids = s->chat ? e.tok.encode_chat(s->messages) : e.tok.encode(s->prompt);
-                const int n = ids.size();
-                if (s->default_max) s->p.max_tokens = std::max(1, std::min(4096, e.ctx_limit() - n));
-                s->id = e.submit(std::move(ids), s->p);
-                live[s->id] = s;
-                s->put([&] { s->prompt_tokens = n, s->started = true; });
-            } catch (const std::invalid_argument& x) {
-                s->put([&] { s->error = x.what(), s->started = true; });
-            }
-        }
-        for (auto& s : cs)
-            if (s->id >= 0 && live.erase(s->id)) e.cancel(s->id);
-        std::vector<Event> evs;
+        start_streams(to_start);
+        cancel_streams(to_cancel);
+        std::vector<Event> events;
         try {
-            evs = e.step();
+            events = engine.step();
         } catch (const std::exception& x) {  // the rows it aborted get token -1 events from the next step()
             fprintf(stderr, "mllm serve: %s\n", x.what());
         }
-        for (const Event& ev : evs) {
-            auto it = live.find(ev.req_id);
-            if (it == live.end()) continue;
-            Stream& s = *it->second;
-            bool stopped = false;
-            auto pieces = ev.token < 0 ? std::vector<Splitter::Piece>{} : s.split.push(ev.text, ev.done, stopped);
-            const std::string finish = ev.token < 0           ? "error"
-                                       : stopped || (ev.done && e.tok.eos.count(ev.token)) ? "stop"
-                                       : ev.done                                           ? "length"
-                                                                                           : "";
-            const auto now = std::chrono::steady_clock::now();
-            s.put([&] {
-                if (ev.token >= 0 && !s.completion_tokens++) s.t_first = now;
-                s.t_end = now;
-                s.cached = ev.cached;
-                for (auto& p : pieces) s.q.push_back(std::move(p));
-                s.finish = finish;
-            });
-            if (stopped && !ev.done) e.cancel(ev.req_id);
-            if (finish.empty()) continue;
-            {
-                std::lock_guard l(s.m);  // handler threads only read these
-                auto sec = [](auto d) { return std::chrono::duration<double>(d).count(); };
-                const int n = s.completion_tokens;
-                fprintf(stderr, "mllm serve: request %d: prompt %d tokens, %d cached, first token %.3f s; %d tokens at "
-                        "%.1f tok/s, %s\n", s.id, s.prompt_tokens, s.cached, n ? sec(s.t_first - s.t0) : 0.0, n,
-                        n > 1 ? (n - 1) / sec(s.t_end - s.t_first) : 0.0, finish.c_str());
-            }
-            live.erase(it);
+        for (const Event& event : events) deliver(event);
+    }
+}
+
+void Server::start_streams(const std::deque<std::shared_ptr<Stream>>& streams) {
+    for (const auto& stream : streams) {
+        try {
+            std::vector<int> tokens = stream->chat ? engine.tokenizer.encode_chat(stream->messages)
+                                                   : engine.tokenizer.encode(stream->prompt);
+            const int prompt_tokens = tokens.size();
+            if (stream->default_max_tokens)
+                stream->params.max_tokens = std::max(1, std::min(4096, engine.context_limit() - prompt_tokens));
+            stream->request_id = engine.submit(std::move(tokens), stream->params);
+            live_streams[stream->request_id] = stream;
+            stream->update([&] { stream->prompt_tokens = prompt_tokens, stream->started = true; });
+        } catch (const std::invalid_argument& x) {
+            stream->update([&] { stream->error = x.what(), stream->started = true; });
         }
     }
+}
+
+void Server::cancel_streams(const std::deque<std::shared_ptr<Stream>>& streams) {
+    for (const auto& stream : streams)
+        if (stream->request_id >= 0 && live_streams.erase(stream->request_id)) engine.cancel(stream->request_id);
+}
+
+static void log_finished(Server::Stream& stream, const std::string& finish_reason) {
+    std::lock_guard lock(stream.mutex);  // handler threads only read these
+    const int tokens = stream.completion_tokens;
+    fprintf(stderr, "mllm serve: request %d: prompt %d tokens, %d cached, first token %.3f s; %d tokens at "
+            "%.1f tok/s, %s\n", stream.request_id, stream.prompt_tokens, stream.cached_tokens,
+            tokens ? seconds(stream.first_token_at - stream.arrived) : 0.0, tokens,
+            tokens > 1 ? (tokens - 1) / seconds(stream.last_token_at - stream.first_token_at) : 0.0,
+            finish_reason.c_str());
+}
+
+void Server::deliver(const Event& event) {
+    auto found = live_streams.find(event.req_id);
+    if (found == live_streams.end()) return;
+    Stream& stream = *found->second;
+    bool stopped = false;
+    auto pieces = event.token < 0 ? std::vector<Splitter::Piece>{} : stream.splitter.push(event.text, event.done, stopped);
+    const std::string finish_reason = event.token < 0                                                  ? "error"
+                                      : stopped || (event.done && engine.tokenizer.eos.count(event.token)) ? "stop"
+                                      : event.done                                                      ? "length"
+                                                                                                        : "";
+    const auto now = std::chrono::steady_clock::now();
+    stream.update([&] {
+        if (event.token >= 0 && !stream.completion_tokens++) stream.first_token_at = now;
+        stream.last_token_at = now;
+        stream.cached_tokens = event.cached;
+        for (auto& piece : pieces) stream.pieces.push_back(std::move(piece));
+        stream.finish_reason = finish_reason;
+    });
+    if (stopped && !event.done) engine.cancel(event.req_id);
+    if (finish_reason.empty()) return;
+    log_finished(stream, finish_reason);
+    live_streams.erase(found);
 }
 
 }  // namespace mllm

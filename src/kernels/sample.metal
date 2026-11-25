@@ -50,6 +50,25 @@ static inline void tg_argmax(thread float& best, thread int& bi, threadgroup flo
   best = simd_broadcast(best, 0), bi = simd_broadcast(bi, 0);
 }
 
+// This thread's share of the mass of tokens with key >= k (exp(v - m) each): over the n candidates ...
+static inline float candidate_mass(threadgroup const ushort* cand_b, uint n, uint k, float m, uint lid) {
+  float s = 0;
+  for (uint j = lid; j < n; j += TG)
+    if (key(cand_b[j]) >= k) s += exp(bf16(cand_b[j]) - m);
+  return s;
+}
+
+// ... or over the whole row, skipping NaNs.
+static inline float row_mass(const device ushort* x, int V, uint k, float m, uint lid) {
+  float s = 0;
+  for (int i = lid; i < V; i += TG) {
+    const ushort b = x[i];
+    const float v = bf16(b);
+    if (key(b) >= k && !isnan(v)) s += exp(v - m);
+  }
+  return s;
+}
+
 [[kernel]] void sample_bf16(
     const device ushort* x [[buffer(0)]],
     device int* ids [[buffer(1)]],
@@ -114,17 +133,7 @@ static inline void tg_argmax(thread float& best, thread int& bi, threadgroup flo
     const bool few = n <= CAP;
     // the mass of tokens with key >= k (exp(v - m) each), over the candidates or the row
     auto mass = [&](uint k) {
-      float s = 0;
-      if (few) {
-        for (uint j = lid; j < n; j += TG)
-          if (key(cand_b[j]) >= k) s += exp(bf16(cand_b[j]) - m);
-      } else {
-        for (int i = lid; i < V; i += TG) {
-          const ushort b = x[i];
-          const float v = bf16(b);
-          if (key(b) >= k && !isnan(v)) s += exp(v - m);
-        }
-      }
+      const float s = few ? candidate_mass(cand_b, n, k, m, lid) : row_mass(x, V, k, m, lid);
       return tg_sum(s, vals, lane, simd);
     };
     // the largest key whose larger-or-equal tokens hold >= target: bisection over the 16-bit keys

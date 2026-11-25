@@ -39,20 +39,13 @@ class Request:
 
 
 class Engine:
-    def __init__(self, model, arena_bytes=1 << 30, chunk=512, page_tokens=32, prefill="gpu", ane_weights="fp16"):
-        """prefill: "gpu" or "ane" (dense blocks on the Neural Engine, compiled for S = chunk).
-        ane_weights: a key of ane._compress (fp16, int8, lut4, ...)."""
+    def __init__(self, model, arena_bytes=1 << 30, chunk=512, page_tokens=32):
         assert chunk % page_tokens == 0, "chunks start on a page boundary"
         self.spec = spec_mod.load(model)
         self.tok = Tokenizer(self.spec.path)
         self.mem = Memory(self.spec, arena_bytes, page_tokens)
         ops = GpuOps(self.spec, self.mem)
-        dense = None
-        if prefill == "ane":
-            from .ane import AneOps
-            self.ane = AneOps(ops, chunk, ane_weights)
-            dense = self.ane.dense
-        self.prefill, self.decode = PrefillLane(ops, self.mem, dense), DecodeLane(ops, self.mem)
+        self.prefill, self.decode = PrefillLane(ops, self.mem), DecodeLane(ops, self.mem)
         self.chunk = chunk
         self.reqs = {}                  # live requests by id, in arrival order
         self.next_id = 0

@@ -14,148 +14,171 @@ static const char* HF_REGEX =
     "(?i:'s|'t|'re|'ve|'m|'ll|'d)|[^\\r\\n\\p{L}\\p{N}]?[\\p{L}\\p{M}]+|\\p{N}| ?[^\\s\\p{L}\\p{M}\\p{N}]+[\\r\\n]*|\\s*[\\r\\n]+|\\s+(?!\\S)|\\s+";
 static const char* LLAMA_REGEX =
     "(?:'[sS]|'[tT]|'[rR][eE]|'[vV][eE]|'[mM]|'[lL][lL]|'[dD])|[^\\r\\n\\p{L}\\p{N}]?[\\p{L}\\p{M}]+|\\p{N}| ?[^\\s\\p{L}\\p{M}\\p{N}]+[\\r\\n]*|\\s*[\\r\\n]+|\\s+(?!\\S)|\\s+";
-static const std::string FFFD = "\xEF\xBF\xBD";
+static const std::string REPLACEMENT_CHARACTER = "\xEF\xBF\xBD";  // U+FFFD
 
 // A token's string -> its bytes: each GPT-2 byte-level character becomes its byte, anything else (added tokens'
 // text) stays as UTF-8. mlx-lm decodes the character for byte 0 as its UTF-8 instead (a falsy-0 slip); we don't.
-static std::string token_bytes(const std::string& s) {
-    static const auto byte_of = [] {
-        std::unordered_map<uint32_t, uint8_t> m;
-        for (int b = 0; b < 256; b++) m[unicode_cpts_from_utf8(unicode_byte_to_utf8(b))[0]] = b;
-        return m;
+static std::string token_string_to_bytes(const std::string& token) {
+    static const auto byte_of_character = [] {
+        std::unordered_map<uint32_t, uint8_t> table;
+        for (int byte = 0; byte < 256; byte++) table[unicode_cpts_from_utf8(unicode_byte_to_utf8(byte))[0]] = byte;
+        return table;
     }();
     std::string out;
-    for (uint32_t c : unicode_cpts_from_utf8(s)) {
-        auto it = byte_of.find(c);
-        out += it != byte_of.end() ? std::string(1, (char)it->second) : unicode_cpt_to_utf8(c);
+    for (uint32_t character : unicode_cpts_from_utf8(token)) {
+        auto found = byte_of_character.find(character);
+        out += found != byte_of_character.end() ? std::string(1, (char)found->second) : unicode_cpt_to_utf8(character);
     }
     return out;
 }
 
 Tokenizer::Tokenizer(const std::string& path) {
-    std::ifstream f(path + "/tokenizer.json");
-    if (!f) throw std::runtime_error(path + ": no tokenizer.json");
-    nlohmann::json j = nlohmann::json::parse(f);
-    const auto& m = j["model"];
-    const auto& pre = j["pre_tokenizer"];
+    std::ifstream file(path + "/tokenizer.json");
+    if (!file) throw std::runtime_error(path + ": no tokenizer.json");
+    nlohmann::json config = nlohmann::json::parse(file);
+    const auto& model = config["model"];
+    const auto& pre_tokenizer = config["pre_tokenizer"];
     // the one tokenizer this file implements; anything else would tokenize wrong without an error
-    if (m["type"] != "BPE" || j["normalizer"]["type"] != "NFC" || pre["type"] != "Sequence" ||
-        pre["pretokenizers"][0]["pattern"]["Regex"] != HF_REGEX || pre["pretokenizers"][1]["type"] != "ByteLevel")
+    if (model["type"] != "BPE" || config["normalizer"]["type"] != "NFC" || pre_tokenizer["type"] != "Sequence" ||
+        pre_tokenizer["pretokenizers"][0]["pattern"]["Regex"] != HF_REGEX ||
+        pre_tokenizer["pretokenizers"][1]["type"] != "ByteLevel")
         throw std::runtime_error(path + ": tokenizer.json is not Qwen3.5's byte-level BPE");
 
-    for (const auto& [k, v] : m["vocab"].items()) vocab.emplace(k, v.get<int>());
+    for (const auto& [token, id] : model["vocab"].items()) vocab.emplace(token, id.get<int>());
     int rank = 0;
-    for (const auto& x : m["merges"]) {
-        std::string l, r;
-        if (x.is_string()) {
-            std::string lr = x.get<std::string>();
-            size_t sp = lr.find(' ');
-            l = lr.substr(0, sp), r = lr.substr(sp + 1);
+    for (const auto& merge : model["merges"]) {  // "left right", or ["left", "right"]
+        std::string left, right;
+        if (merge.is_string()) {
+            std::string both = merge.get<std::string>();
+            size_t space = both.find(' ');
+            left = both.substr(0, space), right = both.substr(space + 1);
         } else {
-            l = x[0].get<std::string>(), r = x[1].get<std::string>();
+            left = merge[0].get<std::string>(), right = merge[1].get<std::string>();
         }
-        merges.emplace((uint64_t)vocab.at(l) << 32 | (uint32_t)vocab.at(r), std::pair{rank++, vocab.at(l + r)});
+        merges.emplace((uint64_t)vocab.at(left) << 32 | (uint32_t)vocab.at(right), std::pair{rank++, vocab.at(left + right)});
     }
-    for (const auto& a : j["added_tokens"]) added.emplace_back(a["content"].get<std::string>(), a["id"].get<int>());
+    for (const auto& token : config["added_tokens"])
+        added_tokens.emplace_back(token["content"].get<std::string>(), token["id"].get<int>());
 
-    for (const auto& [s, id] : vocab) bytes.resize(std::max<size_t>(bytes.size(), id + 1)), bytes[id] = token_bytes(s);
-    for (const auto& [s, id] : added) bytes.resize(std::max<size_t>(bytes.size(), id + 1)), bytes[id] = token_bytes(s);
-    space = vocab.at(unicode_byte_to_utf8(' '));
+    auto set_bytes = [&](const std::string& token, int id) {
+        bytes_of_token.resize(std::max<size_t>(bytes_of_token.size(), id + 1));
+        bytes_of_token[id] = token_string_to_bytes(token);
+    };
+    for (const auto& [token, id] : vocab) set_bytes(token, id);
+    for (const auto& [token, id] : added_tokens) set_bytes(token, id);
+    space_token = vocab.at(unicode_byte_to_utf8(' '));
 
-    std::ifstream fc(path + "/tokenizer_config.json");
-    std::string eos_text = nlohmann::json::parse(fc)["eos_token"].get<std::string>();
-    for (const auto& [s, id] : added)
-        if (s == eos_text) eos.insert(id);
+    std::ifstream config_file(path + "/tokenizer_config.json");
+    std::string eos_text = nlohmann::json::parse(config_file)["eos_token"].get<std::string>();
+    for (const auto& [token, id] : added_tokens)
+        if (token == eos_text) eos.insert(id);
     if (eos.empty()) eos.insert(vocab.at(eos_text));
 }
 
-// One pre-token (byte-level string) -> ids: merge the lowest-ranked adjacent pair (leftmost on a tie) until none
-// is left. Symbols form a linked list; a min-heap holds candidate pairs, stale ones are skipped when popped.
-void Tokenizer::bpe(const std::string& word, std::vector<int>& out) const {
-    struct Sym {
-        int id, prev, next;
+// Merge the lowest-ranked adjacent pair (leftmost on a tie) until none is left. Symbols form a linked list; a min-heap
+// holds candidate pairs, stale ones are skipped when popped.
+void Tokenizer::apply_merges(const std::string& word, std::vector<int>& out) const {
+    struct Symbol {
+        int id, previous, next;
     };
-    std::vector<Sym> sym;
-    for (size_t i = 0; i < word.size();) {
-        size_t n = unicode_len_utf8(word[i]);
-        sym.push_back({vocab.at(word.substr(i, n)), (int)sym.size() - 1, (int)sym.size() + 1});
-        i += n;
+    std::vector<Symbol> symbols;
+    for (size_t at = 0; at < word.size();) {
+        size_t length = unicode_len_utf8(word[at]);
+        symbols.push_back({vocab.at(word.substr(at, length)), (int)symbols.size() - 1, (int)symbols.size() + 1});
+        at += length;
     }
-    if (sym.empty()) return;
-    sym.back().next = -1;
-    struct Pair {
-        int rank, left, right, lid, rid, merged;
-        bool operator>(const Pair& o) const { return rank != o.rank ? rank > o.rank : left > o.left; }
+    if (symbols.empty()) return;
+    symbols.back().next = -1;
+    struct Candidate {
+        int rank, left, right, left_id, right_id, merged_id;  // left / right: symbol indexes
+        bool operator>(const Candidate& o) const { return rank != o.rank ? rank > o.rank : left > o.left; }
     };
-    std::priority_queue<Pair, std::vector<Pair>, std::greater<Pair>> heap;
-    auto add = [&](int l, int r) {
-        if (l < 0 || r < 0) return;
-        auto it = merges.find((uint64_t)sym[l].id << 32 | (uint32_t)sym[r].id);
-        if (it != merges.end()) heap.push({it->second.first, l, r, sym[l].id, sym[r].id, it->second.second});
+    std::priority_queue<Candidate, std::vector<Candidate>, std::greater<Candidate>> candidates;
+    auto push_candidate = [&](int left, int right) {
+        if (left < 0 || right < 0) return;
+        auto found = merges.find((uint64_t)symbols[left].id << 32 | (uint32_t)symbols[right].id);
+        if (found != merges.end())
+            candidates.push({found->second.first, left, right, symbols[left].id, symbols[right].id, found->second.second});
     };
-    for (int i = 0; i + 1 < (int)sym.size(); i++) add(i, i + 1);
-    while (!heap.empty()) {
-        Pair p = heap.top();
-        heap.pop();
-        Sym &l = sym[p.left], &r = sym[p.right];
+    for (int i = 0; i + 1 < (int)symbols.size(); i++) push_candidate(i, i + 1);
+    while (!candidates.empty()) {
+        Candidate pair = candidates.top();
+        candidates.pop();
+        Symbol &left = symbols[pair.left], &right = symbols[pair.right];
         // stale: either side was merged away or changed since this pair was pushed
-        if (l.id != p.lid || r.id != p.rid || l.next != p.right) continue;
-        l.id = p.merged, l.next = r.next, r.id = -1;
-        if (l.next >= 0) sym[l.next].prev = p.left;
-        add(l.prev, p.left);
-        add(p.left, l.next);
+        if (left.id != pair.left_id || right.id != pair.right_id || left.next != pair.right) continue;
+        left.id = pair.merged_id, left.next = right.next, right.id = -1;
+        if (left.next >= 0) symbols[left.next].previous = pair.left;
+        push_candidate(left.previous, pair.left);
+        push_candidate(pair.left, left.next);
     }
-    for (int i = 0; i >= 0; i = sym[i].next) out.push_back(sym[i].id);
+    for (int i = 0; i >= 0; i = symbols[i].next) out.push_back(symbols[i].id);
+}
+
+void Tokenizer::encode_plain(const std::string& text, std::vector<int>& out) const {
+    if (text.empty()) return;
+    std::string normalized;
+    for (uint32_t character : unicode_cpts_normalize_nfc(unicode_cpts_from_utf8(text)))
+        normalized += unicode_cpt_to_utf8(character);
+    // ponytail: llama.cpp's NFC data predates Unicode 10, so marks assigned since then (e.g. U+0C3C) reorder
+    // differently from HF's normalizer. If parity matters there, override their combining classes.
+    for (const auto& word : unicode_regex_split(normalized, {LLAMA_REGEX})) apply_merges(word, out);
 }
 
 std::vector<int> Tokenizer::encode(const std::string& text) const {
     std::vector<int> out;
-    size_t start = 0;
-    auto plain = [&](size_t end) {  // text[start:end] has no added token: NFC, split, BPE
-        if (end == start) return;
-        std::string s;
-        for (uint32_t c : unicode_cpts_normalize_nfc(unicode_cpts_from_utf8(text.substr(start, end - start))))
-            s += unicode_cpt_to_utf8(c);
-        // ponytail: llama.cpp's NFC data predates Unicode 10, so marks assigned since then (e.g. U+0C3C) reorder
-        // differently from HF's normalizer. If parity matters there, override their combining classes.
-        for (const auto& w : unicode_regex_split(s, {LLAMA_REGEX})) bpe(w, out);
-    };
+    size_t plain_start = 0;  // where the text since the last added token starts
     // added tokens first, longest match at the leftmost position (HF: aho-corasick, leftmost-longest)
-    for (size_t i = 0; i < text.size();) {
-        const std::pair<std::string, int>* hit = nullptr;
-        for (const auto& a : added)
-            if (text.compare(i, a.first.size(), a.first) == 0 && (!hit || a.first.size() > hit->first.size())) hit = &a;
-        if (!hit) {
-            i++;
+    for (size_t at = 0; at < text.size();) {
+        const std::pair<std::string, int>* longest = nullptr;
+        for (const auto& token : added_tokens)
+            if (text.compare(at, token.first.size(), token.first) == 0 &&
+                (!longest || token.first.size() > longest->first.size()))
+                longest = &token;
+        if (!longest) {
+            at++;
             continue;
         }
-        plain(i);
-        out.push_back(hit->second);
-        start = i += hit->first.size();
+        encode_plain(text.substr(plain_start, at - plain_start), out);
+        out.push_back(longest->second);
+        plain_start = at += longest->first.size();
     }
-    plain(text.size());
+    encode_plain(text.substr(plain_start), out);
     return out;
 }
 
 // Jinja's |trim = Python's str.strip(): the str.isspace() set.
-static bool py_space(uint32_t c) {
+static bool is_python_space(uint32_t c) {
     return (c >= 0x09 && c <= 0x0D) || (c >= 0x1C && c <= 0x20) || c == 0x85 || c == 0xA0 || c == 0x1680 ||
            (c >= 0x2000 && c <= 0x200A) || c == 0x2028 || c == 0x2029 || c == 0x202F || c == 0x205F || c == 0x3000;
 }
 
-static std::string trim(const std::string& s) {
-    size_t a = s.size(), b = 0;
-    for (size_t i = 0; i < s.size();) {
-        size_t at = i;
-        uint32_t c;
+static std::string trim(const std::string& text) {
+    size_t first = text.size(), end = 0;  // the first non-space byte, and the end of the last non-space character
+    for (size_t at = 0; at < text.size();) {
+        size_t character_start = at;
+        uint32_t character;
         try {
-            c = unicode_cpt_from_utf8(s, i);
+            character = unicode_cpt_from_utf8(text, at);
         } catch (const std::invalid_argument&) {  // invalid UTF-8: a non-space byte
-            c = 0, i = at + 1;
+            character = 0, at = character_start + 1;
         }
-        if (!py_space(c)) a = std::min(a, at), b = i;
+        if (!is_python_space(character)) first = std::min(first, character_start), end = at;
     }
-    return a < b ? s.substr(a, b - a) : "";
+    return first < end ? text.substr(first, end - first) : "";
+}
+
+// An assistant message's "...<think>reasoning</think>content": splits off the reasoning as the template does
+static void split_off_reasoning(std::string& content, std::string& reasoning) {
+    size_t think_end = content.find("</think>");
+    if (think_end == std::string::npos) return;
+    reasoning = content.substr(0, think_end);
+    reasoning.erase(reasoning.find_last_not_of('\n') + 1);  // rstrip('\n')
+    if (size_t think_start = reasoning.rfind("<think>"); think_start != std::string::npos)
+        reasoning.erase(0, think_start + 7);
+    reasoning.erase(0, reasoning.find_first_not_of('\n'));  // lstrip('\n'); npos clears
+    content.erase(0, content.rfind("</think>") + 8);
+    content.erase(0, content.find_first_not_of('\n'));
 }
 
 // qwen3_5's chat_template.jinja for text-only system/user/assistant messages, add_generation_prompt=True and
@@ -165,8 +188,9 @@ std::vector<int> Tokenizer::encode_chat(const std::vector<Message>& messages) co
     if (messages.empty()) throw std::invalid_argument("No messages provided.");
     size_t last_query = messages.size();
     for (size_t i = messages.size(); i-- > 0;) {
-        std::string c = trim(messages[i].content);
-        if (messages[i].role == "user" && !(c.starts_with("<tool_response>") && c.ends_with("</tool_response>"))) {
+        std::string content = trim(messages[i].content);
+        if (messages[i].role == "user" &&
+            !(content.starts_with("<tool_response>") && content.ends_with("</tool_response>"))) {
             last_query = i;
             break;
         }
@@ -184,14 +208,7 @@ std::vector<int> Tokenizer::encode_chat(const std::vector<Message>& messages) co
             text += "<|im_start|>user\n" + content + "<|im_end|>\n";
         } else if (role == "assistant") {
             std::string reasoning;
-            if (size_t e = content.find("</think>"); e != std::string::npos) {
-                reasoning = content.substr(0, e);
-                reasoning.erase(reasoning.find_last_not_of('\n') + 1);  // rstrip('\n')
-                if (size_t s = reasoning.rfind("<think>"); s != std::string::npos) reasoning.erase(0, s + 7);
-                reasoning.erase(0, reasoning.find_first_not_of('\n'));  // lstrip('\n'); npos clears
-                content.erase(0, content.rfind("</think>") + 8);
-                content.erase(0, content.find_first_not_of('\n'));
-            }
+            split_off_reasoning(content, reasoning);
             reasoning = trim(reasoning);
             text += i > last_query ? "<|im_start|>assistant\n<think>\n" + reasoning + "\n</think>\n\n" + content
                                    : "<|im_start|>assistant\n" + content;
@@ -206,23 +223,25 @@ std::vector<int> Tokenizer::encode_chat(const std::vector<Message>& messages) co
 Detokenizer Tokenizer::detokenizer() const { return Detokenizer(*this); }
 
 // bytes -> UTF-8 with each maximal invalid subsequence replaced by U+FFFD, as Python's decode("utf-8", "replace").
-static std::string decode_replace(const std::string& b) {
+static std::string decode_replace(const std::string& bytes) {
     std::string out;
-    for (size_t i = 0, n = b.size(); i < n;) {
-        uint8_t c = b[i];
-        if (c < 0x80) {
-            out += (char)c, i++;
+    for (size_t at = 0, size = bytes.size(); at < size;) {
+        uint8_t lead = bytes[at];
+        if (lead < 0x80) {
+            out += (char)lead, at++;
             continue;
         }
-        int need = c >= 0xC2 && c <= 0xDF ? 1 : c >= 0xE0 && c <= 0xEF ? 2 : c >= 0xF0 && c <= 0xF4 ? 3 : 0;
-        uint8_t lo = c == 0xE0 ? 0xA0 : c == 0xF0 ? 0x90 : 0x80, hi = c == 0xED ? 0x9F : c == 0xF4 ? 0x8F : 0xBF;
-        size_t j = i + 1;
-        for (int k = 0; k < need && j < n; k++, j++) {
-            uint8_t d = b[j];
-            if (d < (k ? 0x80 : lo) || d > (k ? 0xBF : hi)) break;
+        // continuation bytes the lead byte needs, and the range its first continuation byte must be in
+        int continuations = lead >= 0xC2 && lead <= 0xDF ? 1 : lead >= 0xE0 && lead <= 0xEF ? 2 : lead >= 0xF0 && lead <= 0xF4 ? 3 : 0;
+        uint8_t first_min = lead == 0xE0 ? 0xA0 : lead == 0xF0 ? 0x90 : 0x80;
+        uint8_t first_max = lead == 0xED ? 0x9F : lead == 0xF4 ? 0x8F : 0xBF;
+        size_t end = at + 1;
+        for (int k = 0; k < continuations && end < size; k++, end++) {
+            uint8_t next = bytes[end];
+            if (next < (k ? 0x80 : first_min) || next > (k ? 0xBF : first_max)) break;
         }
-        out += need && j - i == (size_t)need + 1 ? b.substr(i, j - i) : FFFD;
-        i = j;
+        out += continuations && end - at == (size_t)continuations + 1 ? bytes.substr(at, end - at) : REPLACEMENT_CHARACTER;
+        at = end;
     }
     return out;
 }
@@ -236,10 +255,11 @@ std::string Detokenizer::emit(std::string text) {
 }
 
 std::string Detokenizer::push(int token) {
-    unflushed += (unsigned)token < t->bytes.size() ? t->bytes[token] : "!";  // mlx-lm: ids past the tokenizer -> "!"
+    // mlx-lm: ids past the tokenizer -> "!"
+    unflushed += (unsigned)token < tokenizer->bytes_of_token.size() ? tokenizer->bytes_of_token[token] : "!";
     std::string text = decode_replace(unflushed);
     // incomplete UTF-8 waits for more bytes; a lone space token waits for the next token (mlx-lm)
-    if (text.ends_with(FFFD) || token == t->space) return "";
+    if (text.ends_with(REPLACEMENT_CHARACTER) || token == tokenizer->space_token) return "";
     return emit(text);
 }
 

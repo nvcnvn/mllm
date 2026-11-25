@@ -20,263 +20,350 @@
 #include "server.h"
 #include "spec.h"
 
+using SteadyClock = std::chrono::steady_clock;
+
+static double seconds(SteadyClock::duration duration) { return std::chrono::duration<double>(duration).count(); }
+
 namespace mllm {
 
 // tools/roofline.py calibration knobs (keep the two in step): effective bandwidth and FP16 rate; 273 GB/s is the M4
 // Pro's peak
-constexpr double BW = 210e9, PEAK_BW = 273e9, FLOPS = 7.5e12;
-constexpr size_t POOL = 64 << 20;  // rotate weights / K/V / state over at least this, so reads come from DRAM
+constexpr double EFFECTIVE_BANDWIDTH = 210e9, PEAK_BANDWIDTH = 273e9, FP16_FLOPS = 7.5e12;
+// rotate weights / K/V / state over at least this many bytes, so reads come from DRAM
+constexpr size_t ROTATION_BYTES = 64 << 20;
 
-static void row(const std::string& op, const std::string& shape, double sec, double bytes, double flops,
-                const char* note) {
-    const double bound = std::max(bytes / BW, flops / FLOPS), gbs = bytes / sec / 1e9, pct = 100 * bound / sec;
-    printf("  %-34s %-14s %9.1f %7.1f%s %9.1f %5.0f%%  %s\n", op.c_str(), shape.c_str(), sec * 1e6, gbs,
-           gbs * 1e9 > PEAK_BW ? "!" : " ", bound * 1e6, pct, pct < 70 || gbs * 1e9 > PEAK_BW ? note : "");
+static const char* TINY_NOTE = "tiny: dispatch / fill floor of a few us, not bandwidth";
+static const char* CACHED_NOTE = "activations stay in cache (no rotation, as in a real step): a few-us floor when small";
+
+// One line of the bench-ops table: the op's time next to its roofline bound (the larger of its bytes at the effective
+// bandwidth and its flops at the FP16 rate); the note shows below 70% of the bound or above the peak bandwidth
+static void print_row(const std::string& op, const std::string& shape, double op_seconds, double bytes, double flops,
+                      const char* note) {
+    const double bound = std::max(bytes / EFFECTIVE_BANDWIDTH, flops / FP16_FLOPS);
+    const double gb_per_second = bytes / op_seconds / 1e9, percent_of_bound = 100 * bound / op_seconds;
+    const bool above_peak = gb_per_second * 1e9 > PEAK_BANDWIDTH;
+    printf("  %-34s %-14s %9.1f %7.1f%s %9.1f %5.0f%%  %s\n", op.c_str(), shape.c_str(), op_seconds * 1e6, gb_per_second,
+           above_peak ? "!" : " ", bound * 1e6, percent_of_bound, percent_of_bound < 70 || above_peak ? note : "");
 }
 
-// bench-ops needs GpuOps' kernel helpers and layers (gpu.h friend)
+// bench-ops needs GpuOps' kernel helpers and layers (gpu.h friend). Holds one run's setup; each step is a member.
 struct GpuOpsTest {
-    static void bench_ops(const std::string& model);
-};
+    static void bench_ops(const std::string& model_name);
 
-void GpuOpsTest::bench_ops(const std::string& model) {
-    const ModelSpec s = spec::load(model);
-    id<MTLDevice> dev = MTLCreateSystemDefaultDevice();
-    Weights w(s.path, dev);
-    const int chunk = 512, max_batch = 16, max_ctx = 8192, L = s.n_layers();
-    Memory mem(s, dev, std::max<size_t>((size_t)2 << 30, Memory::arena_for(s, max_batch, max_ctx)));  // 27B: 16 rows of 8k
-    GpuOps ops(mem, w);
-    Workspace ws = ops.workspace(chunk, max_batch, max_ctx);
-    id<MTLCommandQueue> q = [dev newCommandQueue];
-    StepTables tables = mem.step_tables(chunk, max_ctx);
-    std::vector<id<MTLBuffer>> tabs;  // one per rotation set
-    for (int i = 0; i < 16; i++) tabs.push_back(mem.buffer(tables.words * 4));
-    const GpuOps::Layer &fl = ops.layers[s.full_layers()[0]], &ll = ops.layers[s.linear_layers()[0]];
-    const int max_K = std::max({fl.down_proj.K, fl.out.K, ll.out.K});
-    id<MTLBuffer> xin = mem.buffer((size_t)chunk * max_K * ELEM);
-    id<MTLBuffer> yout = mem.buffer(std::max(ws.logits.length, (size_t)chunk * s.conv_dim() * ELEM));
-    id<MTLBuffer> pool = mem.buffer(96 << 20);
-    mem.freeze();
+    const ModelSpec& model;
+    Memory& memory;
+    GpuOps& ops;
+    Workspace& ws;
+    id<MTLCommandQueue> queue;
+    StepTables& tables;
+    std::vector<id<MTLBuffer>>& table_sets;  // one step table per rotation set
+    id<MTLBuffer> input, output;             // activations in and out of the timed ops
+    id<MTLBuffer> pool;                      // where rotated_copies puts its copies
+    const GpuOps::Layer &full_layer, &linear_layer;
+    std::vector<std::vector<uint32_t>> units = {};  // per request; the tables are written from these spans
 
-    // GPU seconds per encode(r) call: reps calls in one command buffer, best of 3
-    auto time = [&](auto&& encode) {
-        double t1;
+    // GPU seconds for `repeats` encode(repeat) calls in one command buffer
+    template <class Encode>
+    double seconds_for_repeats(Encode& encode, int repeats) {
         @autoreleasepool {
-            t1 = encode_and_wait(q, ws, [&] {
-                ops.use(ws);
-                encode(0);
+            return encode_and_wait(queue, ws, [&] {
+                ops.begin(ws);
+                for (int repeat = 0; repeat < repeats; repeat++) encode(repeat);
             });
         }
-        const int reps = std::clamp((int)(0.02 / std::max(t1, 1e-6)), 3, 2000);
+    }
+    // GPU seconds per encode(repeat) call: enough calls in one command buffer to take ~20 ms, best of 3
+    template <class Encode>
+    double gpu_seconds(Encode&& encode) {
+        const double one_call = seconds_for_repeats(encode, 1);
+        const int repeats = std::clamp((int)(0.02 / std::max(one_call, 1e-6)), 3, 2000);
         double best = INFINITY;
-        for (int k = 0; k < 3; k++) @autoreleasepool {
-                best = std::min(best, encode_and_wait(q, ws, [&] {
-                    ops.use(ws);
-                    for (int r = 0; r < reps; r++) encode(r);
-                }) / reps);
-            }
+        for (int attempt = 0; attempt < 3; attempt++)
+            best = std::min(best, seconds_for_repeats(encode, repeats) / repeats);
         return best;
-    };
-    // copies of l over >= POOL bytes of pool (l itself when it is that big)
-    auto rotate = [&](const QLinear& l) {
-        const size_t wb = (size_t)l.N * l.K / 2, sb = (size_t)l.N * l.K / 64 * ELEM;
-        if (wb + 2 * sb >= POOL) return std::vector<QLinear>{l};
-        auto al = [](size_t x) { return (x + 255) & ~(size_t)255; };
-        const size_t n = (POOL + wb + 2 * sb - 1) / (wb + 2 * sb), stride = al(wb) + 2 * al(sb);
-        assert(n * stride <= pool.length);
-        std::vector<QLinear> out;
-        uint8_t* p = (uint8_t*)pool.contents;
-        for (size_t c = 0; c < n; c++) {
-            QLinear q = l;
-            const size_t o = c * stride;
-            q.w = {pool, o}, q.scales = {pool, o + al(wb)}, q.biases = {pool, o + al(wb) + al(sb)};
-            memcpy(p + o, (uint8_t*)l.w.buffer.contents + l.w.offset, wb);
-            memcpy(p + q.scales.offset, (uint8_t*)l.scales.buffer.contents + l.scales.offset, sb);
-            memcpy(p + q.biases.offset, (uint8_t*)l.biases.buffer.contents + l.biases.offset, sb);
-            out.push_back(q);
+    }
+
+    std::vector<QuantizedWeights> rotated_copies(const QuantizedWeights& weights);
+    int make_table_sets(int requests, int position, int tokens, bool linear, double set_bytes, int layers);
+    void bench_multiply(const std::string& name, const QuantizedWeights& weights, int rows, bool decode);
+    void bench_norms(int rows);
+    void bench_attention(int rows, bool decode);
+    double time_decode_step(double& wall_seconds);
+    void bench_whole_decode_step(int requests, double mlx_baseline);
+};
+
+// Copies of weights over >= ROTATION_BYTES of pool (the weights themselves when they are that big)
+std::vector<QuantizedWeights> GpuOpsTest::rotated_copies(const QuantizedWeights& weights) {
+    const size_t packed_bytes = (size_t)weights.out_size * weights.in_size / 2;
+    const size_t scale_bytes = (size_t)weights.out_size * weights.in_size / 64 * ELEM;  // scales, and again biases
+    if (packed_bytes + 2 * scale_bytes >= ROTATION_BYTES) return std::vector<QuantizedWeights>{weights};
+    auto aligned = [](size_t bytes) { return (bytes + 255) & ~(size_t)255; };
+    const size_t copies = (ROTATION_BYTES + packed_bytes + 2 * scale_bytes - 1) / (packed_bytes + 2 * scale_bytes);
+    const size_t stride = aligned(packed_bytes) + 2 * aligned(scale_bytes);
+    assert(copies * stride <= pool.length);
+    std::vector<QuantizedWeights> out;
+    uint8_t* pool_bytes = (uint8_t*)pool.contents;
+    for (size_t copy_index = 0; copy_index < copies; copy_index++) {
+        QuantizedWeights copy = weights;
+        const size_t offset = copy_index * stride;
+        copy.packed = {pool, offset};
+        copy.scales = {pool, offset + aligned(packed_bytes)};
+        copy.biases = {pool, offset + aligned(packed_bytes) + aligned(scale_bytes)};
+        memcpy(pool_bytes + offset, (uint8_t*)weights.packed.buffer.contents + weights.packed.offset, packed_bytes);
+        memcpy(pool_bytes + copy.scales.offset, (uint8_t*)weights.scales.buffer.contents + weights.scales.offset, scale_bytes);
+        memcpy(pool_bytes + copy.biases.offset, (uint8_t*)weights.biases.buffer.contents + weights.biases.offset, scale_bytes);
+        out.push_back(copy);
+    }
+    return out;
+}
+
+// Sets of `requests` requests on their own units (pages for position + tokens tokens, or a state span), one step table
+// each; enough sets that set_bytes (one layer's distinct footprint per set) * sets * layers >= ROTATION_BYTES. Returns
+// the number of sets (in table_sets' first entries).
+int GpuOpsTest::make_table_sets(int requests, int position, int tokens, bool linear, double set_bytes, int layers) {
+    const uint32_t units_per_request = linear ? memory.state_units : memory.units_for(position + tokens);
+    const int fit = std::min<int>((int)table_sets.size(), memory.arena.n_units / (requests * units_per_request));
+    assert(fit >= 1);
+    const int sets = std::clamp((int)std::ceil(ROTATION_BYTES / (set_bytes * layers)), 1, fit);
+    units.assign((size_t)requests * sets, {});
+    uint32_t next = 0;
+    for (int set = 0; set < sets; set++) {
+        std::vector<StepTables::Row> rows;
+        for (int request = 0; request < requests; request++) {
+            std::vector<uint32_t>& request_units = units[set * requests + request];
+            for (uint32_t j = 0; j < units_per_request; j++) request_units.push_back(next++);
+            const std::span<const uint32_t> none{};
+            rows.push_back({position, tokens, linear ? none : request_units, linear ? request_units : none});
         }
-        return out;
-    };
-    // sets of B requests on their own units (pages for pos + n tokens, or a state span), one table each; enough
-    // sets that set_bytes (one layer's distinct footprint per set) * sets * layers >= POOL
-    const uint32_t SU = mem.state_units;
-    std::vector<std::vector<uint32_t>> units;  // per request; the tables are written from these spans
-    auto make_sets = [&](int B, int pos, int n, bool linear, double set_bytes, int layers) {
-        const uint32_t per_row = linear ? SU : mem.units_for(pos + n);
-        const int fit = std::min<int>((int)tabs.size(), mem.arena.n_units / (B * per_row));
-        assert(fit >= 1);
-        const int sets = std::clamp((int)std::ceil(POOL / (set_bytes * layers)), 1, fit);
-        units.assign((size_t)B * sets, {});
-        uint32_t next = 0;
-        for (int k = 0; k < sets; k++) {
-            std::vector<StepTables::Row> rows;
-            for (int b = 0; b < B; b++) {
-                std::vector<uint32_t>& u = units[k * B + b];
-                for (uint32_t j = 0; j < per_row; j++) u.push_back(next++);
-                rows.push_back({pos, n, linear ? std::span<const uint32_t>{} : u, linear ? u : std::span<const uint32_t>{}});
+        tables.write(table_sets[set], rows);
+    }
+    return sets;
+}
+
+// Why a weight multiply may be below its bound, by shape and kernel (MLX's kernel names)
+static const char* multiply_note(const QuantizedWeights& weights, int rows, bool decode) {
+    if (weights.out_size * weights.in_size < 1 << 20) return TINY_NOTE;  // key, value, update rate, decay projections
+    if (!decode) return "qmm_t (64 x 64 tiles): dequantizing W costs ~10% next to the bf16 GEMM";
+    if (rows == 1) return "MLX qmv_fast";
+    return rows < 13 ? "MLX qmv_wide: known ~40% at M = 8-16, MLX the same; faster kernel breaks bit-exactness"
+                     : "MLX qmm_t_splitk: known ~40% at M = 8-16, MLX the same; faster kernel breaks bit-exactness";
+}
+
+void GpuOpsTest::bench_multiply(const std::string& name, const QuantizedWeights& weights, int rows, bool decode) {
+    const std::vector<QuantizedWeights> copies = rotated_copies(weights);
+    const double weight_bytes =
+        (double)weights.out_size * weights.in_size / 2 + 2.0 * weights.out_size * weights.in_size / 64 * ELEM;
+    const double bytes = weight_bytes + (double)rows * (weights.in_size + weights.out_size) * ELEM;
+    const double time = gpu_seconds(
+        [&](int repeat) { ops.multiply_weights(copies[repeat % copies.size()], {input}, {output}, rows); });
+    print_row(name, std::to_string(weights.in_size) + " -> " + std::to_string(weights.out_size), time, bytes,
+              2.0 * rows * weights.out_size * weights.in_size, multiply_note(weights, rows, decode));
+}
+
+// Norms: their activations stay in cache in a real step too, so no rotation
+void GpuOpsTest::bench_norms(int rows) {
+    const int value_heads = model.linear_value_heads, value_dim = model.linear_value_dim;
+    double time = gpu_seconds([&](int) { ops.normalize(full_layer.attention_norm, {input}, {output}, rows, model.hidden); });
+    print_row("rms_norm", std::to_string(rows) + " x " + std::to_string(model.hidden), time,
+              2.0 * rows * model.hidden * ELEM, 0, CACHED_NOTE);
+    time = gpu_seconds([&](int) {
+        ops.normalize_and_gate(linear_layer.output_norm, {input}, {ws.output_gate}, {output}, rows * value_heads, value_dim);
+    });
+    print_row("gated_rms_norm (2 dispatches)", std::to_string(rows * value_heads) + " x " + std::to_string(value_dim),
+              time, 3.0 * rows * value_heads * value_dim * ELEM, 0, CACHED_NOTE);
+}
+
+// apply_attention: rows on their own pages / state, rotated over sets and layers
+void GpuOpsTest::bench_attention(int rows, bool decode) {
+    const int heads = model.query_heads, key_value_heads = model.key_value_heads, head_dim = model.head_dim;
+    const int value_heads = model.linear_value_heads, value_dim = model.linear_value_dim;
+    const auto full_layers = model.full_layers(), linear_layers = model.linear_layers();
+    const double key_value_bytes_per_token = (double)key_value_heads * head_dim * 2 * ELEM;  // K + V, one layer
+    const double state_bytes = 2.0 * (memory.conv_bytes + memory.delta_bytes);  // one row's state, read + written
+    // per token: decay, kᵀS, update, qᵀS
+    const double linear_flops_per_token = 7.0 * value_heads * value_dim * model.linear_key_dim;
+    const int requests = decode ? rows : 1, tokens = decode ? 1 : rows;
+    ws.request_count = requests, ws.tokens_per_request = tokens;
+    for (int context : decode ? std::vector<int>{512, 2048, 8192} : std::vector<int>{512, 4096}) {
+        const double key_value_bytes = (double)requests * context * key_value_bytes_per_token;
+        const double activation_bytes = (double)requests * tokens * (3 * heads + 2 * key_value_heads) * head_dim * ELEM;
+        const int sets = make_table_sets(requests, context - tokens, tokens, false, key_value_bytes, (int)full_layers.size());
+        const double time = gpu_seconds([&](int repeat) {
+            ws.step_table = table_sets[repeat % sets];
+            ops.apply_attention(full_layers[(repeat / sets) % full_layers.size()], ws);
+        });
+        print_row("attn full, " + std::to_string(context) + " keys",
+                  decode ? std::to_string(requests) + " rows" : "512 queries", time, key_value_bytes + activation_bytes,
+                  decode ? 4.0 * requests * heads * head_dim * context : 4.0 * heads * head_dim * tokens * context,
+                  decode ? "5 dispatches (rope q, rope k, write_kv, sdpa_vector, gate): their floor dominates short contexts"
+                         : "MLX's unfused fallback (gather, 2 GEMMs, softmax over S x keys): no fused path for D 256");
+    }
+    const double activation_bytes = (double)requests * tokens * (model.conv_dim() + 2 * value_heads * value_dim) * ELEM;
+    // state: read + written
+    const int sets = make_table_sets(requests, 0, tokens, true, requests * state_bytes / 2, (int)linear_layers.size());
+    const double time = gpu_seconds([&](int repeat) {
+        ws.step_table = table_sets[repeat % sets];
+        ops.apply_attention(linear_layers[(repeat / sets) % linear_layers.size()], ws);
+    });
+    print_row("attn linear (conv, gated delta)", decode ? std::to_string(requests) + " rows" : "512 tokens", time,
+              requests * state_bytes + activation_bytes, (double)requests * tokens * linear_flops_per_token,
+              decode ? "5 dispatches (conv + norm + scale, gates, delta, gated norm x2): their floor dominates at small B"
+                     : "mlx-lm's gated delta kernel walks the 512 tokens in order (128 threadgroups): latency-bound");
+}
+
+// One whole decode step in one command buffer: returns its GPU seconds, sets wall_seconds (encode + commit + wait)
+double GpuOpsTest::time_decode_step(double& wall_seconds) {
+    const int layers = model.n_layers();
+    @autoreleasepool {
+        const auto wall_start = SteadyClock::now();
+        const double gpu_time = encode_and_wait(queue, ws, [&] {
+            for (int layer = 0; layer <= layers; layer++) {
+                ops.apply_weights(layer, ws);
+                if (layer < layers) ops.apply_attention(layer, ws);
             }
-            tables.write(tabs[k], rows);
-        }
-        return sets;
-    };
+            ops.pick_next_tokens(ws);
+        }, true);
+        wall_seconds = seconds(SteadyClock::now() - wall_start);
+        return gpu_time;
+    }
+}
+
+// A whole decode step for `requests` rows at 512 keys each, median of 10 (after 3 warm-up steps); mlx_baseline: mlx-lm's
+// tok/s at this batch size, 0 when not measured
+void GpuOpsTest::bench_whole_decode_step(int requests, double mlx_baseline) {
+    ws.request_count = requests, ws.tokens_per_request = 1;
+    const uint32_t pages = memory.units_for(512);
+    units.assign(requests, {});
+    std::vector<StepTables::Row> rows;
+    for (uint32_t request = 0, next = 0; request < (uint32_t)requests; request++) {
+        for (uint32_t j = 0; j < pages + memory.state_units; j++) units[request].push_back(next++);
+        rows.push_back({511, 1, std::span(units[request]).first(pages), std::span(units[request]).subspan(pages)});
+    }
+    ws.step_table = table_sets[0];
+    tables.write(ws.step_table, rows);
+    std::vector<double> gpu_times, wall_times;
+    size_t dispatches_before = ops.dispatch_count, dispatches_per_step = 0;
+    for (int step = 0; step < 13; step++) {
+        double wall_time;
+        const double gpu_time = time_decode_step(wall_time);
+        if (!step) dispatches_per_step = ops.dispatch_count - dispatches_before;
+        if (step >= 3) gpu_times.push_back(gpu_time), wall_times.push_back(wall_time);
+    }
+    std::sort(gpu_times.begin(), gpu_times.end()), std::sort(wall_times.begin(), wall_times.end());
+    const double step_time = gpu_times[gpu_times.size() / 2], wall_time = wall_times[wall_times.size() / 2];
+    // the sampling kernel alone on this step's scores (greedy: its argmax pass only, already in the step)
+    std::mt19937_64 rng(1);
+    const std::vector<SampleParams> params(requests, SampleParams{0.7f, 0.9f, &rng});
+    const double sampling_time = gpu_seconds(
+        [&](int) { ops.sample_tokens({ws.next_token_scores}, {ws.next_token_ids}, model.vocab_size, params); });
+    // mlx-lm's figure is end to end, so the ratio uses wall time (greedy)
+    printf("  B = %2d: %zu dispatches; GPU %6.2f ms (%5.1f tok/s); wall %6.2f ms (%5.1f tok/s)", requests,
+           dispatches_per_step, step_time * 1e3, requests / step_time, wall_time * 1e3, requests / wall_time);
+    if (mlx_baseline) printf(" vs mlx-lm %5.1f: %.2fx", mlx_baseline, requests / wall_time / mlx_baseline);
+    printf("; GPU sampling (temp 0.7, top_p 0.9) %.3f ms/step\n", sampling_time * 1e3);
+}
+
+void GpuOpsTest::bench_ops(const std::string& model_name) {
+    const ModelSpec model = spec::load(model_name);
+    id<MTLDevice> device = MTLCreateSystemDefaultDevice();
+    Weights weights(model.path, device);
+    const int chunk = 512, max_batch = 16, max_context = 8192;
+    // 27B: 16 rows of 8k
+    Memory memory(model, device, std::max<size_t>((size_t)2 << 30, Memory::arena_for(model, max_batch, max_context)));
+    GpuOps ops(memory, weights);
+    Workspace ws = ops.workspace(chunk, max_batch, max_context);
+    id<MTLCommandQueue> queue = [device newCommandQueue];
+    StepTables tables = memory.step_tables(chunk, max_context);
+    std::vector<id<MTLBuffer>> table_sets;
+    for (int i = 0; i < 16; i++) table_sets.push_back(memory.buffer(tables.words * 4));
+    const GpuOps::Layer& full_layer = ops.layers[model.full_layers()[0]];
+    const GpuOps::Layer& linear_layer = ops.layers[model.linear_layers()[0]];
+    const int max_in_size = std::max(
+        {full_layer.feed_forward_down.in_size, full_layer.attention_output.in_size, linear_layer.attention_output.in_size});
+    id<MTLBuffer> input = memory.buffer((size_t)chunk * max_in_size * ELEM);
+    id<MTLBuffer> output = memory.buffer(std::max(ws.next_token_scores.length, (size_t)chunk * model.conv_dim() * ELEM));
+    id<MTLBuffer> pool = memory.buffer(96 << 20);
+    memory.freeze();
+    GpuOpsTest bench{model, memory, ops, ws, queue, tables, table_sets, input, output, pool, full_layer, linear_layer};
 
     printf("bench-ops %s\nroofline: BW %.0f GB/s, FP16 %.1f TFLOPS (tools/roofline.py); bound = max(bytes / BW, "
            "flops / FP16);\nweights, K/V and state rotated over >= %zu MB; ! = above the %.0f GB/s peak\n",
-           s.path.c_str(), BW / 1e9, FLOPS / 1e12, POOL >> 20, PEAK_BW / 1e9);
+           model.path.c_str(), EFFECTIVE_BANDWIDTH / 1e9, FP16_FLOPS / 1e12, ROTATION_BYTES >> 20, PEAK_BANDWIDTH / 1e9);
     // warm the GPU (the first shapes run 2x slow otherwise)
-    for (auto t0 = std::chrono::steady_clock::now(); std::chrono::steady_clock::now() - t0 < std::chrono::milliseconds(300);)
-        time([&](int) { ops.linear(ops.lm, {ws.x}, {yout}, 1); });
+    for (auto start = SteadyClock::now(); SteadyClock::now() - start < std::chrono::milliseconds(300);)
+        bench.gpu_seconds([&](int) { ops.multiply_weights(ops.lm, {ws.residual}, {output}, 1); });
 
-    // projections, deduplicated by shape
-    std::vector<std::pair<std::string, QLinear>> proj;
-    auto add_proj = [&](const char* name, const QLinear& q) {
-        for (auto& [n, p] : proj)
-            if (p.N == q.N && p.K == q.K) return (void)(n += std::string("/") + name);
-        proj.push_back({name, q});
+    // projections, deduplicated by shape (names as in the model file)
+    std::vector<std::pair<std::string, QuantizedWeights>> projections;
+    auto add_projection = [&](const char* name, const QuantizedWeights& weights) {
+        for (auto& [names, seen] : projections)
+            if (seen.out_size == weights.out_size && seen.in_size == weights.in_size)
+                return (void)(names += std::string("/") + name);
+        projections.push_back({name, weights});
     };
-    add_proj("q_proj", fl.q_proj), add_proj("k_proj", fl.k_proj), add_proj("v_proj", fl.v_proj);
-    add_proj("o_proj", fl.out), add_proj("in_proj_qkv", ll.in_proj_qkv), add_proj("in_proj_z", ll.in_proj_z);
-    add_proj("in_proj_b", ll.in_proj_b), add_proj("in_proj_a", ll.in_proj_a), add_proj("out_proj", ll.out);
-    add_proj("gate_proj", fl.gate_proj), add_proj("up_proj", fl.up_proj), add_proj("down_proj", fl.down_proj);
+    add_projection("q_proj", full_layer.query_projection);
+    add_projection("k_proj", full_layer.key_projection);
+    add_projection("v_proj", full_layer.value_projection);
+    add_projection("o_proj", full_layer.attention_output);
+    add_projection("in_proj_qkv", linear_layer.query_key_value_projection);
+    add_projection("in_proj_z", linear_layer.output_gate_projection);
+    add_projection("in_proj_b", linear_layer.update_rate_projection);
+    add_projection("in_proj_a", linear_layer.decay_projection);
+    add_projection("out_proj", linear_layer.attention_output);
+    add_projection("gate_proj", full_layer.feed_forward_gate);
+    add_projection("up_proj", full_layer.feed_forward_up);
+    add_projection("down_proj", full_layer.feed_forward_down);
 
-    const int H = s.n_heads, Hkv = s.n_kv_heads, D = s.head_dim, Hv = s.lin_v_heads, Dv = s.lin_v_dim;
-    const auto full = s.full_layers(), lin = s.linear_layers();
-    const double kv_tok = (double)Hkv * D * 2 * ELEM;               // K + V bytes per token, one layer
-    const double state = 2.0 * (mem.conv_bytes + mem.delta_bytes);  // one row's state, read + written
-    const double gdn_flops = 7.0 * Hv * Dv * s.lin_k_dim;           // per token: decay, kᵀS, update, qᵀS
-    const char* tiny = "tiny: dispatch / fill floor of a few us, not bandwidth";
-    const char* cached = "activations stay in cache (no rotation, as in a real step): a few-us floor when small";
-    for (int M : {1, 4, 8, 16, 512}) {
-        const bool decode = M <= max_batch;
-        const std::string title = decode ? "decode B = " + std::to_string(M) : "prefill S = 512 (one row)";
+    for (int rows : {1, 4, 8, 16, 512}) {
+        const bool decode = rows <= max_batch;
+        const std::string title = decode ? "decode B = " + std::to_string(rows) : "prefill S = 512 (one row)";
         printf("\n%s\n  %-34s %-14s %9s %8s %9s %6s  %s\n", title.c_str(), "op", "shape", "us", "GB/s", "bound us",
                "%bound", "note (below 70% or !)");
-        auto lin_note = [&](const QLinear& q) {
-            if (q.N * q.K < 1 << 20) return tiny;  // k_proj, v_proj, in_proj_b, in_proj_a
-            if (!decode) return "qmm_t (64 x 64 tiles): dequantizing W costs ~10% next to the bf16 GEMM";
-            if (M == 1) return "MLX qmv_fast";
-            return M < 13 ? "MLX qmv_wide: known ~40% at M = 8-16, MLX the same; faster kernel breaks bit-exactness"
-                          : "MLX qmm_t_splitk: known ~40% at M = 8-16, MLX the same; faster kernel breaks bit-exactness";
-        };
-        auto bench_linear = [&](const std::string& name, const QLinear& q) {
-            const std::vector<QLinear> rot = rotate(q);
-            const double wbytes = (double)q.N * q.K / 2 + 2.0 * q.N * q.K / 64 * ELEM;
-            const double bytes = wbytes + (double)M * (q.K + q.N) * ELEM;
-            const double t = time([&](int r) { ops.linear(rot[r % rot.size()], {xin}, {yout}, M); });
-            row(name, std::to_string(q.K) + " -> " + std::to_string(q.N), t, bytes, 2.0 * M * q.N * q.K, lin_note(q));
-        };
-        for (auto& [name, q] : proj) bench_linear(name, q);
-        if (decode) bench_linear("lm_head", ops.lm);
-
-        // norms: their activations stay in cache in a real step too, so no rotation
-        double t = time([&](int) { ops.rms_norm(fl.input_layernorm, {xin}, {yout}, M, s.hidden); });
-        row("rms_norm", std::to_string(M) + " x " + std::to_string(s.hidden), t, 2.0 * M * s.hidden * ELEM, 0, cached);
-        t = time([&](int) { ops.gated_rms_norm(ll.gated_norm, {xin}, {ws.z}, {yout}, M * Hv, Dv); });
-        row("gated_rms_norm (2 dispatches)", std::to_string(M * Hv) + " x " + std::to_string(Dv), t,
-            3.0 * M * Hv * Dv * ELEM, 0, cached);
-
-        // attn(i): rows on their own pages / state, rotated over sets and layers
-        const int B = decode ? M : 1, S = decode ? 1 : M;
-        ws.B = B, ws.S = S;
-        for (int ctx : decode ? std::vector<int>{512, 2048, 8192} : std::vector<int>{512, 4096}) {
-            const double kv = (double)B * ctx * kv_tok, act = (double)B * S * (3 * H + 2 * Hkv) * D * ELEM;
-            const int sets = make_sets(B, ctx - S, S, false, kv, (int)full.size());
-            t = time([&](int r) {
-                ws.table = tabs[r % sets];
-                ops.attn(full[(r / sets) % full.size()], ws);
-            });
-            row("attn full, " + std::to_string(ctx) + " keys", decode ? std::to_string(B) + " rows" : "512 queries", t,
-                kv + act, decode ? 4.0 * B * H * D * ctx : 4.0 * H * D * S * ctx,
-                decode ? "5 dispatches (rope q, rope k, write_kv, sdpa_vector, gate): their floor dominates short contexts"
-                       : "MLX's unfused fallback (gather, 2 GEMMs, softmax over S x keys): no fused path for D 256");
-        }
-        const double lact = (double)B * S * (s.conv_dim() + 2 * Hv * Dv) * ELEM;
-        const int sets = make_sets(B, 0, S, true, B * state / 2, (int)lin.size());  // state: read + written
-        t = time([&](int r) {
-            ws.table = tabs[r % sets];
-            ops.attn(lin[(r / sets) % lin.size()], ws);
-        });
-        row("attn linear (conv, gated delta)", decode ? std::to_string(B) + " rows" : "512 tokens", t, B * state + lact,
-            (double)B * S * gdn_flops,
-            decode ? "5 dispatches (conv + norm + scale, gates, delta, gated norm x2): their floor dominates at small B"
-                   : "mlx-lm's gated delta kernel walks the 512 tokens in order (128 threadgroups): latency-bound");
-        if (decode) {
-            t = time([&](int) { ops.argmax({ws.logits}, {yout}, M, s.vocab); });
-            row("argmax", std::to_string(M) + " x " + std::to_string(s.vocab), t, (double)M * s.vocab * ELEM, 0,
-                "one threadgroup per row: B threadgroups can't reach full bandwidth");
-        }
+        for (auto& [name, projection] : projections) bench.bench_multiply(name, projection, rows, decode);
+        if (decode) bench.bench_multiply("lm_head", ops.lm, rows, decode);
+        bench.bench_norms(rows);
+        bench.bench_attention(rows, decode);
+        if (!decode) continue;
+        const double time =
+            bench.gpu_seconds([&](int) { ops.greedy_tokens({ws.next_token_scores}, {output}, rows, model.vocab_size); });
+        print_row("argmax", std::to_string(rows) + " x " + std::to_string(model.vocab_size), time,
+                  (double)rows * model.vocab_size * ELEM, 0,
+                  "one threadgroup per row: B threadgroups can't reach full bandwidth");
     }
 
-    // a whole decode step at 512 keys: dense(0 .. L) with attn of both kinds, lm_head; one command buffer
+    // a whole decode step at 512 keys: apply_weights(0 .. layers) with apply_attention of both kinds, then
+    // pick_next_tokens; one command buffer
     printf("\nwhole decode step (embed .. lm_head + argmax in one command buffer), 512 keys per row; "
            "GPU sampling at temp 0.7, top_p 0.9 timed alone; median of 10 steps\n");
     // mlx-lm tok/s at B = 1 / 4 / 8 / 16 by model (reports/mlx-lm baseline.md; 27B: B = 1 from two quiet holds,
     // B = 4 / 8 from one busy run); 0: not measured, no ratio
-    const bool is08 = s.path.find("Qwen3.5-0.8B-4bit") != std::string::npos;
-    const bool is27 = s.path.find("Qwen3.6-27B-4bit") != std::string::npos;
-    const double baseline[] = {is08 ? 307 : is27 ? 15.5 : 0, is08 ? 780 : is27 ? 35.1 : 0, is08 ? 898 : is27 ? 37.1 : 0,
-                               is08 ? 1064.0 : 0};
-    int bi = 0;
-    for (int B : {1, 4, 8, 16}) {
-        ws.B = B, ws.S = 1;
-        const uint32_t pages = mem.units_for(512);
-        units.assign(B, {});
-        std::vector<StepTables::Row> rows;
-        for (uint32_t b = 0, next = 0; b < (uint32_t)B; b++) {
-            for (uint32_t j = 0; j < pages + SU; j++) units[b].push_back(next++);
-            rows.push_back({511, 1, std::span(units[b]).first(pages), std::span(units[b]).subspan(pages)});
-        }
-        ws.table = tabs[0];
-        tables.write(ws.table, rows);
-        std::vector<double> ts, walls;  // GPU time; wall = encode + commit + wait
-        size_t d0 = ops.dispatches, per_step = 0;
-        for (int k = 0; k < 13; k++) @autoreleasepool {
-                const auto w0 = std::chrono::steady_clock::now();
-                const double t = encode_and_wait(q, ws, [&] {
-                    for (int i = 0; i <= L; i++) {
-                        ops.dense(i, ws);
-                        if (i < L) ops.attn(i, ws);
-                    }
-                    ops.lm_head(ws);
-                }, true);
-                if (!k) per_step = ops.dispatches - d0;
-                const double wall = std::chrono::duration<double>(std::chrono::steady_clock::now() - w0).count();
-                if (k >= 3) ts.push_back(t), walls.push_back(wall);
-            }
-        std::sort(ts.begin(), ts.end()), std::sort(walls.begin(), walls.end());
-        const double step = ts[ts.size() / 2], wall = walls[walls.size() / 2];
-        // the sampling kernel alone on this step's logits (greedy: its argmax pass only, already in the step)
-        std::mt19937_64 rng(1);
-        const std::vector<SampleParams> params(B, SampleParams{0.7f, 0.9f, &rng});
-        const double samp = time([&](int) { ops.sample({ws.logits}, {ws.ids}, s.vocab, params); });
-        // mlx-lm's figure is end to end, so the ratio uses wall time (greedy)
-        printf("  B = %2d: %zu dispatches; GPU %6.2f ms (%5.1f tok/s); wall %6.2f ms (%5.1f tok/s)", B, per_step, step * 1e3,
-               B / step, wall * 1e3, B / wall);
-        if (baseline[bi]) printf(" vs mlx-lm %5.1f: %.2fx", baseline[bi], B / wall / baseline[bi]);
-        printf("; GPU sampling (temp 0.7, top_p 0.9) %.3f ms/step\n", samp * 1e3);
-        bi++;
-    }
+    const bool is_0_8b = model.path.find("Qwen3.5-0.8B-4bit") != std::string::npos;
+    const bool is_27b = model.path.find("Qwen3.6-27B-4bit") != std::string::npos;
+    const double mlx_baseline[] = {is_0_8b ? 307 : is_27b ? 15.5 : 0, is_0_8b ? 780 : is_27b ? 35.1 : 0,
+                                   is_0_8b ? 898 : is_27b ? 37.1 : 0, is_0_8b ? 1064.0 : 0};
+    const int batch_sizes[] = {1, 4, 8, 16};
+    for (int i = 0; i < 4; i++) bench.bench_whole_decode_step(batch_sizes[i], mlx_baseline[i]);
 }
 
 }  // namespace mllm
 
-// mllm generate: the prompt as one user message (chat template), text streamed to stdout
 // ENGINE: --arena-gib (0: the command's default) and --max-ctx, for generate / bench / serve
 static double arena_gib = 0;
-static int max_ctx = 16384;
-static const char* prog = "mllm";  // argv[0]'s name: mmmllm through the package
-static size_t arena(double def_gib) { return (size_t)((arena_gib ? arena_gib : def_gib) * (1 << 30)); }
-// prefill chunk: shared-weight ANE blocks run 1024-token chunks (1.5x GPU prefill at 27B vs 1.3x at 512,
+static int max_context = 16384;
+static const char* program_name = "mllm";  // argv[0]'s name: mmmllm through the package
+static size_t arena_bytes(double default_gib) { return (size_t)((arena_gib ? arena_gib : default_gib) * (1 << 30)); }
+// prefill chunk: ANE blocks run 1024-token chunks (1.5x GPU prefill at 27B vs 1.3x at 512,
 // target-27b.md §5; shorter ones run the 512 block). Fixed at 1024 for this project's M4 Pro (user, 2026-11-25).
-static int chunk(const std::string& on, const std::string& ane_weights) {
-    return on == "ane" && ane_weights == "shared" ? 1024 : 512;
+static int prefill_chunk(const std::string& prefill_on) {
+    return prefill_on == "ane" ? 1024 : 512;
 }
 
-static void generate(const std::string& model, const std::string& prompt, mllm::GenParams p, const std::string& on,
-                     const std::string& ane_weights, bool prefix_cache) {
-    mllm::Engine e(model, arena(1), chunk(on, ane_weights), 32, 16, max_ctx, on, ane_weights, prefix_cache);
-    e.generate({{"user", prompt}}, p, [](const std::string& t) {
-        fputs(t.c_str(), stdout);
+// mllm generate: the prompt as one user message (chat template), text streamed to stdout
+static void generate(const std::string& model, const std::string& prompt, mllm::GenParams params,
+                     const std::string& prefill_on, bool prefix_cache) {
+    mllm::Engine engine(model, arena_bytes(1), prefill_chunk(prefill_on), 32, 16, max_context, prefill_on, prefix_cache);
+    engine.generate({{"user", prompt}}, params, [](const std::string& text) {
+        fputs(text.c_str(), stdout);
         fflush(stdout);
         return true;
     });
@@ -288,57 +375,66 @@ static void generate(const std::string& model, const std::string& prompt, mllm::
 // plus the new message. Ctrl-C stops a reply (the turn is dropped), at the prompt it quits, as does Ctrl-D.
 static std::atomic<bool> interrupted;
 
-static void chat(const std::string& model, mllm::GenParams p, bool default_max, const std::string& on,
-                 const std::string& ane_weights, bool prefix_cache) {
-    mllm::Engine e(model, arena(1), chunk(on, ane_weights), 32, 16, max_ctx, on, ane_weights, prefix_cache);
+struct Reply {
+    std::string text;
+    int tokens = 0, cached_tokens = 0;
+    SteadyClock::time_point first_token_at;
+};
+
+// Steps the engine, printing the request's text as it comes, until it is done or Ctrl-C
+static Reply stream_reply(mllm::Engine& engine, int request_id) {
+    Reply reply;
+    for (bool done = false; !done && !interrupted;)
+        for (const mllm::Event& event : engine.step()) {
+            if (event.req_id != request_id) continue;
+            if (event.token < 0) throw std::runtime_error("request aborted");
+            if (!reply.tokens++) reply.first_token_at = SteadyClock::now();
+            reply.cached_tokens = event.cached, done = event.done;
+            reply.text += event.text;
+            fputs(event.text.c_str(), stdout);
+            fflush(stdout);
+        }
+    return reply;
+}
+
+static void chat(const std::string& model, mllm::GenParams params, bool default_max_tokens,
+                 const std::string& prefill_on, bool prefix_cache) {
+    mllm::Engine engine(model, arena_bytes(1), prefill_chunk(prefill_on), 32, 16, max_context, prefill_on, prefix_cache);
     const bool tty = isatty(0);
-    if (tty) fprintf(stderr, "%s chat: Ctrl-C stops a reply, Ctrl-D quits\n", prog);
+    if (tty) fprintf(stderr, "%s chat: Ctrl-C stops a reply, Ctrl-D quits\n", program_name);
     std::vector<mllm::Message> history;
     for (std::string line;;) {
         if (tty) fputs(">>> ", stdout), fflush(stdout);
         if (!std::getline(std::cin, line)) break;
         if (line.empty()) continue;
         history.push_back({"user", line});
-        using clock = std::chrono::steady_clock;
-        const auto t0 = clock::now();
-        std::vector<int> ids = e.tok.encode_chat(history);
-        const int n = ids.size();
-        if (default_max) p.max_tokens = std::max(1, std::min(4096, e.ctx_limit() - n));
-        int rid;
+        const auto start = SteadyClock::now();
+        std::vector<int> tokens = engine.tokenizer.encode_chat(history);
+        const int prompt_tokens = tokens.size();
+        if (default_max_tokens) params.max_tokens = std::max(1, std::min(4096, engine.context_limit() - prompt_tokens));
+        int request_id;
         try {
-            rid = e.submit(std::move(ids), p);
+            request_id = engine.submit(std::move(tokens), params);
         } catch (const std::invalid_argument& x) {
-            fprintf(stderr, "%s: %s\n", prog, x.what());
+            fprintf(stderr, "%s: %s\n", program_name, x.what());
             history.pop_back();
             continue;
         }
         interrupted = false;
         signal(SIGINT, [](int) { interrupted = true; });
-        std::string reply;
-        int out = 0, cached = 0;
-        clock::time_point t1;
-        for (bool done = false; !done && !interrupted;)
-            for (const mllm::Event& ev : e.step()) {
-                if (ev.req_id != rid) continue;
-                if (ev.token < 0) throw std::runtime_error("request aborted");
-                if (!out++) t1 = clock::now();
-                cached = ev.cached, done = ev.done;
-                reply += ev.text;
-                fputs(ev.text.c_str(), stdout);
-                fflush(stdout);
-            }
+        const Reply reply = stream_reply(engine, request_id);
         signal(SIGINT, SIG_DFL);
-        const auto t2 = clock::now();
-        auto sec = [](auto d) { return std::chrono::duration<double>(d).count(); };
+        const auto end = SteadyClock::now();
         if (interrupted) {
-            e.cancel(rid);
+            engine.cancel(request_id);
             history.pop_back();
             fprintf(stderr, "\n[stopped]\n");
             continue;
         }
-        history.push_back({"assistant", reply});
-        fprintf(stderr, "\n[prompt %d tokens, %d cached, first token %.2f s; %d tokens at %.1f tok/s]\n", n, cached,
-                sec(t1 - t0), out, out > 1 ? (out - 1) / sec(t2 - t1) : 0.0);
+        history.push_back({"assistant", reply.text});
+        fprintf(stderr, "\n[prompt %d tokens, %d cached, first token %.2f s; %d tokens at %.1f tok/s]\n", prompt_tokens,
+                reply.cached_tokens, seconds(reply.first_token_at - start), reply.tokens,
+                reply.tokens > 1 ? (reply.tokens - 1) / seconds(end - reply.first_token_at) : 0.0);
     }
 }
 
@@ -349,79 +445,88 @@ static void chat(const std::string& model, mllm::GenParams p, bool default_max, 
 // stream > 0 (not in mlx-lm): meanwhile keep one more request of `stream` random tokens prefilling (max_tokens 1, a new
 // one as each finishes), left out of the fields above; stream_tps = its prompt tokens done / the trial's time. Measures
 // what a concurrent prefill costs decode (architecture.md "Concurrency").
-static void bench(const std::string& model, int P, int G, int B, int n, const std::string& on,
-                  const std::string& ane_weights, int stream, bool prefix_cache) {
-    mllm::Engine e(model, arena(1), chunk(on, ane_weights), 32, 16, max_ctx, on, ane_weights, prefix_cache);
-    e.tok.eos.clear();  // as mlx_lm.benchmark: never stop early
-    std::mt19937 rng(0);
-    std::uniform_int_distribution<int> tok(0, e.spec.vocab - 1);
-    std::vector<std::vector<int>> prompts(B, std::vector<int>(P));
-    for (auto& p : prompts)
-        for (int& t : p) t = tok(rng);
-    std::vector<int> stream_prompt(stream);
-    for (int& t : stream_prompt) t = tok(rng);
-    const mllm::Arena& a = e.mem.arena;
-    struct Trial {
-        double prompt_tps, generation_tps, peak_memory, total_time, stream_tps;
+struct Trial {
+    double prompt_tps, generation_tps, peak_memory, total_time, stream_tps;
+};
+
+static Trial run_trial(mllm::Engine& engine, const std::vector<std::vector<int>>& prompts,
+                       const std::vector<int>& stream_prompt, int generation_tokens) {
+    const mllm::Arena& arena = engine.mem.arena;
+    const long batch_size = prompts.size(), stream_tokens = stream_prompt.size();
+    const auto start = SteadyClock::now();
+    std::map<int, int> tokens_by_request;
+    for (const auto& prompt : prompts) tokens_by_request[engine.submit(prompt, {.max_tokens = generation_tokens})] = 0;
+    int stream_id = -1;
+    long streamed = 0;
+    uint32_t peak_units = 0;
+    SteadyClock::time_point all_started_at;
+    long tokens_after = 0, started = 0;
+    auto any_live = [&] {
+        return std::any_of(tokens_by_request.begin(), tokens_by_request.end(),
+                           [&](auto& entry) { return engine.requests.count(entry.first); });
     };
-    auto trial = [&] {
-        using clock = std::chrono::steady_clock;
-        const auto t0 = clock::now();
-        std::map<int, int> got;
-        for (const auto& p : prompts) got[e.submit(p, {.max_tokens = G})] = 0;
-        int sid = -1;
-        long streamed = 0;
-        uint32_t peak_units = 0;
-        clock::time_point t_prompt;
-        long after = 0, started = 0;
-        while (std::any_of(got.begin(), got.end(), [&](auto& kv) { return e.reqs.count(kv.first); })) {
-            if (stream && !e.reqs.count(sid)) {
-                streamed += sid < 0 ? 0 : stream;
-                sid = e.submit(stream_prompt, {.max_tokens = 1});
-            }
-            for (const mllm::Event& ev : e.step()) {
-                if (!got.count(ev.req_id)) continue;
-                if (got[ev.req_id]++ == 0 && ++started == B) t_prompt = clock::now();
-                else if (started == B) after++;
-            }
-            peak_units = std::max(peak_units, a.n_units - a.free_units);
+    while (any_live()) {
+        if (stream_tokens && !engine.requests.count(stream_id)) {
+            streamed += stream_id < 0 ? 0 : stream_tokens;
+            stream_id = engine.submit(stream_prompt, {.max_tokens = 1});
         }
-        const auto t1 = clock::now();
-        if (sid >= 0) e.cancel(sid);
-        while (!e.reqs.empty()) e.step();
-        auto sec = [](auto d) { return std::chrono::duration<double>(d).count(); };
-        const double mem = (double)e.device.currentAllocatedSize - e.mem.arena_buffer.length + peak_units * a.unit_bytes;
-        return Trial{(double)B * P / sec(t_prompt - t0), after / sec(t1 - t_prompt), mem / 1e9, sec(t1 - t0),
-                     streamed / sec(t1 - t0)};
-    };
+        for (const mllm::Event& event : engine.step()) {
+            if (!tokens_by_request.count(event.req_id)) continue;
+            if (tokens_by_request[event.req_id]++ == 0 && ++started == batch_size) all_started_at = SteadyClock::now();
+            else if (started == batch_size) tokens_after++;
+        }
+        peak_units = std::max(peak_units, arena.n_units - arena.free_units);
+    }
+    const auto end = SteadyClock::now();
+    if (stream_id >= 0) engine.cancel(stream_id);
+    while (!engine.requests.empty()) engine.step();
+    const double memory =
+        (double)engine.device.currentAllocatedSize - engine.mem.arena_buffer.length + peak_units * arena.unit_bytes;
+    return Trial{(double)batch_size * prompts[0].size() / seconds(all_started_at - start),
+                 tokens_after / seconds(end - all_started_at), memory / 1e9, seconds(end - start),
+                 streamed / seconds(end - start)};
+}
+
+static void bench(const std::string& model, int prompt_tokens, int generation_tokens, int batch_size, int trials,
+                  const std::string& prefill_on, int stream_tokens, bool prefix_cache) {
+    mllm::Engine engine(model, arena_bytes(1), prefill_chunk(prefill_on), 32, 16, max_context, prefill_on, prefix_cache);
+    engine.tokenizer.eos.clear();  // as mlx_lm.benchmark: never stop early
+    std::mt19937 rng(0);
+    std::uniform_int_distribution<int> random_token(0, engine.spec.vocab_size - 1);
+    std::vector<std::vector<int>> prompts(batch_size, std::vector<int>(prompt_tokens));
+    for (auto& prompt : prompts)
+        for (int& token : prompt) token = random_token(rng);
+    std::vector<int> stream_prompt(stream_tokens);
+    for (int& token : stream_prompt) token = random_token(rng);
     printf("Running warmup..\n");
-    trial();
-    printf("Timing with prompt_tokens=%d, generation_tokens=%d, batch_size=%d.\n", P, G, B);
+    run_trial(engine, prompts, stream_prompt, generation_tokens);
+    printf("Timing with prompt_tokens=%d, generation_tokens=%d, batch_size=%d.\n", prompt_tokens, generation_tokens,
+           batch_size);
     Trial sum{};
-    for (int i = 0; i < n; i++) {
-        Trial t = trial();
+    for (int i = 0; i < trials; i++) {
+        Trial trial = run_trial(engine, prompts, stream_prompt, generation_tokens);
         printf("Trial %d:  prompt_tps=%.3f, generation_tps=%.3f, peak_memory=%.3f, total_time=%.3f", i + 1,
-               t.prompt_tps, t.generation_tps, t.peak_memory, t.total_time);
-        if (stream) printf(", stream_tps=%.1f", t.stream_tps);
+               trial.prompt_tps, trial.generation_tps, trial.peak_memory, trial.total_time);
+        if (stream_tokens) printf(", stream_tps=%.1f", trial.stream_tps);
         printf("\n");
         fflush(stdout);
-        sum = {sum.prompt_tps + t.prompt_tps, sum.generation_tps + t.generation_tps, sum.peak_memory + t.peak_memory, 0,
-               sum.stream_tps + t.stream_tps};
+        sum = {sum.prompt_tps + trial.prompt_tps, sum.generation_tps + trial.generation_tps,
+               sum.peak_memory + trial.peak_memory, 0, sum.stream_tps + trial.stream_tps};
     }
-    printf("Averages: prompt_tps=%.3f, generation_tps=%.3f, peak_memory=%.3f", sum.prompt_tps / n,
-           sum.generation_tps / n, sum.peak_memory / n);
-    if (stream) printf(", stream_tps=%.1f", sum.stream_tps / n);
+    printf("Averages: prompt_tps=%.3f, generation_tps=%.3f, peak_memory=%.3f", sum.prompt_tps / trials,
+           sum.generation_tps / trials, sum.peak_memory / trials);
+    if (stream_tokens) printf(", stream_tps=%.1f", sum.stream_tps / trials);
     printf("\n");
 }
 
 // mllm serve: /v1/completions on 127.0.0.1 until killed. A 2 GiB arena: 32 requests of 512 + 256 tokens need 0.9.
-static int serve(const std::string& model, int port, const std::string& on, const std::string& ane_weights,
-                 int max_batch, bool prefix_cache) {
-    mllm::Engine e(model, arena(2), chunk(on, ane_weights), 32, max_batch, max_ctx, on, ane_weights, prefix_cache);
-    mllm::Server s(e, model);
+static int serve(const std::string& model, int port, const std::string& prefill_on, int max_batch, bool prefix_cache) {
+    mllm::Engine engine(model, arena_bytes(2), prefill_chunk(prefill_on), 32, max_batch, max_context, prefill_on,
+                        prefix_cache);
+    mllm::Server server(engine, model);
     fprintf(stderr, "%s serve: http://127.0.0.1:%d/v1 (chat/completions, completions; prefill on %s, max batch %d, "
-            "prefix cache %s)\n", prog, port, on.c_str(), max_batch, prefix_cache ? "on" : "off");
-    if (!s.listen("127.0.0.1", port)) throw std::runtime_error("can't listen on port " + std::to_string(port));
+            "prefix cache %s)\n", program_name, port, prefill_on.c_str(), max_batch, prefix_cache ? "on" : "off");
+    if (!server.listen("127.0.0.1", port)) throw std::runtime_error("can't listen on port " + std::to_string(port));
     return 0;
 }
 
@@ -436,85 +541,94 @@ static int usage() {
             "         /v1/completions on 127.0.0.1\n"
             "       %1$s bench-ops MODEL                      GPU time per op and per decode step, next to the roofline\n"
             "MODEL: repo id under $HF_HOME, or a local dir\n"
-            "PREFILL: [--prefill gpu|ane] [--ane-weights shared|fp16|int8|lut6|lut4]: dense blocks of prefill on the\n"
-            "         Neural Engine (Core ML models built by py/mllm/ane.py). shared (default): no weight copy of its\n"
-            "         own, the GPU feeds it its weights a layer at a time, 1024-token chunks; the others bake the\n"
-            "         weights into per-layer blocks of 512 (small models only: a copy of their own)\n"
+            "PREFILL: [--prefill gpu|ane]: prefill's matmuls on the Neural Engine, the GPU feeding it its own weights a\n"
+            "         layer at a time (Core ML blocks built by py/mllm/ane.py), 1024-token chunks\n"
             "         [--prefix-cache on|off]: reuse prompt prefixes across requests (default on; off for bench, whose\n"
             "         trials repeat the same prompts)\n"
             "ENGINE (generate, bench, serve): [--arena-gib G] (default 1, serve 2; 12 at 2 MiB units, the 27B)\n"
-            "         [--max-ctx N] (default 16384; 32768 at 2 MiB units)\n", prog);
+            "         [--max-ctx N] (default 16384; 32768 at 2 MiB units)\n", program_name);
     return 2;
 }
 
+// Runs one command; its flags after the positional arguments, each taken out of flags as it is read
+static int run_command(int argc, char** argv, int positional_count, std::map<std::string, std::string>& flags) {
+    const std::string command = argv[1];
+    auto take_flag = [&](const char* name, const char* default_value) {
+        auto found = flags.find(name);
+        std::string value = found == flags.end() ? default_value : found->second;
+        if (found != flags.end()) flags.erase(found);
+        return value;
+    };
+    auto take_prefix_cache = [&](const char* default_value) {
+        const std::string value = take_flag("--prefix-cache", default_value);
+        if (value != "on" && value != "off") throw std::invalid_argument("--prefix-cache: on or off, not " + value);
+        return value == "on";
+    };
+    // defaults by unit size: 2 MiB units (27B) get target-27b.md's budget, a 12 GiB arena and max_ctx 32k; smaller
+    // models keep 0 (the command's default arena) and 16k
+    const bool big = positional_count >= 3 && command != "bench-ops" &&
+                     mllm::Memory::unit_of(mllm::spec::load(argv[2])) >= (2u << 20);
+    arena_gib = std::stod(take_flag("--arena-gib", big ? "12" : "0"));
+    max_context = std::stoi(take_flag("--max-ctx", big ? "32768" : "16384"));
+    if (arena_gib < 0 || max_context < 1) return usage();
+    if (command == "generate") {
+        mllm::GenParams params{std::stoi(take_flag("--max-tokens", "256")), std::stof(take_flag("--temp", "0")),
+                               std::stof(take_flag("--top-p", "0"))};
+        const std::string prefill_on = take_flag("--prefill", "gpu");
+        const bool prefix_cache = take_prefix_cache("on");
+        if (!flags.empty()) return usage();
+        generate(argv[2], argv[3], params, prefill_on, prefix_cache);
+    } else if (command == "chat") {
+        const bool default_max_tokens = !flags.count("--max-tokens");
+        mllm::GenParams params{std::stoi(take_flag("--max-tokens", "1")), std::stof(take_flag("--temp", "0")),
+                               std::stof(take_flag("--top-p", "0"))};
+        const std::string prefill_on = take_flag("--prefill", "gpu");
+        const bool prefix_cache = take_prefix_cache("on");
+        if (!flags.empty()) return usage();
+        chat(argv[2], params, default_max_tokens, prefill_on, prefix_cache);
+    } else if (command == "bench") {
+        const int prompt_tokens = std::stoi(take_flag("-p", "512")), generation_tokens = std::stoi(take_flag("-g", "1024"));
+        const int batch_size = std::stoi(take_flag("-b", "1")), trials = std::stoi(take_flag("-n", "5"));
+        const std::string prefill_on = take_flag("--prefill", "gpu");
+        const int stream_tokens = std::stoi(take_flag("--stream", "0"));
+        const bool prefix_cache = take_prefix_cache("off");
+        if (!flags.empty() || prompt_tokens < 2 || generation_tokens < 1 || batch_size < 1 || trials < 1 ||
+            stream_tokens < 0 || stream_tokens == 1)
+            return usage();
+        bench(argv[2], prompt_tokens, generation_tokens, batch_size, trials, prefill_on, stream_tokens, prefix_cache);
+    } else if (command == "serve") {
+        const int port = std::stoi(take_flag("--port", "8080")), max_batch = std::stoi(take_flag("--max-batch", "32"));
+        const std::string prefill_on = take_flag("--prefill", "gpu");
+        const bool prefix_cache = take_prefix_cache("on");
+        if (!flags.empty() || max_batch < 1) return usage();
+        return serve(argv[2], port, prefill_on, max_batch, prefix_cache);
+    } else if (command == "bench-ops") {
+        if (!flags.empty()) return usage();
+        mllm::GpuOpsTest::bench_ops(argv[2]);
+    } else {
+        if (argc != 2) return usage();
+        mllm::ModelSpec model = mllm::spec::load(argv[1]);
+        printf("%s\n%d layers (%zu full, %zu linear), hidden %d, vocab %d\n", model.path.c_str(), model.n_layers(),
+               model.full_layers().size(), model.linear_layers().size(), model.hidden, model.vocab_size);
+    }
+    return 0;
+}
+
 int main(int argc, char** argv) {
-    if (const char* sl = strrchr(argv[0], '/')) prog = sl + 1;
-    else prog = argv[0];
+    if (const char* slash = strrchr(argv[0], '/')) program_name = slash + 1;
+    else program_name = argv[0];
     if (argc < 2) return usage();
-    const std::string cmd = argv[1];
+    const std::string command = argv[1];
     // flags after the positional arguments: name -> value
     std::map<std::string, std::string> flags;
-    const int npos = cmd == "generate" ? 4 : cmd == "bench" || cmd == "bench-ops" || cmd == "serve" || cmd == "chat" ? 3 : 2;
-    if (argc < npos || (argc - npos) % 2) return usage();
-    for (int i = npos; i < argc; i += 2) flags[argv[i]] = argv[i + 1];
-    auto flag = [&](const char* name, const char* def) {
-        auto it = flags.find(name);
-        std::string v = it == flags.end() ? def : it->second;
-        if (it != flags.end()) flags.erase(it);
-        return v;
-    };
-    auto prefix_cache = [&](const char* def) {
-        const std::string v = flag("--prefix-cache", def);
-        if (v != "on" && v != "off") throw std::invalid_argument("--prefix-cache: on or off, not " + v);
-        return v == "on";
-    };
+    const bool takes_model = command == "bench" || command == "bench-ops" || command == "serve" || command == "chat";
+    const int positional_count = command == "generate" ? 4 : takes_model ? 3 : 2;
+    if (argc < positional_count || (argc - positional_count) % 2) return usage();
+    for (int i = positional_count; i < argc; i += 2) flags[argv[i]] = argv[i + 1];
     try {
-        // defaults by unit size: 2 MiB units (27B) get target-27b.md's budget, a 12 GiB arena and max_ctx 32k; smaller
-        // models keep 0 (the command's default arena) and 16k
-        const bool big = npos >= 3 && cmd != "bench-ops" && mllm::Memory::unit_of(mllm::spec::load(argv[2])) >= (2u << 20);
-        arena_gib = std::stod(flag("--arena-gib", big ? "12" : "0"));
-        max_ctx = std::stoi(flag("--max-ctx", big ? "32768" : "16384"));
-        if (arena_gib < 0 || max_ctx < 1) return usage();
-        if (cmd == "generate") {
-            mllm::GenParams p{std::stoi(flag("--max-tokens", "256")), std::stof(flag("--temp", "0")),
-                              std::stof(flag("--top-p", "0"))};
-            const std::string on = flag("--prefill", "gpu"), aw = flag("--ane-weights", "shared");
-            const bool pc = prefix_cache("on");
-            if (!flags.empty()) return usage();
-            generate(argv[2], argv[3], p, on, aw, pc);
-        } else if (cmd == "chat") {
-            const bool default_max = !flags.count("--max-tokens");
-            mllm::GenParams p{std::stoi(flag("--max-tokens", "1")), std::stof(flag("--temp", "0")),
-                              std::stof(flag("--top-p", "0"))};
-            const std::string on = flag("--prefill", "gpu"), aw = flag("--ane-weights", "shared");
-            const bool pc = prefix_cache("on");
-            if (!flags.empty()) return usage();
-            chat(argv[2], p, default_max, on, aw, pc);
-        } else if (cmd == "bench") {
-            const int P = std::stoi(flag("-p", "512")), G = std::stoi(flag("-g", "1024")), B = std::stoi(flag("-b", "1"));
-            const int n = std::stoi(flag("-n", "5"));
-            const std::string on = flag("--prefill", "gpu"), aw = flag("--ane-weights", "shared");
-            const int stream = std::stoi(flag("--stream", "0"));
-            const bool pc = prefix_cache("off");
-            if (!flags.empty() || P < 2 || G < 1 || B < 1 || n < 1 || stream < 0 || stream == 1) return usage();
-            bench(argv[2], P, G, B, n, on, aw, stream, pc);
-        } else if (cmd == "serve") {
-            const int port = std::stoi(flag("--port", "8080")), max_batch = std::stoi(flag("--max-batch", "32"));
-            const std::string on = flag("--prefill", "gpu"), aw = flag("--ane-weights", "shared");
-            const bool pc = prefix_cache("on");
-            if (!flags.empty() || max_batch < 1) return usage();
-            return serve(argv[2], port, on, aw, max_batch, pc);
-        } else if (cmd == "bench-ops") {
-            if (!flags.empty()) return usage();
-            mllm::GpuOpsTest::bench_ops(argv[2]);
-        } else {
-            if (argc != 2) return usage();
-            mllm::ModelSpec s = mllm::spec::load(argv[1]);
-            printf("%s\n%d layers (%zu full, %zu linear), hidden %d, vocab %d\n", s.path.c_str(), s.n_layers(),
-                   s.full_layers().size(), s.linear_layers().size(), s.hidden, s.vocab);
-        }
+        return run_command(argc, argv, positional_count, flags);
     } catch (const std::exception& e) {
-        fprintf(stderr, "%s: %s\n", prog, e.what());
+        fprintf(stderr, "%s: %s\n", program_name, e.what());
         return 1;
     }
 }
