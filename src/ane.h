@@ -28,7 +28,7 @@ class AneOps {
 public:
     // Loads every block (compute units CPU + NE) and allocates its surfaces. Throws, naming the Python command that
     // builds them, if a block is missing. weights: fp16, int8, lut6, lut4 (baked into per-layer blocks) or shared.
-    AneOps(GpuOps& gpu, Memory& mem, int S, const std::string& weights = "fp16");
+    AneOps(GpuOps& gpu, Memory& mem, int S, const std::string& weights = "shared");
 
     // set: which of the 2 surface sets (two chunks in flight, one set each; PrefillLane uses chunk parity).
     // Encode into ws.enc: block i's inputs (ws.x, and ws.o for i > 0) into its surfaces, zero past ws.S tokens.

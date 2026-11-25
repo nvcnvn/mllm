@@ -388,7 +388,7 @@ int main() {
             for (const mllm::Event& ev : e.step()) out.push_back(ev.token);
         return out;
     };
-    mllm::Engine ea(golden::MODEL, 512 << 20, S, 32, 16, 4096, "ane");
+    mllm::Engine ea(golden::MODEL, 512 << 20, S, 32, 16, 4096, "ane", "fp16");
     for (int i = 0; i < 3; i++) {
         std::vector<int> got = greedy(ea, prompts[i], 64), want = ids_of("greedy/" + std::to_string(i));
         printf("c. engine, ANE prefill: prompt %d greedy %zu tokens %s golden\n", i, got.size(),

@@ -267,7 +267,7 @@ static int max_ctx = 16384;
 static const char* prog = "mllm";  // argv[0]'s name: mmmllm through the package
 static size_t arena(double def_gib) { return (size_t)((arena_gib ? arena_gib : def_gib) * (1 << 30)); }
 // prefill chunk: shared-weight ANE blocks run 1024-token chunks (1.5x GPU prefill at 27B vs 1.3x at 512,
-// target-27b.md §5; shorter ones run the 512 block); 2048 needs steel attention (engine.mm)
+// target-27b.md §5; shorter ones run the 512 block). Fixed at 1024 for this project's M4 Pro (user, 2026-11-25).
 static int chunk(const std::string& on, const std::string& ane_weights) {
     return on == "ane" && ane_weights == "shared" ? 1024 : 512;
 }
@@ -436,9 +436,10 @@ static int usage() {
             "         /v1/completions on 127.0.0.1\n"
             "       %1$s bench-ops MODEL                      GPU time per op and per decode step, next to the roofline\n"
             "MODEL: repo id under $HF_HOME, or a local dir\n"
-            "PREFILL: [--prefill gpu|ane] [--ane-weights fp16|int8|lut6|lut4|shared]: dense blocks of prefill on the\n"
-            "         Neural Engine (Core ML models built by py/mllm/ane.py). shared: no weight copy of its own (the GPU\n"
-            "         feeds it its weights a layer at a time; the 27B's option), 1024-token chunks\n"
+            "PREFILL: [--prefill gpu|ane] [--ane-weights shared|fp16|int8|lut6|lut4]: dense blocks of prefill on the\n"
+            "         Neural Engine (Core ML models built by py/mllm/ane.py). shared (default): no weight copy of its\n"
+            "         own, the GPU feeds it its weights a layer at a time, 1024-token chunks; the others bake the\n"
+            "         weights into per-layer blocks of 512 (small models only: a copy of their own)\n"
             "         [--prefix-cache on|off]: reuse prompt prefixes across requests (default on; off for bench, whose\n"
             "         trials repeat the same prompts)\n"
             "ENGINE (generate, bench, serve): [--arena-gib G] (default 1, serve 2; 12 at 2 MiB units, the 27B)\n"
@@ -477,7 +478,7 @@ int main(int argc, char** argv) {
         if (cmd == "generate") {
             mllm::GenParams p{std::stoi(flag("--max-tokens", "256")), std::stof(flag("--temp", "0")),
                               std::stof(flag("--top-p", "0"))};
-            const std::string on = flag("--prefill", "gpu"), aw = flag("--ane-weights", "fp16");
+            const std::string on = flag("--prefill", "gpu"), aw = flag("--ane-weights", "shared");
             const bool pc = prefix_cache("on");
             if (!flags.empty()) return usage();
             generate(argv[2], argv[3], p, on, aw, pc);
@@ -485,21 +486,21 @@ int main(int argc, char** argv) {
             const bool default_max = !flags.count("--max-tokens");
             mllm::GenParams p{std::stoi(flag("--max-tokens", "1")), std::stof(flag("--temp", "0")),
                               std::stof(flag("--top-p", "0"))};
-            const std::string on = flag("--prefill", "gpu"), aw = flag("--ane-weights", "fp16");
+            const std::string on = flag("--prefill", "gpu"), aw = flag("--ane-weights", "shared");
             const bool pc = prefix_cache("on");
             if (!flags.empty()) return usage();
             chat(argv[2], p, default_max, on, aw, pc);
         } else if (cmd == "bench") {
             const int P = std::stoi(flag("-p", "512")), G = std::stoi(flag("-g", "1024")), B = std::stoi(flag("-b", "1"));
             const int n = std::stoi(flag("-n", "5"));
-            const std::string on = flag("--prefill", "gpu"), aw = flag("--ane-weights", "fp16");
+            const std::string on = flag("--prefill", "gpu"), aw = flag("--ane-weights", "shared");
             const int stream = std::stoi(flag("--stream", "0"));
             const bool pc = prefix_cache("off");
             if (!flags.empty() || P < 2 || G < 1 || B < 1 || n < 1 || stream < 0 || stream == 1) return usage();
             bench(argv[2], P, G, B, n, on, aw, stream, pc);
         } else if (cmd == "serve") {
             const int port = std::stoi(flag("--port", "8080")), max_batch = std::stoi(flag("--max-batch", "32"));
-            const std::string on = flag("--prefill", "gpu"), aw = flag("--ane-weights", "fp16");
+            const std::string on = flag("--prefill", "gpu"), aw = flag("--ane-weights", "shared");
             const bool pc = prefix_cache("on");
             if (!flags.empty() || max_batch < 1) return usage();
             return serve(argv[2], port, on, aw, max_batch, pc);

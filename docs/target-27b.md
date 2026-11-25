@@ -108,7 +108,7 @@ Expected shape (*estimates* from the 0.8B numbers, replaced by measurements as i
   Largest |value| in the fp16 dense: residual 868, down_proj out 502, FFN act 354 (fp16 max 65504). Not covered:
   the ANE's own accumulation (MLX fp16 matmuls accumulate in fp32). **Check** in the engine work: a real layer's
   ANE output against this emulation.
-- [x] **Engine** (2026-11-25): `--prefill ane --ane-weights shared` (AneOps shared, src/ane.mm; blocks from
+- [x] **Engine** (2026-11-25): `--prefill ane` (`--ane-weights shared`, the default) (AneOps shared, src/ane.mm; blocks from
   `ane.py build_shared`, 4 kinds x S 512 / 1024, 32 s to build at 27B). Chunks of 1024; a shorter one runs the 512
   block; two chunks in flight, each with its own weight surfaces (~0.9 GB a set at 27B). Tests: test_ane_shared (0.8B:
   K/V/state cos vs GPU 0.9952-0.9987, like the baked fp16 blocks; two in flight bit-exact; greedy = golden up to the
@@ -123,8 +123,8 @@ Expected shape (*estimates* from the 0.8B numbers, replaced by measurements as i
   | peak memory | 16.6-16.8 GB | 19.7-19.9 GB |
 
 - [ ] **Next:** a single chunk takes turns (ANE dense, then GPU attn + the next layer's dequant): dequant layer i + 1
-  while the ANE runs layer i (a third weight set) for the one-chunk case. 2048-token chunks (steel attention). Tune
-  `gpu_below` for 27B (256, from the 0.8B). Startup time of the 8 models not measured. Default `--ane-weights` for 27B.
+  while the ANE runs layer i (a third weight set) for the one-chunk case. Tune `gpu_below` for 27B (256, from the
+  0.8B). Startup time of the 8 models not measured. Chunks stay 1024 (user, 2026-11-25: no 2048 / steel attention).
 - LUT4 as the *GPU's* format too (one format, not one copy: the ANE still compiles its own): ruled out 2026-11-25, ~10%
   less to read per decode step isn't worth the precision and losing bit-exactness with mlx-lm.
 - [ ] Weight format: LUT4 built from the **bf16 original** weights (LUT4 from the 4-bit MLX weights failed on 0.8B, cos 0.93). **Check:** per-block cos against fp32 reference; whole-model greedy tokens against GPU prefill; total weights (GPU 4-bit + ANE) next to a 12 GiB arena and ~16 GB for macOS fit in 64 GB.
