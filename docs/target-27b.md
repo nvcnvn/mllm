@@ -78,8 +78,28 @@ Expected shape (*estimates* from the 0.8B numbers, replaced by measurements as i
     ANE with input weights is about even at 512-token chunks and ~1.7x at 2048, before per-call overheads of a real
     layer, plus the GPU's dequant (~0.8 GB fp16 written per layer, ~4 ms) and ~1.7 GB double-buffered scratch.
     Route open. Its case is still mainly concurrency (decode keeps its speed during prefill), not single-user speed.
-- [ ] **Next for that route:** one whole 27B layer as a Core ML block with weight inputs (fine splits), the GPU
-  writing the scratch. **Check:** layer time vs GPU prefill at S = 512 and 2048, and decode speed alongside.
+- [x] **One 27B layer with weight inputs** (2026-11-25, `tools/ane_layer.py` builds, `tools/ane_time.swift` times
+  with IOSurface I/O; random weights, Qwen3.6-27B shapes). Dense block = o/out_proj + FFN of layer i-1 and the
+  projections of layer i, row-major [S, C], ~730 MiB fp16 of weight inputs. Splits: one input per linear sliced in
+  the graph into Cin <= 1024 x Cout <= 4096 pieces (47 ms at S=512); unsplit 200 ms; the pieces as 133 separate
+  inputs 95 ms (37 ms of CPU per call). All matmuls on the ANE. One compiled model per layer kind and S serves all
+  layers (weights are inputs), loading in 4-14 s.
+
+  | S | linear-attn block | full-attn block | dense only, x 64 layers | vs GPU prefill (131 tok/s) |
+  |---|---|---|---|---|
+  | 512 | 47.4 ms (8.3 TFLOPS) | 47.4 ms | 169 tok/s | 1.3x |
+  | 1024 | 82.5 ms (9.5) | 82.8 ms | 194 tok/s | 1.5x |
+  | 2048 | 153 ms (10.3) | 154 ms | 209 tok/s | 1.6x |
+
+  - GPU side per layer and chunk: dequant 4-bit -> fp16 scratch 5.4 ms (MLX, 175 GB/s), plus attention / DeltaNet.
+    Both well under the ANE's time, so with two chunks in flight prefill is ANE-bound (estimate, not measured).
+  - Decode alongside (27B, B=1): 14.9 tok/s alone, 12.6 with the S=2048 block looping on the ANE (-16%; the dequant
+    would add ~3.5% GPU time). GPU prefill alongside costs decode ~70%.
+  - Scratch: two layers' weights, ~1.5 GB. S=2048 also needs steel attention on the GPU (engine.mm rejects chunk >= 2048).
+- [ ] **Precision:** the ANE computes in fp16, the GPU in bf16. 27B's residual stream may exceed fp16's range.
+  **Check:** real weights, fp16 dense blocks vs the GPU path, per layer cos and max |x|, before any engine work.
+- [ ] **Engine:** AneOps with weight inputs (src/ane.mm), GPU dequant into IOSurface scratch, chunk sizes picked per
+  prompt (2048 / 1024 / 512, GPU tail). **Check:** 27B TTFT at 1k-8k vs GPU, decode alongside, greedy tokens vs GPU.
 - LUT4 as the *GPU's* format too (one format, not one copy: the ANE still compiles its own): ruled out 2026-11-25, ~10%
   less to read per decode step isn't worth the precision and losing bit-exactness with mlx-lm.
 - [ ] Weight format: LUT4 built from the **bf16 original** weights (LUT4 from the 4-bit MLX weights failed on 0.8B, cos 0.93). **Check:** per-block cos against fp32 reference; whole-model greedy tokens against GPU prefill; total weights (GPU 4-bit + ANE) next to a 12 GiB arena and ~16 GB for macOS fit in 64 GB.
