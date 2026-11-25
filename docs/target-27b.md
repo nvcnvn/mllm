@@ -96,8 +96,18 @@ Expected shape (*estimates* from the 0.8B numbers, replaced by measurements as i
   - Decode alongside (27B, B=1): 14.9 tok/s alone, 12.6 with the S=2048 block looping on the ANE (-16%; the dequant
     would add ~3.5% GPU time). GPU prefill alongside costs decode ~70%.
   - Scratch: two layers' weights, ~1.5 GB. S=2048 also needs steel attention on the GPU (engine.mm rejects chunk >= 2048).
-- [ ] **Precision:** the ANE computes in fp16, the GPU in bf16. 27B's residual stream may exceed fp16's range.
-  **Check:** real weights, fp16 dense blocks vs the GPU path, per layer cos and max |x|, before any engine work.
+- [x] **Precision** (2026-11-25, `tools/ane_fp16_check.py`, emulated on the GPU): the dense blocks in fp16 (residual
+  stream included), attention / DeltaNet in bf16; prefill 2048 tokens, then the bf16 GPU path scores the next 256 from
+  that cache and state. Against an fp32-dense reference, fp16 prefill is as close as the bf16 GPU path itself:
+
+  | text | KL mean bf16 / fp16 | top-1 agree bf16 / fp16 | NLL fp32 / bf16 / fp16 |
+  |---|---|---|---|
+  | prose (docs) | 1.23e-3 / 1.43e-3 | 99.6% / 98.8% | 2.7878 / 2.7892 / 2.7912 |
+  | code | 1.10e-3 / 1.13e-3 | 98.0% / 98.4% | 0.8653 / 0.8611 / 0.8646 |
+
+  Largest |value| in the fp16 dense: residual 868, down_proj out 502, FFN act 354 (fp16 max 65504). Not covered:
+  the ANE's own accumulation (MLX fp16 matmuls accumulate in fp32). **Check** in the engine work: a real layer's
+  ANE output against this emulation.
 - [ ] **Engine:** AneOps with weight inputs (src/ane.mm), GPU dequant into IOSurface scratch, chunk sizes picked per
   prompt (2048 / 1024 / 512, GPU tail). **Check:** 27B TTFT at 1k-8k vs GPU, decode alongside, greedy tokens vs GPU.
 - LUT4 as the *GPU's* format too (one format, not one copy: the ANE still compiles its own): ruled out 2026-11-25, ~10%
