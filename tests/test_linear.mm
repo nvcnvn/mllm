@@ -1,6 +1,6 @@
 // attn(i) check for linear-attention layers: replay the golden trace (prefill0..2, decode0..2 at batch 2) through
 // GpuOps::attn with each request's state span on scattered, out-of-order arena units, layer by layer, from golden
-// qkv/z/b/a. Compares ws.o with <call>/LNN/attn/o and, after each call, the request's conv and delta state with
+// qkv/z/b/a. Compares ws.attention_result with <call>/LNN/attn/o and, after each call, the request's conv and delta state with
 // <call>/rB/LNN/conv, delta. Decode calls run at B = 5: both requests, copies of them on other units (rows must equal
 // the originals, o and state) and a row with n = 0 (its state must not change). Pass: everything bit-exact.
 #include <cassert>
@@ -34,12 +34,12 @@ int main() {
     mllm::Memory mem(s, dev, std::max<size_t>(256 << 20, mllm::Memory::arena_for(s, 5, 0)));  // 5 state spans
     const int chunk = g["chunk"], max_batch = 5, rows_max = std::max(chunk, max_batch);
     mllm::GpuOps ops(mem, w);
-    ops.merge = false;  // the fields are loaded here, not left by dense's merged M = 1 matmuls
+    ops.merge_projections = false;  // the fields are loaded here, not left by dense's merged M = 1 matmuls
     mllm::Workspace ws = ops.workspace(chunk, max_batch, 1024);
     id<MTLCommandQueue> q = [dev newCommandQueue];
     mllm::StepTables tables = mem.step_tables(rows_max);
     mem.freeze();
-    id<MTLBuffer> table = ws.table = tables.copies[0];
+    id<MTLBuffer> table = ws.step_table = tables.copies[0];
 
     // 5 requests' state spans on shuffled units: 0, 1 = the trace's requests, 2, 3 = their copies, 4 = idle row
     const size_t unit = mem.arena.unit_bytes, SU = mem.state_units, span = SU * unit;
@@ -97,7 +97,7 @@ int main() {
         std::string c = call["name"].get<std::string>();
         const mllm::Tensor& tok = tr.at(c + "/tokens");
         const int B = (int)tok.shape[0];
-        ws.S = (int)tok.shape[1];
+        ws.tokens_per_request = (int)tok.shape[1];
         std::vector<int> req, pos, n;
         for (const auto& r : call["rows"]) {
             int id = r["req"];
@@ -117,7 +117,7 @@ int main() {
             }
             rows.push_back({0, 0, {}, st[4]}), src.push_back(0), reqs.push_back(4);
         }
-        ws.B = (int)rows.size();
+        ws.request_count = (int)rows.size();
         tables.write(table, rows);
 
         for (int li : s.linear_layers()) {
@@ -125,15 +125,15 @@ int main() {
             snprintf(lname, sizeof lname, "L%02d", li);
             std::string pre = c + "/" + lname + "/";
             if (!tr.tensors.count(pre + "dense/qkv")) continue;  // big models: a few layers (dump_golden kept_layers)
-            load(pre + "dense/qkv", ws.qkv, src), load(pre + "dense/z", ws.z, src);
-            load(pre + "dense/b", ws.b, src), load(pre + "dense/a", ws.a, src);
+            load(pre + "dense/qkv", ws.query_key_value, src), load(pre + "dense/z", ws.output_gate, src);
+            load(pre + "dense/b", ws.update_rate_input, src), load(pre + "dense/a", ws.decay_input, src);
             @autoreleasepool {
                 mllm::encode_and_wait(q, ws, [&] {
-                    ops.attn(li, ws);
+                    ops.apply_attention(li, ws);
                 });
             }
             const mllm::Tensor& o = tr.at(pre + "attn/o");
-            const uint8_t* got = (const uint8_t*)ws.o.contents;
+            const uint8_t* got = (const uint8_t*)ws.attention_result.contents;
             record("o", pre + "attn/o", max_diff("BF16", got, tr.data(o), o.numel()));
             if (dup)
                 for (int b = 2; b < 4; b++, dup_rows++) assert(!memcmp(got + b * o.nbytes / 2, got + src[b] * o.nbytes / 2, o.nbytes / 2));

@@ -66,22 +66,22 @@ public:
     int submit(std::vector<int> ids, GenParams p = {});  // throws std::invalid_argument
     int submit(const std::vector<Message>& chat, GenParams p = {});
     void cancel(int req_id);  // one in a lane finishes when step() polls it
-    int ctx_limit() const { return max_ctx; }
+    int context_limit() const { return max_ctx; }
     std::vector<Event> step();
     // on_text gets each piece of text; returning false stops early (cancels the request). Throws if it aborts.
     // Other requests' events still come out of step().
     void generate(const std::vector<Message>& chat, GenParams p, const std::function<bool(const std::string&)>& on_text);
 
     ModelSpec spec;
-    Tokenizer tok;
+    Tokenizer tokenizer;
     id<MTLDevice> device;
     Weights weights;
     Memory mem;
-    GpuOps ops;
+    GpuOps gpu;
     std::unique_ptr<AneOps> ane;  // prefill_on == "ane"
     PrefillLane prefill;
     DecodeLane decode;
-    std::map<int, Request> reqs;  // live requests by id = arrival order
+    std::map<int, Request> requests;  // live requests by id = arrival order
     std::unique_ptr<PrefixCache> cache;  // nullptr = off
 
 private:

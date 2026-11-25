@@ -27,10 +27,10 @@ int main() {
     id<MTLCommandQueue> q = [dev newCommandQueue];
     mllm::StepTables tables = mem.step_tables(rows_max);
     mem.freeze();
-    id<MTLBuffer> table = ws.table = tables.copies[0];
+    id<MTLBuffer> table = ws.step_table = tables.copies[0];
 
     // 6 requests on shuffled units: 0, 1 = the trace's; 2..5 = copies of 0, 1, 0, 1 for the B = 4 runs
-    const size_t unit = mem.arena.unit_bytes, V = s.vocab;
+    const size_t unit = mem.arena.unit_bytes, V = s.vocab_size;
     const uint32_t SU = mem.state_units, P = mem.units_for(max_ctx);
     std::vector<uint32_t> perm(mem.arena.n_units);
     std::iota(perm.begin(), perm.end(), 0);
@@ -51,23 +51,23 @@ int main() {
 
     // one step through the whole stack; decode steps also run lm_head and return the greedy ids
     auto step = [&](const std::vector<int>& reqs, const std::vector<int>& pos, int n, const uint8_t* tokens) {
-        ws.B = (int)reqs.size(), ws.S = n;
+        ws.request_count = (int)reqs.size(), ws.tokens_per_request = n;
         std::vector<mllm::StepTables::Row> rows;
         for (size_t b = 0; b < reqs.size(); b++) rows.push_back({pos[b], n, pg[reqs[b]], st[reqs[b]]});
         tables.write(table, rows);
-        memcpy(ws.tokens.contents, tokens, (size_t)ws.B * n * 4);
+        memcpy(ws.token_ids.contents, tokens, (size_t)ws.request_count * n * 4);
         const bool decode = n == 1;
         @autoreleasepool {
             mllm::encode_and_wait(q, ws, [&] {
                 for (int i = 0; i <= L; i++) {
                     if (i == L && !decode) break;  // prefill never runs dense(L)
-                    ops.dense(i, ws);
-                    if (i < L) ops.attn(i, ws);
+                    ops.apply_weights(i, ws);
+                    if (i < L) ops.apply_attention(i, ws);
                 }
-                if (decode) ops.lm_head(ws);
+                if (decode) ops.pick_next_tokens(ws);
             });
         }
-        return decode ? ops.ids(ws) : std::vector<int>{};
+        return decode ? ops.next_tokens(ws) : std::vector<int>{};
     };
 
     int decodes = 0;
@@ -85,7 +85,7 @@ int main() {
         for (int r = 2; r < 6; r++) copy_request(r % 2, r);  // before the B = 2 step changes 0 and 1
         std::vector<int> ids = step(req, pos, 1, tr.data(tok));
         const mllm::Tensor &want = tr.at(c + "/logits"), &am = tr.at(c + "/argmax");
-        const std::vector<uint8_t> logits((uint8_t*)ws.logits.contents, (uint8_t*)ws.logits.contents + want.nbytes);
+        const std::vector<uint8_t> logits((uint8_t*)ws.next_token_scores.contents, (uint8_t*)ws.next_token_scores.contents + want.nbytes);
         for (int b = 0; b < 2; b++) {  // row by row
             const size_t row = V * 2;
             if (memcmp(logits.data() + b * row, tr.data(want) + b * row, row)) {
@@ -99,7 +99,7 @@ int main() {
         for (int b = 0; b < 4; b++) memcpy(&tok4[b * 4], tr.data(tok) + (b % 2) * 4, 4);
         std::vector<int> ids4 = step({2, 3, 4, 5}, {pos[0], pos[1], pos[0], pos[1]}, 1, tok4.data());
         for (int b = 0; b < 4; b++) {
-            assert(!memcmp((uint8_t*)ws.logits.contents + b * V * 2, logits.data() + (b % 2) * V * 2, V * 2));
+            assert(!memcmp((uint8_t*)ws.next_token_scores.contents + b * V * 2, logits.data() + (b % 2) * V * 2, V * 2));
             assert(ids4[b] == ids[b % 2]);
         }
         decodes++;

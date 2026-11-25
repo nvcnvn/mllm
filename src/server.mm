@@ -325,17 +325,17 @@ void Server::loop() {
         std::deque<std::shared_ptr<Stream>> js, cs;
         {
             std::unique_lock l(m);
-            n_live = e.reqs.size();
+            n_live = e.requests.size();
             // idle: sleep here; with live requests step() blocks on the lanes instead
-            cv.wait(l, [&] { return !e.reqs.empty() || !jobs.empty() || !cancels.empty() || stopping; });
-            if (stopping && jobs.empty() && e.reqs.empty()) return;
+            cv.wait(l, [&] { return !e.requests.empty() || !jobs.empty() || !cancels.empty() || stopping; });
+            if (stopping && jobs.empty() && e.requests.empty()) return;
             js.swap(jobs), cs.swap(cancels);
         }
         for (auto& s : js) {
             try {
-                std::vector<int> ids = s->chat ? e.tok.encode_chat(s->messages) : e.tok.encode(s->prompt);
+                std::vector<int> ids = s->chat ? e.tokenizer.encode_chat(s->messages) : e.tokenizer.encode(s->prompt);
                 const int n = ids.size();
-                if (s->default_max) s->p.max_tokens = std::max(1, std::min(4096, e.ctx_limit() - n));
+                if (s->default_max) s->p.max_tokens = std::max(1, std::min(4096, e.context_limit() - n));
                 s->id = e.submit(std::move(ids), s->p);
                 live[s->id] = s;
                 s->put([&] { s->prompt_tokens = n, s->started = true; });
@@ -358,7 +358,7 @@ void Server::loop() {
             bool stopped = false;
             auto pieces = ev.token < 0 ? std::vector<Splitter::Piece>{} : s.split.push(ev.text, ev.done, stopped);
             const std::string finish = ev.token < 0           ? "error"
-                                       : stopped || (ev.done && e.tok.eos.count(ev.token)) ? "stop"
+                                       : stopped || (ev.done && e.tokenizer.eos.count(ev.token)) ? "stop"
                                        : ev.done                                           ? "length"
                                                                                            : "";
             const auto now = std::chrono::steady_clock::now();

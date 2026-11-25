@@ -197,7 +197,7 @@ id<MTLBuffer> StepTables::begin(uint64_t step, uint64_t signaled) {
 void StepTables::write(id<MTLBuffer> table, const std::vector<Row>& rows) const {
     const uint32_t R = (uint32_t)rows.size();
     size_t n_slots = 0, n_state = R ? rows[0].state.size() : 0;
-    for (const Row& r : rows) n_slots += r.slots.size() + r.state.size(), assert(r.state.size() == n_state);
+    for (const Row& r : rows) n_slots += r.pages.size() + r.state.size(), assert(r.state.size() == n_state);
     assert(3 + 3 * R + n_slots <= words && table.length >= words * 4);
     uint32_t* t = (uint32_t*)table.contents;
     t[0] = R, t[1] = (uint32_t)n_state;
@@ -205,10 +205,10 @@ void StepTables::write(id<MTLBuffer> table, const std::vector<Row>& rows) const 
     off[0] = 0;
     for (uint32_t b = 0; b < R; b++) {
         assert(rows[b].pos >= 0 && rows[b].n >= 0);
-        for (uint32_t s : rows[b].slots) assert(s < n_units);
+        for (uint32_t s : rows[b].pages) assert(s < n_units);
         t[2 + b] = rows[b].pos, t[2 + R + b] = rows[b].n;
-        off[b + 1] = off[b] + (uint32_t)rows[b].slots.size();
-        std::copy(rows[b].slots.begin(), rows[b].slots.end(), off + R + 1 + off[b]);
+        off[b + 1] = off[b] + (uint32_t)rows[b].pages.size();
+        std::copy(rows[b].pages.begin(), rows[b].pages.end(), off + R + 1 + off[b]);
     }
     for (uint32_t b = 0; b < R; b++) {
         for (uint32_t s : rows[b].state) assert(s < n_units);
@@ -218,12 +218,12 @@ void StepTables::write(id<MTLBuffer> table, const std::vector<Row>& rows) const 
 
 // memory.py: a unit is one KV page (T tokens) of every full layer, rounded up to the OS page.
 size_t Memory::unit_of(const ModelSpec& s, int T) {
-    size_t kv = s.full_layers().size() * 2 * s.n_kv_heads * T * s.head_dim * ELEM;
+    size_t kv = s.full_layers().size() * 2 * s.key_value_heads * T * s.head_dim * ELEM;
     return (kv + PAGE - 1) / PAGE * PAGE;
 }
 
 static size_t state_layer_bytes(const ModelSpec& s) {  // conv then delta, per linear layer
-    return (s.conv_kernel - 1) * s.conv_dim() * ELEM + (size_t)s.lin_v_heads * s.lin_v_dim * s.lin_k_dim * 4;
+    return (s.conv_kernel - 1) * s.conv_dim() * ELEM + (size_t)s.linear_value_heads * s.linear_value_dim * s.linear_key_dim * 4;
 }
 
 uint32_t Memory::state_units_of(const ModelSpec& s, int T) {
@@ -232,10 +232,10 @@ uint32_t Memory::state_units_of(const ModelSpec& s, int T) {
 }
 
 Memory::Memory(const ModelSpec& spec, id<MTLDevice> device, size_t arena_bytes, int page_tokens)
-    : spec(spec), device(device), T(page_tokens),
+    : spec(spec), device(device), page_tokens(page_tokens),
       arena(unit_of(spec, page_tokens), (uint32_t)(arena_bytes / unit_of(spec, page_tokens))) {
     conv_bytes = (spec.conv_kernel - 1) * spec.conv_dim() * ELEM;
-    delta_bytes = (size_t)spec.lin_v_heads * spec.lin_v_dim * spec.lin_k_dim * 4;
+    delta_bytes = (size_t)spec.linear_value_heads * spec.linear_value_dim * spec.linear_key_dim * 4;
     size_t per_layer = conv_bytes + delta_bytes;
     assert(per_layer == state_layer_bytes(spec));
     auto lin = spec.linear_layers();
@@ -255,7 +255,7 @@ Memory::Memory(const ModelSpec& spec, id<MTLDevice> device, size_t arena_bytes, 
 }
 
 size_t Memory::kv_offset(int g, int kv, int head, int token) const {
-    return ((((size_t)g * 2 + kv) * spec.n_kv_heads + head) * T + token) * spec.head_dim * ELEM;
+    return ((((size_t)g * 2 + kv) * spec.key_value_heads + head) * page_tokens + token) * spec.head_dim * ELEM;
 }
 
 size_t Memory::state_offset(int layer) const {
@@ -296,21 +296,21 @@ Memory::Surface Memory::surface(int rows, int cols) {
 Workspace Memory::workspace(int chunk, int max_batch) {
     const ModelSpec& s = spec;
     size_t R = std::max(chunk, max_batch) * ELEM;  // bytes per element column, over all rows
-    size_t qd = (size_t)s.n_heads * s.head_dim, kvd = (size_t)s.n_kv_heads * s.head_dim;
-    size_t vd = (size_t)s.lin_v_heads * s.lin_v_dim;
+    size_t qd = (size_t)s.query_heads * s.head_dim, kvd = (size_t)s.key_value_heads * s.head_dim;
+    size_t vd = (size_t)s.linear_value_heads * s.linear_value_dim;
     return {
-        .tokens = buffer(std::max(chunk, max_batch) * sizeof(int32_t)),
-        .x = buffer(R * s.hidden),
-        .o = buffer(R * std::max(qd, vd)),
-        .q = buffer(R * qd),
-        .k = buffer(R * kvd),
-        .v = buffer(R * kvd),
-        .gate = buffer(R * qd),
-        .qkv = buffer(R * s.conv_dim()),
-        .z = buffer(R * vd),
-        .b = buffer(R * s.lin_v_heads),
-        .a = buffer(R * s.lin_v_heads),
-        .logits = buffer((size_t)max_batch * s.vocab * ELEM),
+        .token_ids = buffer(std::max(chunk, max_batch) * sizeof(int32_t)),
+        .residual = buffer(R * s.hidden),
+        .attention_result = buffer(R * std::max(qd, vd)),
+        .query = buffer(R * qd),
+        .key = buffer(R * kvd),
+        .value = buffer(R * kvd),
+        .query_gate = buffer(R * qd),
+        .query_key_value = buffer(R * s.conv_dim()),
+        .output_gate = buffer(R * vd),
+        .update_rate_input = buffer(R * s.linear_value_heads),
+        .decay_input = buffer(R * s.linear_value_heads),
+        .next_token_scores = buffer((size_t)max_batch * s.vocab_size * ELEM),
     };
 }
 

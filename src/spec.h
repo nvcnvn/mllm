@@ -8,14 +8,14 @@ namespace mllm {
 struct ModelSpec {
     std::string path;
     std::vector<std::string> kinds;  // per layer: "full" | "linear"
-    int hidden, vocab;
-    int n_heads, n_kv_heads, head_dim;  // full attention
-    int lin_k_heads, lin_v_heads, lin_k_dim, lin_v_dim, conv_kernel;  // Gated DeltaNet
+    int hidden, vocab_size;
+    int query_heads, key_value_heads, head_dim;  // full attention
+    int linear_key_heads, linear_value_heads, linear_key_dim, linear_value_dim, conv_kernel;  // Gated DeltaNet
 
     int n_layers() const { return (int)kinds.size(); }
     std::vector<int> full_layers() const { return layers_of("full"); }
     std::vector<int> linear_layers() const { return layers_of("linear"); }
-    int conv_dim() const { return 2 * lin_k_heads * lin_k_dim + lin_v_heads * lin_v_dim; }
+    int conv_dim() const { return 2 * linear_key_heads * linear_key_dim + linear_value_heads * linear_value_dim; }
 
 private:
     std::vector<int> layers_of(const char* kind) const;

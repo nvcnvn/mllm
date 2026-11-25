@@ -10,17 +10,17 @@ namespace mllm {
 // ponytail: a fixed interval; the OS may unwire idle memory sooner under pressure, then the first step after pays.
 constexpr auto RESIDENCY_EVERY = std::chrono::seconds(10);
 
-static std::unique_ptr<AneOps> ane_ops(const std::string& on, GpuOps& ops, Memory& mem, int chunk) {
+static std::unique_ptr<AneOps> ane_ops(const std::string& on, GpuOps& gpu, Memory& mem, int chunk) {
     if (on != "gpu" && on != "ane") throw std::invalid_argument("prefill_on: \"gpu\" or \"ane\", not " + on);
-    return on == "ane" ? std::make_unique<AneOps>(ops, mem, chunk) : nullptr;
+    return on == "ane" ? std::make_unique<AneOps>(gpu, mem, chunk) : nullptr;
 }
 
 Engine::Engine(const std::string& model, size_t arena_bytes, int chunk, int page_tokens, int max_batch, int max_ctx,
                const std::string& prefill_on, bool prefix_cache)
-    : spec(spec::load(model)), tok(spec.path), device(MTLCreateSystemDefaultDevice()), weights(spec.path, device),
-      mem(spec, device, arena_bytes, page_tokens), ops(mem, weights), ane(ane_ops(prefill_on, ops, mem, chunk)),
-      prefill(ops, mem, chunk, max_ctx, ane.get()),
-      decode(ops, mem, max_batch, max_ctx), cache(prefix_cache ? std::make_unique<PrefixCache>(mem.arena, page_tokens) : nullptr),
+    : spec(spec::load(model)), tokenizer(spec.path), device(MTLCreateSystemDefaultDevice()), weights(spec.path, device),
+      mem(spec, device, arena_bytes, page_tokens), gpu(mem, weights), ane(ane_ops(prefill_on, gpu, mem, chunk)),
+      prefill(gpu, mem, chunk, max_ctx, ane.get()),
+      decode(gpu, mem, max_batch, max_ctx), cache(prefix_cache ? std::make_unique<PrefixCache>(mem.arena, page_tokens) : nullptr),
       chunk(chunk), max_batch(max_batch), max_ctx(max_ctx),
       residency_at(std::chrono::steady_clock::now()) {
     if (chunk % page_tokens) throw std::invalid_argument("chunks start on a page boundary: chunk % page_tokens != 0");
@@ -43,24 +43,24 @@ int Engine::submit(std::vector<int> ids, GenParams p) {
     if (!(std::isfinite(p.temperature) && p.temperature >= 0 && p.top_p >= 0 && p.top_p <= 1))
         throw std::invalid_argument("need finite temperature >= 0 and 0 <= top_p <= 1");
     for (int t : ids)  // embed doesn't bounds-check
-        if (t < 0 || t >= spec.vocab) throw std::invalid_argument("token id out of range: " + std::to_string(t));
+        if (t < 0 || t >= spec.vocab_size) throw std::invalid_argument("token id out of range: " + std::to_string(t));
     if (ids.size() + p.max_tokens > (size_t)max_ctx)
         throw std::invalid_argument("prompt + max_tokens > max_ctx " + std::to_string(max_ctx));
     Request r{.id = next_id, .ids = std::move(ids), .max_tokens = p.max_tokens, .sampler = {p.temperature, p.top_p},
-              .rng = std::mt19937_64(std::random_device{}()), .detok = tok.detokenizer()};
+              .rng = std::mt19937_64(std::random_device{}()), .detok = tokenizer.detokenizer()};
     if (demand(r) > mem.arena.n_units)
         throw std::invalid_argument("request needs " + std::to_string(demand(r)) + " units, arena has " +
                                     std::to_string(mem.arena.n_units));
-    Request& in = reqs.emplace(r.id, std::move(r)).first->second;
+    Request& in = requests.emplace(r.id, std::move(r)).first->second;
     in.sampler.rng = &in.rng;
     return next_id++;
 }
 
-int Engine::submit(const std::vector<Message>& chat, GenParams p) { return submit(tok.encode_chat(chat), p); }
+int Engine::submit(const std::vector<Message>& chat, GenParams p) { return submit(tokenizer.encode_chat(chat), p); }
 
 void Engine::cancel(int req_id) {
-    auto it = reqs.find(req_id);
-    if (it == reqs.end() || it->second.state == State::DONE) return;
+    auto it = requests.find(req_id);
+    if (it == requests.end() || it->second.state == State::DONE) return;
     it->second.cancelled = true;
     if (!it->second.in_flight) finish(it->second);
 }
@@ -76,7 +76,7 @@ std::vector<Event> Engine::step() {
         // a failed poll aborts the lane's in-flight rows, like a failed submit
         auto in_lane = [&](State s) {
             std::vector<Request*> rows;
-            for (auto& [_, r] : reqs)
+            for (auto& [_, r] : requests)
                 if (r.in_flight && r.state == s) rows.push_back(&r);
             return rows;
         };
@@ -90,7 +90,7 @@ std::vector<Event> Engine::step() {
         }
         progress |= !chunks.empty();
         for (const PrefillWork& w : chunks) {
-            Request& r = reqs.at(w.req_id);
+            Request& r = requests.at(w.req_id);
             r.in_flight--;
             if (r.cancelled) {
                 if (!r.in_flight) finish(r);
@@ -113,8 +113,8 @@ std::vector<Event> Engine::step() {
         }
         progress |= !toks.empty();
         for (auto [req_id, t] : toks) {
-            auto it = reqs.find(req_id);
-            if (it == reqs.end() || it->second.state == State::DONE) continue;  // ran one step past its end (fed)
+            auto it = requests.find(req_id);
+            if (it == requests.end() || it->second.state == State::DONE) continue;  // ran one step past its end (fed)
             Request& r = it->second;
             r.in_flight--;
             if (r.cancelled) {
@@ -123,7 +123,7 @@ std::vector<Event> Engine::step() {
             }
             r.pos += 1;
             r.out.push_back(t);
-            const bool eos = tok.eos.count(t);
+            const bool eos = tokenizer.eos.count(t);
             const bool done = eos || (int)r.out.size() >= r.max_tokens;
             std::string text = eos ? "" : r.detok.push(t);
             if (done) {
@@ -133,7 +133,7 @@ std::vector<Event> Engine::step() {
             emit({req_id, t, std::move(text), done, r.cached});
         }
 
-        for (auto& [_, r] : reqs) {
+        for (auto& [_, r] : requests) {
             if (r.state != State::WAITING) continue;
             if (!admit(r)) break;  // arrival order: later requests never overtake the oldest waiter
             progress = true;
@@ -142,12 +142,12 @@ std::vector<Event> Engine::step() {
         // the oldest request with tokens left to send; a second chunk of the same one too, unless the first ends at a
         // snapshot point (the copy needs that chunk done and the next one not started)
         while (prefill.can_submit()) {
-            auto it = std::find_if(reqs.begin(), reqs.end(), [](auto& kv) {
+            auto it = std::find_if(requests.begin(), requests.end(), [](auto& kv) {
                 const Request& r = kv.second;
                 return r.state == State::PREFILL && !r.cancelled && r.sent < (int)r.ids.size() - 1 &&
                        !(r.in_flight && !r.snaps.empty() && r.sent == r.snaps.front());
             });
-            if (it == reqs.end()) break;
+            if (it == requests.end()) break;
             Request& r = it->second;
             int end = std::min(r.sent + chunk, (int)r.ids.size() - 1);
             if (!r.snaps.empty()) end = std::min(end, r.snaps.front());
@@ -172,7 +172,7 @@ std::vector<Event> Engine::step() {
         // on the GPU) is fed there. Unless that step makes its last token; an EOS there leaves one wasted row (its
         // result is dropped at poll).
         std::vector<Request*> batch;
-        for (auto& [_, r] : reqs)
+        for (auto& [_, r] : requests)
             if (r.state == State::DECODE && !r.cancelled && (int)batch.size() < max_batch &&
                 (!r.in_flight || (r.in_flight == 1 && (int)r.out.size() + 1 < r.max_tokens)))
                 batch.push_back(&r);
@@ -195,7 +195,7 @@ std::vector<Event> Engine::step() {
             step_no++;
         }
 
-        std::erase_if(reqs, [](auto& kv) { return kv.second.state == State::DONE; });
+        std::erase_if(requests, [](auto& kv) { return kv.second.state == State::DONE; });
         // Nothing to do until a lane finishes: block instead of handing a busy loop to the caller (a 1000-token
         // generate spun 3.7 s of CPU, now 0.5 s). On the decode step when one runs: it is the short one, and a
         // completion-handler semaphore that woke on either lane cost B = 1 2%. ponytail: prefill may then sit done
@@ -256,7 +256,7 @@ uint32_t Engine::alloc(Request& r) {
 // Reserve the request's units and give it its state; with the prefix cache, start at the deepest cached snapshot.
 bool Engine::admit(Request& r) {
     Arena& a = mem.arena;
-    const int T = mem.T, last = (int)r.ids.size() - 1;  // the last prompt token is fed by decode
+    const int T = mem.page_tokens, last = (int)r.ids.size() - 1;  // the last prompt token is fed by decode
     PrefixCache::Match m;
     std::vector<int> snaps;
     if (cache) {
@@ -296,7 +296,7 @@ bool Engine::admit(Request& r) {
 // r.pos is a snapshot point and its chunk has completed (the next one isn't submitted): copy its state into fresh
 // units and cache its pages up to here. Its pages from pos on stay its own.
 void Engine::snapshot(Request& r) {
-    const int n_pages = r.pos / mem.T;
+    const int n_pages = r.pos / mem.page_tokens;
     if (cache->has_snapshot(r.ids, n_pages)) {  // another request got here first: return the copy's reservation
         mem.arena.unreserve(mem.state_units);
         r.reserved -= mem.state_units;
@@ -317,7 +317,7 @@ void Engine::copy_units(const std::vector<uint32_t>& dst, const std::vector<uint
 }
 
 void Engine::ensure_pages(Request& r, int n_tokens) {
-    while ((int)r.pages.size() * mem.T < n_tokens) r.pages.push_back(alloc(r));
+    while ((int)r.pages.size() * mem.page_tokens < n_tokens) r.pages.push_back(alloc(r));
 }
 
 void Engine::emit(Event ev) {

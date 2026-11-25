@@ -21,7 +21,7 @@ static std::vector<std::vector<int>> run(mllm::Engine& e, const std::vector<std:
     std::vector<int> ids;
     for (const auto& p : prompts) ids.push_back(e.submit(p, {.max_tokens = N}));
     std::map<int, std::vector<int>> out;
-    while (!e.reqs.empty())
+    while (!e.requests.empty())
         for (const mllm::Event& ev : e.step()) out[ev.req_id].push_back(ev.token);
     check_arena(e);
     std::vector<std::vector<int>> res;
@@ -65,7 +65,7 @@ int main() {
 
     // 3. arena fits one request at a time: the rest WAIT, then run, same tokens
     size_t longest = 0;
-    for (const auto& p : prompts) longest = std::max(longest, e.tok.encode_chat(p).size());
+    for (const auto& p : prompts) longest = std::max(longest, e.tokenizer.encode_chat(p).size());
     const uint32_t need = e.mem.units_for(longest + N) + e.mem.state_units;
     {
         mllm::Engine small(golden::MODEL, need * e.mem.arena.unit_bytes, CHUNK);
@@ -76,7 +76,7 @@ int main() {
     printf("wait ok with a %u-unit arena\n", need);
     {
         // FIFO: B runs; A waits (doesn't fit next to B); C would fit next to B but must not overtake A
-        const std::vector<int> pa = e.tok.encode_chat(prompts[0]), pb = e.tok.encode_chat(prompts[2]), pc = {1, 2, 3};
+        const std::vector<int> pa = e.tokenizer.encode_chat(prompts[0]), pb = e.tokenizer.encode_chat(prompts[2]), pc = {1, 2, 3};
         auto demand = [&](size_t n, int gen) { return e.mem.units_for(n + gen) + e.mem.state_units; };
         const uint32_t db = demand(pb.size(), 8), da = demand(pa.size(), N), dc = demand(pc.size(), 4);
         assert(db + da > db + dc && da <= db + dc);
@@ -84,11 +84,11 @@ int main() {
         const int b = fifo.submit(pb, {.max_tokens = 8}), a = fifo.submit(pa, {.max_tokens = N});
         const int c = fifo.submit(pc, {.max_tokens = 4});
         std::vector<int> admitted;  // in admission order
-        while (!fifo.reqs.empty()) {
+        while (!fifo.requests.empty()) {
             fifo.step();
             for (int r : {a, b, c})
                 if (std::find(admitted.begin(), admitted.end(), r) == admitted.end() &&
-                    (!fifo.reqs.count(r) || fifo.reqs.at(r).state != mllm::State::WAITING))
+                    (!fifo.requests.count(r) || fifo.requests.at(r).state != mllm::State::WAITING))
                     admitted.push_back(r);
         }
         assert(admitted == std::vector<int>({b, a, c}));
@@ -100,7 +100,7 @@ int main() {
         const int g = e.submit(std::vector<int>{1}, {.max_tokens = 24});
         const int smp = e.submit(std::vector<int>{2}, {.max_tokens = 12, .temperature = 0.8f, .top_p = 0.9f});
         int n_g = 0, n_s = 0, last = 0;
-        while (!e.reqs.empty())
+        while (!e.requests.empty())
             for (const mllm::Event& ev : e.step()) {
                 if (ev.req_id == g) n_g++;
                 if (ev.req_id != smp) continue;
@@ -118,7 +118,7 @@ int main() {
         } catch (const std::invalid_argument&) {
             bad = true;
         }
-        assert(bad && e.reqs.empty());
+        assert(bad && e.requests.empty());
     }
 
     // 4. a generate() stopped early (cancel mid-decode), and a lane call that fails, both return every unit
@@ -143,14 +143,14 @@ int main() {
         } catch (const std::runtime_error&) {
             std::vector<mllm::Event> ev = e.step();  // the abort event was kept for the next step() caller
             aborted = ev.size() == 1 && ev[0].req_id == f && ev[0].token == -1 && ev[0].done;
-            assert(aborted && e.reqs.empty());
+            assert(aborted && e.requests.empty());
         }
     }
     check_arena(e);
     // cancel before it ever ran: gone at once
     e.cancel(e.submit(prompts[2], {.max_tokens = N}));
     e.step();
-    assert(e.reqs.empty());
+    assert(e.requests.empty());
     check_arena(e);
     // the engine still works after the abort
     assert(run(e, {prompts[2]})[0] == solo[2]);

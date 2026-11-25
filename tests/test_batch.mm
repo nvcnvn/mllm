@@ -13,7 +13,7 @@
 #include "lanes.h"
 
 // mlx-lm's own KL(B=1 || B=8) is 7.5e-4 mean (B=16 9.2e-4) on batch_ref: 10x that. A wrong kernel lands far above
-// (8 stale outputs per qmv_wide matmul: 1.8); a bad weight group doesn't (one group x 2 in each layer's gate_proj:
+// (8 stale outputs per qmv_wide matmul: 1.8); a bad weight group doesn't (one group x 2 in each layer's feed_forward_gate:
 // 1.3e-3, inside rounding noise): the B = 1 byte check and test_kernels' CPU references catch those.
 // Top-1 within one ulp: mlx-lm's strict top-1 is 98.5% at B = 8, every miss a tie or 1-ulp gap at B = 1.
 static const double KL_MAX = 7.5e-3, TOP1_MIN = 0.99;
@@ -30,7 +30,7 @@ int main() {
     const ModelSpec s = spec::load(golden::MODEL);
     Safetensors ref(golden::dir(s) + "/batch_ref.safetensors");
     const Tensor &tok_t = ref.at("tokens"), &ids_t = ref.at("ids"), &top_t = ref.at("logits"), &lse_t = ref.at("lse");
-    const int NS = (int)tok_t.shape[0], T = (int)tok_t.shape[1], TOP = (int)ids_t.shape[2], V = s.vocab, L = s.n_layers();
+    const int NS = (int)tok_t.shape[0], T = (int)tok_t.shape[1], TOP = (int)ids_t.shape[2], V = s.vocab_size, L = s.n_layers();
     auto tok = [&](int q, int p) { return golden::load<int32_t>(ref.data(tok_t), (size_t)q * T + p); };
     auto rid = [&](int q, int p, int k) { return golden::load<int32_t>(ref.data(ids_t), ((size_t)q * T + p) * TOP + k); };
     auto rtop = [&](int q, int p, int k) { return golden::load<uint16_t>(ref.data(top_t), ((size_t)q * T + p) * TOP + k); };
@@ -47,7 +47,7 @@ int main() {
     const uint32_t pages = mem.units_for(T), per_row = pages + mem.state_units;
     assert((size_t)16 * per_row <= mem.arena.n_units);
 
-    // one decode step: row b = (seq[b], pos[b]) in fresh-per-run units b; returns nothing, logits in ws.logits
+    // one decode step: row b = (seq[b], pos[b]) in fresh-per-run units b; returns nothing, logits in ws.next_token_scores
     std::vector<std::vector<uint32_t>> units(16);
     for (uint32_t b = 0; b < 16; b++)
         for (uint32_t j = 0; j < per_row; j++) units[b].push_back(b * per_row + j);
@@ -56,24 +56,24 @@ int main() {
             std::vector<StepTables::Row> rows;
             for (size_t b = 0; b < seq.size(); b++) {
                 rows.push_back({pos[b], 1, std::span(units[slot[b]]).first(pages), std::span(units[slot[b]]).subspan(pages)});
-                ((int32_t*)ws.tokens.contents)[b] = tok(seq[b], pos[b]);
+                ((int32_t*)ws.token_ids.contents)[b] = tok(seq[b], pos[b]);
             }
             tables.write(tab, rows);
-            ws.B = (int)seq.size(), ws.S = 1, ws.table = tab;
+            ws.request_count = (int)seq.size(), ws.tokens_per_request = 1, ws.step_table = tab;
             encode_and_wait(q, ws, [&] {
                 for (int i = 0; i <= L; i++) {
-                    ops.dense(i, ws);
-                    if (i < L) ops.attn(i, ws);
+                    ops.apply_weights(i, ws);
+                    if (i < L) ops.apply_attention(i, ws);
                 }
-                ops.lm_head(ws);
+                ops.pick_next_tokens(ws);
             }, true);
         }
     };
-    // row b of ws.logits against the reference at (sq, p): KL over its top-64 + rest, and top-1 within 1 ulp
+    // row b of ws.next_token_scores against the reference at (sq, p): KL over its top-64 + rest, and top-1 within 1 ulp
     double kl_sum = 0, kl_max = 0;
     int n = 0, top1 = 0, near = 0;
     auto check = [&](int b, int sq, int p) {
-        const uint16_t* row = (const uint16_t*)ws.logits.contents + (size_t)b * V;
+        const uint16_t* row = (const uint16_t*)ws.next_token_scores.contents + (size_t)b * V;
         double m = -INFINITY, sum = 0;
         int arg = 0;
         for (int v = 0; v < V; v++)
@@ -110,7 +110,7 @@ int main() {
         for (int p = 0; p < T; p++) {
             step({sq}, {p}, {sq});  // a unit set per sequence: each starts from zero state
             check(0, sq, p);
-            const uint16_t* row = (const uint16_t*)ws.logits.contents;
+            const uint16_t* row = (const uint16_t*)ws.next_token_scores.contents;
             for (int k = 0; k < TOP; k++) bad += row[rid(sq, p, k)] != rtop(sq, p, k);
         }
     report(1);

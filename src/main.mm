@@ -52,9 +52,9 @@ void GpuOpsTest::bench_ops(const std::string& model) {
     std::vector<id<MTLBuffer>> tabs;  // one per rotation set
     for (int i = 0; i < 16; i++) tabs.push_back(mem.buffer(tables.words * 4));
     const GpuOps::Layer &fl = ops.layers[s.full_layers()[0]], &ll = ops.layers[s.linear_layers()[0]];
-    const int max_K = std::max({fl.down_proj.K, fl.out.K, ll.out.K});
+    const int max_K = std::max({fl.feed_forward_down.in_size, fl.attention_output.in_size, ll.attention_output.in_size});
     id<MTLBuffer> xin = mem.buffer((size_t)chunk * max_K * ELEM);
-    id<MTLBuffer> yout = mem.buffer(std::max(ws.logits.length, (size_t)chunk * s.conv_dim() * ELEM));
+    id<MTLBuffer> yout = mem.buffer(std::max(ws.next_token_scores.length, (size_t)chunk * s.conv_dim() * ELEM));
     id<MTLBuffer> pool = mem.buffer(96 << 20);
     mem.freeze();
 
@@ -63,7 +63,7 @@ void GpuOpsTest::bench_ops(const std::string& model) {
         double t1;
         @autoreleasepool {
             t1 = encode_and_wait(q, ws, [&] {
-                ops.use(ws);
+                ops.begin(ws);
                 encode(0);
             });
         }
@@ -71,26 +71,26 @@ void GpuOpsTest::bench_ops(const std::string& model) {
         double best = INFINITY;
         for (int k = 0; k < 3; k++) @autoreleasepool {
                 best = std::min(best, encode_and_wait(q, ws, [&] {
-                    ops.use(ws);
+                    ops.begin(ws);
                     for (int r = 0; r < reps; r++) encode(r);
                 }) / reps);
             }
         return best;
     };
     // copies of l over >= POOL bytes of pool (l itself when it is that big)
-    auto rotate = [&](const QLinear& l) {
-        const size_t wb = (size_t)l.N * l.K / 2, sb = (size_t)l.N * l.K / 64 * ELEM;
-        if (wb + 2 * sb >= POOL) return std::vector<QLinear>{l};
+    auto rotate = [&](const QuantizedWeights& l) {
+        const size_t wb = (size_t)l.out_size * l.in_size / 2, sb = (size_t)l.out_size * l.in_size / 64 * ELEM;
+        if (wb + 2 * sb >= POOL) return std::vector<QuantizedWeights>{l};
         auto al = [](size_t x) { return (x + 255) & ~(size_t)255; };
         const size_t n = (POOL + wb + 2 * sb - 1) / (wb + 2 * sb), stride = al(wb) + 2 * al(sb);
         assert(n * stride <= pool.length);
-        std::vector<QLinear> out;
+        std::vector<QuantizedWeights> out;
         uint8_t* p = (uint8_t*)pool.contents;
         for (size_t c = 0; c < n; c++) {
-            QLinear q = l;
+            QuantizedWeights q = l;
             const size_t o = c * stride;
-            q.w = {pool, o}, q.scales = {pool, o + al(wb)}, q.biases = {pool, o + al(wb) + al(sb)};
-            memcpy(p + o, (uint8_t*)l.w.buffer.contents + l.w.offset, wb);
+            q.packed = {pool, o}, q.scales = {pool, o + al(wb)}, q.biases = {pool, o + al(wb) + al(sb)};
+            memcpy(p + o, (uint8_t*)l.packed.buffer.contents + l.packed.offset, wb);
             memcpy(p + q.scales.offset, (uint8_t*)l.scales.buffer.contents + l.scales.offset, sb);
             memcpy(p + q.biases.offset, (uint8_t*)l.biases.buffer.contents + l.biases.offset, sb);
             out.push_back(q);
@@ -125,25 +125,25 @@ void GpuOpsTest::bench_ops(const std::string& model) {
            s.path.c_str(), BW / 1e9, FLOPS / 1e12, POOL >> 20, PEAK_BW / 1e9);
     // warm the GPU (the first shapes run 2x slow otherwise)
     for (auto t0 = std::chrono::steady_clock::now(); std::chrono::steady_clock::now() - t0 < std::chrono::milliseconds(300);)
-        time([&](int) { ops.linear(ops.lm, {ws.x}, {yout}, 1); });
+        time([&](int) { ops.multiply_weights(ops.lm, {ws.residual}, {yout}, 1); });
 
     // projections, deduplicated by shape
-    std::vector<std::pair<std::string, QLinear>> proj;
-    auto add_proj = [&](const char* name, const QLinear& q) {
+    std::vector<std::pair<std::string, QuantizedWeights>> proj;
+    auto add_proj = [&](const char* name, const QuantizedWeights& q) {
         for (auto& [n, p] : proj)
-            if (p.N == q.N && p.K == q.K) return (void)(n += std::string("/") + name);
+            if (p.out_size == q.out_size && p.in_size == q.in_size) return (void)(n += std::string("/") + name);
         proj.push_back({name, q});
     };
-    add_proj("q_proj", fl.q_proj), add_proj("k_proj", fl.k_proj), add_proj("v_proj", fl.v_proj);
-    add_proj("o_proj", fl.out), add_proj("in_proj_qkv", ll.in_proj_qkv), add_proj("in_proj_z", ll.in_proj_z);
-    add_proj("in_proj_b", ll.in_proj_b), add_proj("in_proj_a", ll.in_proj_a), add_proj("out_proj", ll.out);
-    add_proj("gate_proj", fl.gate_proj), add_proj("up_proj", fl.up_proj), add_proj("down_proj", fl.down_proj);
+    add_proj("q_proj", fl.query_projection), add_proj("k_proj", fl.key_projection), add_proj("v_proj", fl.value_projection);
+    add_proj("o_proj", fl.attention_output), add_proj("in_proj_qkv", ll.query_key_value_projection), add_proj("in_proj_z", ll.output_gate_projection);
+    add_proj("in_proj_b", ll.update_rate_projection), add_proj("in_proj_a", ll.decay_projection), add_proj("out_proj", ll.attention_output);
+    add_proj("gate_proj", fl.feed_forward_gate), add_proj("up_proj", fl.feed_forward_up), add_proj("down_proj", fl.feed_forward_down);
 
-    const int H = s.n_heads, Hkv = s.n_kv_heads, D = s.head_dim, Hv = s.lin_v_heads, Dv = s.lin_v_dim;
+    const int H = s.query_heads, Hkv = s.key_value_heads, D = s.head_dim, Hv = s.linear_value_heads, Dv = s.linear_value_dim;
     const auto full = s.full_layers(), lin = s.linear_layers();
     const double kv_tok = (double)Hkv * D * 2 * ELEM;               // K + V bytes per token, one layer
     const double state = 2.0 * (mem.conv_bytes + mem.delta_bytes);  // one row's state, read + written
-    const double gdn_flops = 7.0 * Hv * Dv * s.lin_k_dim;           // per token: decay, kᵀS, update, qᵀS
+    const double gdn_flops = 7.0 * Hv * Dv * s.linear_key_dim;           // per token: decay, kᵀS, update, qᵀS
     const char* tiny = "tiny: dispatch / fill floor of a few us, not bandwidth";
     const char* cached = "activations stay in cache (no rotation, as in a real step): a few-us floor when small";
     for (int M : {1, 4, 8, 16, 512}) {
@@ -151,39 +151,39 @@ void GpuOpsTest::bench_ops(const std::string& model) {
         const std::string title = decode ? "decode B = " + std::to_string(M) : "prefill S = 512 (one row)";
         printf("\n%s\n  %-34s %-14s %9s %8s %9s %6s  %s\n", title.c_str(), "op", "shape", "us", "GB/s", "bound us",
                "%bound", "note (below 70% or !)");
-        auto lin_note = [&](const QLinear& q) {
-            if (q.N * q.K < 1 << 20) return tiny;  // k_proj, v_proj, in_proj_b, in_proj_a
+        auto lin_note = [&](const QuantizedWeights& q) {
+            if (q.out_size * q.in_size < 1 << 20) return tiny;  // key_projection, value_projection, update_rate_projection, decay_projection
             if (!decode) return "qmm_t (64 x 64 tiles): dequantizing W costs ~10% next to the bf16 GEMM";
             if (M == 1) return "MLX qmv_fast";
             return M < 13 ? "MLX qmv_wide: known ~40% at M = 8-16, MLX the same; faster kernel breaks bit-exactness"
                           : "MLX qmm_t_splitk: known ~40% at M = 8-16, MLX the same; faster kernel breaks bit-exactness";
         };
-        auto bench_linear = [&](const std::string& name, const QLinear& q) {
-            const std::vector<QLinear> rot = rotate(q);
-            const double wbytes = (double)q.N * q.K / 2 + 2.0 * q.N * q.K / 64 * ELEM;
-            const double bytes = wbytes + (double)M * (q.K + q.N) * ELEM;
-            const double t = time([&](int r) { ops.linear(rot[r % rot.size()], {xin}, {yout}, M); });
-            row(name, std::to_string(q.K) + " -> " + std::to_string(q.N), t, bytes, 2.0 * M * q.N * q.K, lin_note(q));
+        auto bench_linear = [&](const std::string& name, const QuantizedWeights& q) {
+            const std::vector<QuantizedWeights> rot = rotate(q);
+            const double wbytes = (double)q.out_size * q.in_size / 2 + 2.0 * q.out_size * q.in_size / 64 * ELEM;
+            const double bytes = wbytes + (double)M * (q.in_size + q.out_size) * ELEM;
+            const double t = time([&](int r) { ops.multiply_weights(rot[r % rot.size()], {xin}, {yout}, M); });
+            row(name, std::to_string(q.in_size) + " -> " + std::to_string(q.out_size), t, bytes, 2.0 * M * q.out_size * q.in_size, lin_note(q));
         };
         for (auto& [name, q] : proj) bench_linear(name, q);
         if (decode) bench_linear("lm_head", ops.lm);
 
         // norms: their activations stay in cache in a real step too, so no rotation
-        double t = time([&](int) { ops.rms_norm(fl.input_layernorm, {xin}, {yout}, M, s.hidden); });
+        double t = time([&](int) { ops.normalize(fl.attention_norm, {xin}, {yout}, M, s.hidden); });
         row("rms_norm", std::to_string(M) + " x " + std::to_string(s.hidden), t, 2.0 * M * s.hidden * ELEM, 0, cached);
-        t = time([&](int) { ops.gated_rms_norm(ll.gated_norm, {xin}, {ws.z}, {yout}, M * Hv, Dv); });
+        t = time([&](int) { ops.normalize_and_gate(ll.output_norm, {xin}, {ws.output_gate}, {yout}, M * Hv, Dv); });
         row("gated_rms_norm (2 dispatches)", std::to_string(M * Hv) + " x " + std::to_string(Dv), t,
             3.0 * M * Hv * Dv * ELEM, 0, cached);
 
         // attn(i): rows on their own pages / state, rotated over sets and layers
         const int B = decode ? M : 1, S = decode ? 1 : M;
-        ws.B = B, ws.S = S;
+        ws.request_count = B, ws.tokens_per_request = S;
         for (int ctx : decode ? std::vector<int>{512, 2048, 8192} : std::vector<int>{512, 4096}) {
             const double kv = (double)B * ctx * kv_tok, act = (double)B * S * (3 * H + 2 * Hkv) * D * ELEM;
             const int sets = make_sets(B, ctx - S, S, false, kv, (int)full.size());
             t = time([&](int r) {
-                ws.table = tabs[r % sets];
-                ops.attn(full[(r / sets) % full.size()], ws);
+                ws.step_table = tabs[r % sets];
+                ops.apply_attention(full[(r / sets) % full.size()], ws);
             });
             row("attn full, " + std::to_string(ctx) + " keys", decode ? std::to_string(B) + " rows" : "512 queries", t,
                 kv + act, decode ? 4.0 * B * H * D * ctx : 4.0 * H * D * S * ctx,
@@ -193,16 +193,16 @@ void GpuOpsTest::bench_ops(const std::string& model) {
         const double lact = (double)B * S * (s.conv_dim() + 2 * Hv * Dv) * ELEM;
         const int sets = make_sets(B, 0, S, true, B * state / 2, (int)lin.size());  // state: read + written
         t = time([&](int r) {
-            ws.table = tabs[r % sets];
-            ops.attn(lin[(r / sets) % lin.size()], ws);
+            ws.step_table = tabs[r % sets];
+            ops.apply_attention(lin[(r / sets) % lin.size()], ws);
         });
         row("attn linear (conv, gated delta)", decode ? std::to_string(B) + " rows" : "512 tokens", t, B * state + lact,
             (double)B * S * gdn_flops,
             decode ? "5 dispatches (conv + norm + scale, gates, delta, gated norm x2): their floor dominates at small B"
                    : "mlx-lm's gated delta kernel walks the 512 tokens in order (128 threadgroups): latency-bound");
         if (decode) {
-            t = time([&](int) { ops.argmax({ws.logits}, {yout}, M, s.vocab); });
-            row("argmax", std::to_string(M) + " x " + std::to_string(s.vocab), t, (double)M * s.vocab * ELEM, 0,
+            t = time([&](int) { ops.greedy_tokens({ws.next_token_scores}, {yout}, M, s.vocab_size); });
+            row("argmax", std::to_string(M) + " x " + std::to_string(s.vocab_size), t, (double)M * s.vocab_size * ELEM, 0,
                 "one threadgroup per row: B threadgroups can't reach full bandwidth");
         }
     }
@@ -218,7 +218,7 @@ void GpuOpsTest::bench_ops(const std::string& model) {
                                is08 ? 1064.0 : 0};
     int bi = 0;
     for (int B : {1, 4, 8, 16}) {
-        ws.B = B, ws.S = 1;
+        ws.request_count = B, ws.tokens_per_request = 1;
         const uint32_t pages = mem.units_for(512);
         units.assign(B, {});
         std::vector<StepTables::Row> rows;
@@ -226,20 +226,20 @@ void GpuOpsTest::bench_ops(const std::string& model) {
             for (uint32_t j = 0; j < pages + SU; j++) units[b].push_back(next++);
             rows.push_back({511, 1, std::span(units[b]).first(pages), std::span(units[b]).subspan(pages)});
         }
-        ws.table = tabs[0];
-        tables.write(ws.table, rows);
+        ws.step_table = tabs[0];
+        tables.write(ws.step_table, rows);
         std::vector<double> ts, walls;  // GPU time; wall = encode + commit + wait
-        size_t d0 = ops.dispatches, per_step = 0;
+        size_t d0 = ops.dispatch_count, per_step = 0;
         for (int k = 0; k < 13; k++) @autoreleasepool {
                 const auto w0 = std::chrono::steady_clock::now();
                 const double t = encode_and_wait(q, ws, [&] {
                     for (int i = 0; i <= L; i++) {
-                        ops.dense(i, ws);
-                        if (i < L) ops.attn(i, ws);
+                        ops.apply_weights(i, ws);
+                        if (i < L) ops.apply_attention(i, ws);
                     }
-                    ops.lm_head(ws);
+                    ops.pick_next_tokens(ws);
                 }, true);
-                if (!k) per_step = ops.dispatches - d0;
+                if (!k) per_step = ops.dispatch_count - d0;
                 const double wall = std::chrono::duration<double>(std::chrono::steady_clock::now() - w0).count();
                 if (k >= 3) ts.push_back(t), walls.push_back(wall);
             }
@@ -248,7 +248,7 @@ void GpuOpsTest::bench_ops(const std::string& model) {
         // the sampling kernel alone on this step's logits (greedy: its argmax pass only, already in the step)
         std::mt19937_64 rng(1);
         const std::vector<SampleParams> params(B, SampleParams{0.7f, 0.9f, &rng});
-        const double samp = time([&](int) { ops.sample({ws.logits}, {ws.ids}, s.vocab, params); });
+        const double samp = time([&](int) { ops.sample_tokens({ws.next_token_scores}, {ws.next_token_ids}, s.vocab_size, params); });
         // mlx-lm's figure is end to end, so the ratio uses wall time (greedy)
         printf("  B = %2d: %zu dispatches; GPU %6.2f ms (%5.1f tok/s); wall %6.2f ms (%5.1f tok/s)", B, per_step, step * 1e3,
                B / step, wall * 1e3, B / wall);
@@ -301,9 +301,9 @@ static void chat(const std::string& model, mllm::GenParams p, bool default_max, 
         history.push_back({"user", line});
         using clock = std::chrono::steady_clock;
         const auto t0 = clock::now();
-        std::vector<int> ids = e.tok.encode_chat(history);
+        std::vector<int> ids = e.tokenizer.encode_chat(history);
         const int n = ids.size();
-        if (default_max) p.max_tokens = std::max(1, std::min(4096, e.ctx_limit() - n));
+        if (default_max) p.max_tokens = std::max(1, std::min(4096, e.context_limit() - n));
         int rid;
         try {
             rid = e.submit(std::move(ids), p);
@@ -352,9 +352,9 @@ static void chat(const std::string& model, mllm::GenParams p, bool default_max, 
 static void bench(const std::string& model, int P, int G, int B, int n, const std::string& on,
                   int stream, bool prefix_cache) {
     mllm::Engine e(model, arena(1), chunk(on), 32, 16, max_ctx, on, prefix_cache);
-    e.tok.eos.clear();  // as mlx_lm.benchmark: never stop early
+    e.tokenizer.eos.clear();  // as mlx_lm.benchmark: never stop early
     std::mt19937 rng(0);
-    std::uniform_int_distribution<int> tok(0, e.spec.vocab - 1);
+    std::uniform_int_distribution<int> tok(0, e.spec.vocab_size - 1);
     std::vector<std::vector<int>> prompts(B, std::vector<int>(P));
     for (auto& p : prompts)
         for (int& t : p) t = tok(rng);
@@ -374,8 +374,8 @@ static void bench(const std::string& model, int P, int G, int B, int n, const st
         uint32_t peak_units = 0;
         clock::time_point t_prompt;
         long after = 0, started = 0;
-        while (std::any_of(got.begin(), got.end(), [&](auto& kv) { return e.reqs.count(kv.first); })) {
-            if (stream && !e.reqs.count(sid)) {
+        while (std::any_of(got.begin(), got.end(), [&](auto& kv) { return e.requests.count(kv.first); })) {
+            if (stream && !e.requests.count(sid)) {
                 streamed += sid < 0 ? 0 : stream;
                 sid = e.submit(stream_prompt, {.max_tokens = 1});
             }
@@ -388,7 +388,7 @@ static void bench(const std::string& model, int P, int G, int B, int n, const st
         }
         const auto t1 = clock::now();
         if (sid >= 0) e.cancel(sid);
-        while (!e.reqs.empty()) e.step();
+        while (!e.requests.empty()) e.step();
         auto sec = [](auto d) { return std::chrono::duration<double>(d).count(); };
         const double mem = (double)e.device.currentAllocatedSize - e.mem.arena_buffer.length + peak_units * a.unit_bytes;
         return Trial{(double)B * P / sec(t_prompt - t0), after / sec(t1 - t_prompt), mem / 1e9, sec(t1 - t0),
@@ -509,7 +509,7 @@ int main(int argc, char** argv) {
             if (argc != 2) return usage();
             mllm::ModelSpec s = mllm::spec::load(argv[1]);
             printf("%s\n%d layers (%zu full, %zu linear), hidden %d, vocab %d\n", s.path.c_str(), s.n_layers(),
-                   s.full_layers().size(), s.linear_layers().size(), s.hidden, s.vocab);
+                   s.full_layers().size(), s.linear_layers().size(), s.hidden, s.vocab_size);
         }
     } catch (const std::exception& e) {
         fprintf(stderr, "%s: %s\n", prog, e.what());

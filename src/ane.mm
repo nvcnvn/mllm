@@ -16,14 +16,14 @@ static std::runtime_error error(const std::string& what, NSError* err) {
 }
 
 static const std::map<std::string, id<MTLBuffer> Workspace::*> FIELDS = {
-    {"q", &Workspace::q},     {"k", &Workspace::k},     {"v", &Workspace::v}, {"gate", &Workspace::gate},
-    {"qkv", &Workspace::qkv}, {"z", &Workspace::z},     {"b", &Workspace::b}, {"a", &Workspace::a},
-    {"x", &Workspace::x},     {"o", &Workspace::o}};
+    {"q", &Workspace::query},     {"k", &Workspace::key},     {"v", &Workspace::value}, {"gate", &Workspace::query_gate},
+    {"qkv", &Workspace::query_key_value}, {"z", &Workspace::output_gate},     {"b", &Workspace::update_rate_input}, {"a", &Workspace::decay_input},
+    {"x", &Workspace::residual},     {"o", &Workspace::attention_result}};
 
 AneOps::AneOps(GpuOps& gpu, Memory& mem, int S)
     : S(S), gpu(gpu), from_rows_ps(gpu.pipeline(@"from_rows")), to_rows_ps(gpu.pipeline(@"to_rows")),
       dequant_ps(gpu.pipeline(@"dequant_q4")) {
-    this->gpu.merge = false;  // dense runs here and writes every workspace field: attn must read those
+    this->gpu.merge_projections = false;  // dense runs here and writes every workspace field: attn must read those
     const ModelSpec& sp = mem.spec;
     if (S % 32 || S < 32) throw std::invalid_argument("ANE: chunk must be a multiple of 32");
     sizes = S > 512 ? std::vector<int>{512, S} : std::vector<int>{S};
@@ -128,9 +128,9 @@ std::vector<AneOps::Param> AneOps::layer_params(int i, const ModelSpec& sp) {
                                      std::to_string(cols) + "] (blocks built for another model?)");
         return &it->second;
     };
-    auto weight = [&](const std::string& name, const QLinear& w) {
-        if (w.K % 64) throw std::runtime_error("ANE: K not a multiple of the group size 64");
-        return Param{&w, {}, 0, {find(0, name, w.N, w.K), find(1, name, w.N, w.K)}};
+    auto weight = [&](const std::string& name, const QuantizedWeights& w) {
+        if (w.in_size % 64) throw std::runtime_error("ANE: K not a multiple of the group size 64");
+        return Param{&w, {}, 0, {find(0, name, w.out_size, w.in_size), find(1, name, w.out_size, w.in_size)}};
     };
     auto gamma = [&](const std::string& name, Buf g, int dim) {
         return Param{nullptr, g, dim, {find(0, name, 1, dim), find(1, name, 1, dim)}};
@@ -138,18 +138,18 @@ std::vector<AneOps::Param> AneOps::layer_params(int i, const ModelSpec& sp) {
     std::vector<Param> ps;
     if (i > 0) {
         const GpuOps::Layer& p = gpu.layers[i - 1];
-        ps = {weight("w_o", p.out), weight("w_gate", p.gate_proj), weight("w_up", p.up_proj),
-              weight("w_down", p.down_proj), gamma("g_post", p.post_attention_layernorm, sp.hidden)};
+        ps = {weight("w_o", p.attention_output), weight("w_gate", p.feed_forward_gate), weight("w_up", p.feed_forward_up),
+              weight("w_down", p.feed_forward_down), gamma("g_post", p.feed_forward_norm, sp.hidden)};
     }
     const GpuOps::Layer& l = gpu.layers[i];
-    ps.push_back(gamma("g_in", l.input_layernorm, sp.hidden));
+    ps.push_back(gamma("g_in", l.attention_norm, sp.hidden));
     if (l.is_linear) {
-        ps.push_back(weight("w_qkv", l.in_proj_qkv)), ps.push_back(weight("w_z", l.in_proj_z));
-        ps.push_back(weight("w_b", l.in_proj_b)), ps.push_back(weight("w_a", l.in_proj_a));
+        ps.push_back(weight("w_qkv", l.query_key_value_projection)), ps.push_back(weight("w_z", l.output_gate_projection));
+        ps.push_back(weight("w_b", l.update_rate_projection)), ps.push_back(weight("w_a", l.decay_projection));
     } else {
-        ps.push_back(weight("w_q", l.q_proj)), ps.push_back(weight("w_k", l.k_proj));
-        ps.push_back(weight("w_v", l.v_proj));
-        ps.push_back(gamma("g_q", l.q_norm, sp.head_dim)), ps.push_back(gamma("g_k", l.k_norm, sp.head_dim));
+        ps.push_back(weight("w_q", l.query_projection)), ps.push_back(weight("w_k", l.key_projection));
+        ps.push_back(weight("w_v", l.value_projection));
+        ps.push_back(gamma("g_q", l.query_norm, sp.head_dim)), ps.push_back(gamma("g_k", l.key_norm, sp.head_dim));
     }
     return ps;
 }
@@ -158,12 +158,12 @@ const AneOps::Block& AneOps::block(int i, int n) const {
     return blocks.at({*std::lower_bound(sizes.begin(), sizes.end(), n), kind_of[i]});
 }
 
-void AneOps::inputs(int i, Workspace& ws, int set) {
-    assert(ws.B == 1 && ws.S > 0 && ws.S <= S && (set == 0 || set == 1));
-    gpu.use(ws);
-    if (i == 0) gpu.embed({ws.tokens}, {ws.x}, ws.S);
-    const Block& b = block(i, ws.S);
-    for (const Io& io : b.ins) to_rows(ws, {ws.*io.field}, *io.surface[set], ws.S, b.S);
+void AneOps::prepare_inputs(int i, Workspace& ws, int set) {
+    assert(ws.request_count == 1 && ws.tokens_per_request > 0 && ws.tokens_per_request <= S && (set == 0 || set == 1));
+    gpu.begin(ws);
+    if (i == 0) gpu.look_up_embeddings({ws.token_ids}, {ws.residual}, ws.tokens_per_request);
+    const Block& b = block(i, ws.tokens_per_request);
+    for (const Io& io : b.ins) to_rows(ws, {ws.*io.field}, *io.surface[set], ws.tokens_per_request, b.S);
     // block i's weights and gammas into this set's weight surfaces (the ANE is done with them: this set's last
     // predict returned before this command buffer was encoded)
     for (const Param& p : params[i]) {
@@ -172,29 +172,29 @@ void AneOps::inputs(int i, Workspace& ws, int set) {
             to_rows(ws, p.gamma, *p.surface[set], 1, 1);
             continue;
         }
-        [ws.enc setComputePipelineState:dequant_ps];
-        [ws.enc setBuffer:p.w->w.buffer offset:p.w->w.offset atIndex:0];
-        [ws.enc setBuffer:p.w->scales.buffer offset:p.w->scales.offset atIndex:1];
-        [ws.enc setBuffer:p.w->biases.buffer offset:p.w->biases.offset atIndex:2];
-        [ws.enc setBuffer:d.buffer offset:0 atIndex:3];
-        [ws.enc setBytes:&d.row length:4 atIndex:4];
-        [ws.enc dispatchThreads:MTLSizeMake(p.w->K / 8, p.w->N, 1) threadsPerThreadgroup:MTLSizeMake(32, 8, 1)];
+        [ws.encoder setComputePipelineState:dequant_ps];
+        [ws.encoder setBuffer:p.w->packed.buffer offset:p.w->packed.offset atIndex:0];
+        [ws.encoder setBuffer:p.w->scales.buffer offset:p.w->scales.offset atIndex:1];
+        [ws.encoder setBuffer:p.w->biases.buffer offset:p.w->biases.offset atIndex:2];
+        [ws.encoder setBuffer:d.buffer offset:0 atIndex:3];
+        [ws.encoder setBytes:&d.row length:4 atIndex:4];
+        [ws.encoder dispatchThreads:MTLSizeMake(p.w->in_size / 8, p.w->out_size, 1) threadsPerThreadgroup:MTLSizeMake(32, 8, 1)];
     }
 }
 
 // bf16 [n, dst.C] at src -> dst's first `rows` fp16 rows, zero in rows n .. rows
 void AneOps::to_rows(Workspace& ws, Buf src, const Surface& dst, uint32_t n, int rows) {
-    [ws.enc setComputePipelineState:to_rows_ps];
-    [ws.enc setBuffer:src.buffer offset:src.offset atIndex:0];
-    [ws.enc setBuffer:dst.s.buffer offset:0 atIndex:1];
-    [ws.enc setBytes:&dst.s.row length:4 atIndex:2];
-    [ws.enc setBytes:&n length:4 atIndex:3];
-    [ws.enc dispatchThreads:MTLSizeMake(dst.C, rows, 1) threadsPerThreadgroup:MTLSizeMake(32, rows > 1 ? 8 : 1, 1)];
+    [ws.encoder setComputePipelineState:to_rows_ps];
+    [ws.encoder setBuffer:src.buffer offset:src.offset atIndex:0];
+    [ws.encoder setBuffer:dst.s.buffer offset:0 atIndex:1];
+    [ws.encoder setBytes:&dst.s.row length:4 atIndex:2];
+    [ws.encoder setBytes:&n length:4 atIndex:3];
+    [ws.encoder dispatchThreads:MTLSizeMake(dst.C, rows, 1) threadsPerThreadgroup:MTLSizeMake(32, rows > 1 ? 8 : 1, 1)];
 }
 
-void AneOps::dense(int i, Workspace& ws, int set) {
-    assert(ws.B == 1 && ws.S > 0 && ws.S <= S && (set == 0 || set == 1));
-    const Block& b = block(i, ws.S);
+void AneOps::apply_weights(int i, Workspace& ws, int set) {
+    assert(ws.request_count == 1 && ws.tokens_per_request > 0 && ws.tokens_per_request <= S && (set == 0 || set == 1));
+    const Block& b = block(i, ws.tokens_per_request);
     NSError* err = nil;
     id<MLFeatureProvider> r = [b.model predictionFromFeatures:b.in[set] options:b.opts[set] error:&err];
     if (!r) throw error("ANE dense block " + std::to_string(i), err);
@@ -204,11 +204,11 @@ void AneOps::dense(int i, Workspace& ws, int set) {
         if ([r featureValueForName:k].multiArrayValue.pixelBuffer != ((MLMultiArray*)backings[k]).pixelBuffer)
             throw std::runtime_error("ANE dense block " + std::to_string(i) + ": output not written in place");
     for (const Io& io : b.outs) {
-        [ws.enc setComputePipelineState:from_rows_ps];
-        [ws.enc setBuffer:io.surface[set]->s.buffer offset:0 atIndex:0];
-        [ws.enc setBuffer:ws.*io.field offset:0 atIndex:1];
-        [ws.enc setBytes:&io.surface[set]->s.row length:4 atIndex:2];
-        [ws.enc dispatchThreads:MTLSizeMake(io.surface[set]->C, ws.S, 1) threadsPerThreadgroup:MTLSizeMake(32, 8, 1)];
+        [ws.encoder setComputePipelineState:from_rows_ps];
+        [ws.encoder setBuffer:io.surface[set]->s.buffer offset:0 atIndex:0];
+        [ws.encoder setBuffer:ws.*io.field offset:0 atIndex:1];
+        [ws.encoder setBytes:&io.surface[set]->s.row length:4 atIndex:2];
+        [ws.encoder dispatchThreads:MTLSizeMake(io.surface[set]->C, ws.tokens_per_request, 1) threadsPerThreadgroup:MTLSizeMake(32, 8, 1)];
     }
 }
 

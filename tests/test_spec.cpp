@@ -12,10 +12,10 @@ int main() {
     assert(g.size() == 12);  // a new spec.py field needs a line here
     assert(s.path == g["path"].get<std::string>());
     assert(s.kinds == g["kinds"].get<std::vector<std::string>>());
-    assert(s.hidden == g["hidden"].get<int>() && s.vocab == g["vocab"].get<int>());
-    assert(s.n_heads == g["n_heads"].get<int>() && s.n_kv_heads == g["n_kv_heads"].get<int>() && s.head_dim == g["head_dim"].get<int>());
-    assert(s.lin_k_heads == g["lin_k_heads"].get<int>() && s.lin_v_heads == g["lin_v_heads"].get<int>());
-    assert(s.lin_k_dim == g["lin_k_dim"].get<int>() && s.lin_v_dim == g["lin_v_dim"].get<int>() && s.conv_kernel == g["conv_kernel"].get<int>());
+    assert(s.hidden == g["hidden"].get<int>() && s.vocab_size == g["vocab"].get<int>());
+    assert(s.query_heads == g["n_heads"].get<int>() && s.key_value_heads == g["n_kv_heads"].get<int>() && s.head_dim == g["head_dim"].get<int>());
+    assert(s.linear_key_heads == g["lin_k_heads"].get<int>() && s.linear_value_heads == g["lin_v_heads"].get<int>());
+    assert(s.linear_key_dim == g["lin_k_dim"].get<int>() && s.linear_value_dim == g["lin_v_dim"].get<int>() && s.conv_kernel == g["conv_kernel"].get<int>());
     assert(s.full_layers().size() + s.linear_layers().size() == (size_t)s.n_layers());
 
     assert(mllm::spec::resolve(s.path) == s.path);  // a directory is used as-is

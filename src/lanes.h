@@ -28,14 +28,14 @@ struct PrefillWork {
     int req_id;
     std::vector<int> tokens;  // exact length (the GPU path never pads)
     int start_pos;
-    std::vector<uint32_t> slots;        // KV pages covering start_pos + n_valid
+    std::vector<uint32_t> pages;        // KV pages covering start_pos + n_valid
     std::vector<uint32_t> state_slots;  // the request's state units
     int n_valid() const { return (int)tokens.size(); }
 };
 
 struct DecodeRow {
     int req_id, token, pos;  // token -1: the request's row in the step in flight, its token fed on the GPU
-    std::vector<uint32_t> slots, state_slots;
+    std::vector<uint32_t> pages, state_slots;
     SampleParams sampler;
 };
 
@@ -44,7 +44,7 @@ struct DecodeWork {
     std::vector<DecodeRow> rows;
 };
 
-// One command buffer on q: f encodes into ws.enc (concurrent: as the decode lane's). Waits; returns GPU seconds.
+// One command buffer on q: f encodes into ws.encoder (concurrent: as the decode lane's). Waits; returns GPU seconds.
 double encode_and_wait(id<MTLCommandQueue> q, Workspace& ws, const std::function<void()>& f, bool concurrent = false);
 
 class PrefillLane {
@@ -66,7 +66,7 @@ public:
     id<MTLSharedEvent> event;  // signaled with the chunk count
     std::atomic<bool> fail_next = false;  // tests: the ANE thread's next layer throws (a failed predict)
     int fail_submit = 0;                  // tests: the fail_submit-th submit from now throws
-    // ANE: a chunk of fewer tokens runs on the GPU path instead (ws.S = n, no padding to S: tails and prefix-cache
+    // ANE: a chunk of fewer tokens runs on the GPU path instead (ws.tokens_per_request = n, no padding to S: tails and prefix-cache
     // splits). The crossover of GPU prefill time at n against one ANE chunk (reports/mlx-lm baseline.md).
     int gpu_below = 256;
     int gpu_chunks = 0;  // ANE: chunks submitted to the GPU path (tests)

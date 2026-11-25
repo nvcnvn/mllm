@@ -25,9 +25,9 @@
 #include "golden.h"
 
 static const std::map<std::string, id<MTLBuffer> mllm::Workspace::*> FIELDS = {
-    {"q", &mllm::Workspace::q},       {"k", &mllm::Workspace::k},     {"v", &mllm::Workspace::v},
-    {"gate", &mllm::Workspace::gate}, {"qkv", &mllm::Workspace::qkv}, {"z", &mllm::Workspace::z},
-    {"b", &mllm::Workspace::b},       {"a", &mllm::Workspace::a},     {"x", &mllm::Workspace::x}};
+    {"q", &mllm::Workspace::query},       {"k", &mllm::Workspace::key},     {"v", &mllm::Workspace::value},
+    {"gate", &mllm::Workspace::query_gate}, {"qkv", &mllm::Workspace::query_key_value}, {"z", &mllm::Workspace::output_gate},
+    {"b", &mllm::Workspace::update_rate_input},       {"a", &mllm::Workspace::decay_input},     {"x", &mllm::Workspace::residual}};
 
 static float bf16(uint16_t u) {
     uint32_t w = (uint32_t)u << 16;
@@ -72,29 +72,29 @@ int main() {
     // b.
     {
         const int n = 32;  // golden prefill0: 32 tokens at pos 0
-        ws.B = 1, ws.S = n;
+        ws.request_count = 1, ws.tokens_per_request = n;
         auto put = [&](id<MTLBuffer> b, const std::string& name) {  // a golden bf16 tensor -> workspace rows
             const mllm::Tensor& t = tr.at(name);
             memcpy(b.contents, tr.data(t), t.nbytes);
         };
         const mllm::Tensor& tok = tr.at("prefill0/tokens");
-        memcpy(ws.tokens.contents, tr.data(tok), tok.nbytes);
+        memcpy(ws.token_ids.contents, tr.data(tok), tok.nbytes);
         for (int i : {0, 3, 4}) {
             const mllm::AneOps::Block& b = ane.block(i, n);
             assert(b.S == 512);
             char L[8];
             snprintf(L, sizeof L, "L%02d", i - 1);
             if (i > 0) {
-                put(ws.x, "prefill0/" + std::string(L) + "/dense/x");
-                put(ws.o, "prefill0/" + std::string(L) + "/attn/o");
+                put(ws.residual, "prefill0/" + std::string(L) + "/dense/x");
+                put(ws.attention_result, "prefill0/" + std::string(L) + "/attn/o");
             }
-            mllm::encode_and_wait(q, ws, [&] { ane.inputs(i, ws, 0); });
+            mllm::encode_and_wait(q, ws, [&] { ane.prepare_inputs(i, ws, 0); });
             for (const mllm::AneOps::Io& io : b.ins) {  // padding: zero past n
                 const uint16_t* p = (const uint16_t*)io.surface[0]->s.buffer.contents;
                 for (size_t t = n; t < (size_t)b.S; t++)
                     for (int c = 0; c < io.surface[0]->C; c++) assert(p[t * io.surface[0]->s.row + c] == 0);
             }
-            mllm::encode_and_wait(q, ws, [&] { ane.dense(i, ws, 0); });
+            mllm::encode_and_wait(q, ws, [&] { ane.apply_weights(i, ws, 0); });
             snprintf(L, sizeof L, "L%02d", i);
             for (const mllm::AneOps::Io& io : b.outs) {
                 std::string name;
@@ -177,10 +177,10 @@ int main() {
     // full layer g's K (0) or V (1), all heads, tokens from .. n
     auto kv = [&](const Units& u, int g, int which, int n, int from = 0) {
         std::vector<double> v;
-        for (int h = 0; h < s.n_kv_heads; h++)
+        for (int h = 0; h < s.key_value_heads; h++)
             for (int t = from; t < n; t++) {
-                const uint16_t* p = (const uint16_t*)(arena + (size_t)u.pages[t / mem.T] * ar.unit_bytes +
-                                                      mem.kv_offset(g, which, h, t % mem.T));
+                const uint16_t* p = (const uint16_t*)(arena + (size_t)u.pages[t / mem.page_tokens] * ar.unit_bytes +
+                                                      mem.kv_offset(g, which, h, t % mem.page_tokens));
                 for (int j = 0; j < s.head_dim; j++) v.push_back(bf16(p[j]));
             }
         return v;
@@ -260,13 +260,13 @@ int main() {
     }
     ane_lane.gpu_below = gpu_below;
 
-    // d. tails on the GPU: an ANE chunk of fewer than gpu_below tokens runs on the GPU path (ws.S = n, no padding).
+    // d. tails on the GPU: an ANE chunk of fewer than gpu_below tokens runs on the GPU path (ws.tokens_per_request = n, no padding).
     // Bit-exact with the ANE lane's full chunks followed by the GPU lane's tail. Against GPU prefill, on the tail tokens'
     // K/V and the final state: >= 0.999 on random prompts (the repetitive one's ANE chunks drift more).
     {
         std::vector<int> randp;
         std::mt19937 rng(3);
-        for (int j = 0; j < 2101; j++) randp.push_back((int)(rng() % s.vocab));
+        for (int j = 0; j < 2101; j++) randp.push_back((int)(rng() % s.vocab_size));
         for (const auto* src : {&longp, &randp})
             for (int n : {1100, 2100}) {
                 const std::vector<int> ids(src->begin(), src->begin() + n + 1);
@@ -295,7 +295,7 @@ int main() {
     auto greedy = [](mllm::Engine& e, const std::vector<int>& ids, int N) {
         const int id = e.submit(ids, {.max_tokens = N});
         std::vector<int> out;
-        while (e.reqs.count(id))
+        while (e.requests.count(id))
             for (const mllm::Event& ev : e.step()) out.push_back(ev.token);
         return out;
     };
@@ -320,7 +320,7 @@ int main() {
     {
         std::mt19937 rng(4);
         std::vector<int> ids(600);
-        for (int& t : ids) t = (int)(rng() % s.vocab);
+        for (int& t : ids) t = (int)(rng() % s.vocab_size);
         const int before = ea.prefill.gpu_chunks;
         greedy(ea, ids, 1);
         assert(ea.prefill.gpu_chunks == before + 1);
@@ -332,12 +332,12 @@ int main() {
     {
         std::mt19937 rng(5);
         std::vector<int> ids(1100);
-        for (int& t : ids) t = (int)(rng() % s.vocab);
+        for (int& t : ids) t = (int)(rng() % s.vocab_size);
         const int id = ea.submit(ids, {.max_tokens = 1});
-        while (ea.reqs.count(id)) ea.step(), usleep(40000);
+        while (ea.requests.count(id)) ea.step(), usleep(40000);
         const std::vector<int> head(ids.begin(), ids.begin() + 1089);
         mllm::PrefixCache::Match m = ea.cache->match(head);
-        assert(m.S * mem.T == 1088 && m.snapshot.size() == mem.state_units);
+        assert(m.S * mem.page_tokens == 1088 && m.snapshot.size() == mem.state_units);
         Units u = prefill(ane_lane, head);
         const uint8_t* ea_arena = (const uint8_t*)ea.mem.arena_buffer.contents;
         size_t diff = 0;
@@ -356,13 +356,13 @@ int main() {
         const int id = ea.submit(prompts[0], {.max_tokens = 64});
         std::vector<int> out;
         int other = -1;
-        while (ea.reqs.count(id)) {
-            if (!ea.reqs.count(other)) other = ea.submit(two_chunks, {.max_tokens = 1});
+        while (ea.requests.count(id)) {
+            if (!ea.requests.count(other)) other = ea.submit(two_chunks, {.max_tokens = 1});
             for (const mllm::Event& ev : ea.step())
                 if (ev.req_id == id) out.push_back(ev.token);
         }
         ea.cancel(other);
-        while (!ea.reqs.empty()) ea.step();
+        while (!ea.requests.empty()) ea.step();
         assert(out == ids_of("greedy/0"));
         printf("e. engine: greedy 64 still golden with 2-chunk ANE prefills running alongside\n");
     }
@@ -372,14 +372,14 @@ int main() {
         std::mt19937 rng(1);
         int submitted = 0;
         auto last = std::chrono::steady_clock::now();
-        while (submitted < 10 || !ea.reqs.empty()) {
-            if (submitted < 10 && ea.reqs.size() < 16 && rng() % 3 == 0) {
+        while (submitted < 10 || !ea.requests.empty()) {
+            if (submitted < 10 && ea.requests.size() < 16 && rng() % 3 == 0) {
                 std::vector<int> ids(2 + rng() % 2099);
-                for (int& t : ids) t = (int)(rng() % s.vocab);
+                for (int& t : ids) t = (int)(rng() % s.vocab_size);
                 ea.submit(ids, {.max_tokens = 1 + (int)(rng() % 64), .temperature = rng() % 2 ? 0.7f : 0.0f});
                 submitted++;
             }
-            if (!ea.reqs.empty() && rng() % 300 == 0) ea.cancel(std::next(ea.reqs.begin(), rng() % ea.reqs.size())->first);
+            if (!ea.requests.empty() && rng() % 300 == 0) ea.cancel(std::next(ea.requests.begin(), rng() % ea.requests.size())->first);
             std::vector<mllm::Event> ev = ea.step();
             for (const mllm::Event& e : ev) assert(e.token >= 0);
             if (!ev.empty()) last = std::chrono::steady_clock::now();
@@ -394,18 +394,18 @@ int main() {
         auto all_free = [&] { return a.free_units + a.cache_only_units == a.n_units && a.reserved == 0 && !ea.prefill.busy(); };
         auto in_flight = [&] {
             int k = 0;
-            for (auto& [_, r] : ea.reqs) k += r.state == mllm::State::PREFILL ? r.in_flight : 0;
+            for (auto& [_, r] : ea.requests) k += r.state == mllm::State::PREFILL ? r.in_flight : 0;
             return k;
         };
         std::mt19937 rng(2);
         auto rand_ids = [&](int n) {
             std::vector<int> v(n);
-            for (int& t : v) t = (int)(rng() % s.vocab);
+            for (int& t : v) t = (int)(rng() % s.vocab_size);
             return v;
         };
         auto drain = [&](std::vector<mllm::Event>* evs) {
             auto t0 = std::chrono::steady_clock::now();
-            while (!ea.reqs.empty()) {
+            while (!ea.requests.empty()) {
                 for (const mllm::Event& e : ea.step()) evs->push_back(e);
                 assert(std::chrono::steady_clock::now() - t0 < std::chrono::seconds(30));
             }
@@ -417,7 +417,7 @@ int main() {
             const int x = ea.submit(rand_ids(reqs == 2 ? 300 : 1300), {.max_tokens = 4});
             const int y = reqs == 2 ? ea.submit(rand_ids(1300), {.max_tokens = 4}) : -1;
             while (in_flight() < 2) ea.step();
-            if (reqs == 2) assert(ea.reqs.at(x).in_flight == 1 && ea.reqs.at(y).in_flight == 1);
+            if (reqs == 2) assert(ea.requests.at(x).in_flight == 1 && ea.requests.at(y).in_flight == 1);
             ea.cancel(x);  // y (if any) runs on to its tokens
             evs.clear();
             drain(&evs);

@@ -1,6 +1,6 @@
 // The decode lane's concurrent encoder (GpuOps::pre's barriers) == a serial one, byte for byte: logits and every
 // touched K/V and state byte, one whole decode step repeated 20 times at B = 7, 8, 13, 16, 17 (qmm_t_decode and
-// split-k matmuls, which share ws.splitk; rows at mixed positions, some on the 2-pass SDPA path). From g9 QA's race
+// split-k matmuls, which share ws.partial_sums; rows at mixed positions, some on the 2-pass SDPA path). From g9 QA's race
 // harness.
 #include <cassert>
 #include <cstdio>
@@ -40,8 +40,8 @@ int main() {
             rows.push_back({pos, 1, std::span(units[b]).first(pages), std::span(units[b]).subspan(pages)});
         }
         tables.write(tab, rows);
-        ws.B = B, ws.S = 1, ws.table = tab;
-        const size_t bytes = (size_t)next * mem.arena.unit_bytes, lb = (size_t)B * s.vocab * 2;
+        ws.request_count = B, ws.tokens_per_request = 1, ws.step_table = tab;
+        const size_t bytes = (size_t)next * mem.arena.unit_bytes, lb = (size_t)B * s.vocab_size * 2;
         std::vector<uint16_t> init(bytes / 2);  // random bf16 in [-0.5, 0.5)
         std::uniform_real_distribution<float> u(-0.5f, 0.5f);
         for (auto& x : init) {
@@ -50,18 +50,18 @@ int main() {
             memcpy(&bits, &v, 4);
             x = bits >> 16;
         }
-        for (int b = 0; b < B; b++) ((int32_t*)ws.tokens.contents)[b] = (int)(rng() % s.vocab);
+        for (int b = 0; b < B; b++) ((int32_t*)ws.token_ids.contents)[b] = (int)(rng() % s.vocab_size);
         auto step = [&](bool concurrent) {
             memcpy(mem.arena_buffer.contents, init.data(), bytes);
             encode_and_wait(q, ws, [&] {
                 for (int i = 0; i <= L; i++) {
-                    ops.dense(i, ws);
-                    if (i < L) ops.attn(i, ws);
+                    ops.apply_weights(i, ws);
+                    if (i < L) ops.apply_attention(i, ws);
                 }
-                ops.lm_head(ws);
+                ops.pick_next_tokens(ws);
             }, concurrent);
             std::vector<uint8_t> r(lb + bytes);
-            memcpy(r.data(), ws.logits.contents, lb);
+            memcpy(r.data(), ws.next_token_scores.contents, lb);
             memcpy(r.data() + lb, mem.arena_buffer.contents, bytes);
             return r;
         };

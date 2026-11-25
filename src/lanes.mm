@@ -11,23 +11,23 @@ static std::runtime_error failed(const char* lane, id<MTLCommandBuffer> cb) {
                               (cb.error ? std::string(": ") + cb.error.localizedDescription.UTF8String : ""));
 }
 
-// One command buffer on q: f encodes into ws.enc (after fence's last update, then updating it, if a fence is given),
+// One command buffer on q: f encodes into ws.encoder (after fence's last update, then updating it, if a fence is given),
 // signaling `signal` with `value` at its end if given. Not committed.
 static id<MTLCommandBuffer> encode(id<MTLCommandQueue> q, Workspace& ws, const std::function<void()>& f, bool concurrent,
                                    id<MTLFence> fence = nil, id<MTLSharedEvent> signal = nil, uint64_t value = 0) {
     id<MTLCommandBuffer> cb = [q commandBuffer];
-    ws.enc = [cb computeCommandEncoderWithDispatchType:concurrent ? MTLDispatchTypeConcurrent : MTLDispatchTypeSerial];
-    if (fence) [ws.enc waitForFence:fence];
+    ws.encoder = [cb computeCommandEncoderWithDispatchType:concurrent ? MTLDispatchTypeConcurrent : MTLDispatchTypeSerial];
+    if (fence) [ws.encoder waitForFence:fence];
     try {
         f();
     } catch (...) {  // the ANE's predict failed midway: close the encoder, drop the command buffer
-        [ws.enc endEncoding];
-        ws.enc = nil;
+        [ws.encoder endEncoding];
+        ws.encoder = nil;
         throw;
     }
-    if (fence) [ws.enc updateFence:fence];
-    [ws.enc endEncoding];
-    ws.enc = nil;
+    if (fence) [ws.encoder updateFence:fence];
+    [ws.encoder endEncoding];
+    ws.encoder = nil;
     if (signal) [cb encodeSignalEvent:signal value:value];
     return cb;
 }
@@ -54,11 +54,11 @@ static id<MTLCommandQueue> lane_queue(Memory& mem) {
     return q;
 }
 
-// lanes.py _layers: dense(i) then attn(i) for every layer, into ws.enc
+// lanes.py _layers: dense(i) then attn(i) for every layer, into ws.encoder
 static void layers(GpuOps& ops, Workspace& ws, int L) {
     for (int i = 0; i < L; i++) {
-        ops.dense(i, ws);
-        ops.attn(i, ws);
+        ops.apply_weights(i, ws);
+        ops.apply_attention(i, ws);
     }
 }
 
@@ -70,8 +70,8 @@ PrefillLane::PrefillLane(GpuOps& ops, Memory& mem, int chunk, int max_ctx, AneOp
     if (ane) {
         const Workspace own = mem.workspace(chunk, 1);
         ws[1] = ws[0];
-        ws[1].tokens = own.tokens, ws[1].x = own.x, ws[1].o = own.o, ws[1].q = own.q, ws[1].k = own.k, ws[1].v = own.v;
-        ws[1].gate = own.gate, ws[1].qkv = own.qkv, ws[1].z = own.z, ws[1].b = own.b, ws[1].a = own.a;
+        ws[1].token_ids = own.token_ids, ws[1].residual = own.residual, ws[1].attention_result = own.attention_result, ws[1].query = own.query, ws[1].key = own.key, ws[1].value = own.value;
+        ws[1].query_gate = own.query_gate, ws[1].query_key_value = own.query_key_value, ws[1].output_gate = own.output_gate, ws[1].update_rate_input = own.update_rate_input, ws[1].decay_input = own.decay_input;
     }
     if (ane) thread = std::thread(&PrefillLane::run, this);
 }
@@ -148,7 +148,7 @@ bool PrefillLane::turn(Chunk& c, const std::deque<Chunk>& others) {
         return true;
     }
     if (c.layer < 0) {
-        c.cb = commit(queue, ws, [&] { ane->inputs(0, ws, set); }, false, fence);
+        c.cb = commit(queue, ws, [&] { ane->prepare_inputs(0, ws, set); }, false, fence);
         c.layer = 0;
         return true;
     }
@@ -164,9 +164,9 @@ bool PrefillLane::turn(Chunk& c, const std::deque<Chunk>& others) {
     if (fail_next.exchange(false)) throw std::runtime_error("PrefillLane: injected failure");
     const int i = c.layer;
     c.cb = commit(queue, ws, [&] {  // K/V and state only: the last layer's o_proj + FFN never run
-        ane->dense(i, ws, set);
-        ops.attn(i, ws);
-        if (i + 1 < L) ane->inputs(i + 1, ws, set);
+        ane->apply_weights(i, ws, set);
+        ops.apply_attention(i, ws);
+        if (i + 1 < L) ane->prepare_inputs(i + 1, ws, set);
     }, false, fence);
     c.layer++;
     return true;
@@ -174,13 +174,13 @@ bool PrefillLane::turn(Chunk& c, const std::deque<Chunk>& others) {
 
 void PrefillLane::submit(PrefillWork work) {
     @autoreleasepool {
-        assert(can_submit() && work.n_valid() > 0 && work.n_valid() <= ws[0].rows);
+        assert(can_submit() && work.n_valid() > 0 && work.n_valid() <= ws[0].max_rows);
         if (fail_submit && --fail_submit == 0) throw std::runtime_error("PrefillLane: injected submit failure");
         Workspace& ws = this->ws[ane ? (n + 1) % 2 : 0];
-        ws.B = 1, ws.S = work.n_valid();
-        std::copy(work.tokens.begin(), work.tokens.end(), (int32_t*)ws.tokens.contents);
-        ws.table = tables.begin(n + 1, event.signaledValue);
-        tables.write(ws.table, {{work.start_pos, work.n_valid(), work.slots, work.state_slots}});
+        ws.request_count = 1, ws.tokens_per_request = work.n_valid();
+        std::copy(work.tokens.begin(), work.tokens.end(), (int32_t*)ws.token_ids.contents);
+        ws.step_table = tables.begin(n + 1, event.signaledValue);
+        tables.write(ws.step_table, {{work.start_pos, work.n_valid(), work.pages, work.state_slots}});
         n++;
         if (ane) {
             const bool gpu = work.n_valid() < gpu_below;
@@ -201,7 +201,7 @@ void PrefillLane::submit(PrefillWork work) {
             constexpr int K = 8;
             for (int a = 0; a < L; a += K)
                 cbs.push_back(encode(queue, ws, [&] {
-                    for (int i = a; i < std::min(a + K, L); i++) ops.dense(i, ws), ops.attn(i, ws);
+                    for (int i = a; i < std::min(a + K, L); i++) ops.apply_weights(i, ws), ops.apply_attention(i, ws);
                 }, false, fence, a + K >= L ? event : nil, n));
             for (size_t j = 0; j + 1 < cbs.size(); j++) {
                 id<MTLCommandBuffer> next = cbs[j + 1];
@@ -266,8 +266,8 @@ void DecodeLane::submit(DecodeWork work) {
         }
         Workspace& ws = this->ws[work.step % 2];
         const int B = (int)work.rows.size();
-        assert(can_submit() && B > 0 && B <= ws.rows && (q.empty() || q.back().w.step + 1 == work.step));
-        ws.B = B, ws.S = 1;
+        assert(can_submit() && B > 0 && B <= ws.max_rows && (q.empty() || q.back().w.step + 1 == work.step));
+        ws.request_count = B, ws.tokens_per_request = 1;
         std::vector<StepTables::Row> rows;
         std::vector<int> src(B, -1);  // fed rows: their row in the step in flight
         bool fed = false;
@@ -280,27 +280,27 @@ void DecodeLane::submit(DecodeWork work) {
                 assert(it != prev.end() && it->pos + 1 == r.pos);
                 src[b] = (int)(it - prev.begin()), fed = true;
             }
-            ((int32_t*)ws.tokens.contents)[b] = r.token;
-            rows.push_back({r.pos, 1, r.slots, r.state_slots});
+            ((int32_t*)ws.token_ids.contents)[b] = r.token;
+            rows.push_back({r.pos, 1, r.pages, r.state_slots});
         }
-        ws.table = tables.begin(work.step + 1, event.signaledValue);
-        tables.write(ws.table, rows);
+        ws.step_table = tables.begin(work.step + 1, event.signaledValue);
+        tables.write(ws.step_table, rows);
         id<MTLCommandBuffer> cb = [queue commandBuffer];
-        ws.enc = [cb computeCommandEncoderWithDispatchType:MTLDispatchTypeConcurrent];
+        ws.encoder = [cb computeCommandEncoderWithDispatchType:MTLDispatchTypeConcurrent];
         // Defensive today: a row in both step N and N + 1 is fed, and feeding reads N's ids, a tracked buffer, so
         // Metal already orders the two encoders (and with them the untracked arena's K/V and state). Needed if
         // workspace buffers become untracked. A fence, not encodeWaitForEvent: that cost B = 1 ~3.5% (297 vs 287).
-        [ws.enc waitForFence:fence];
-        if (fed) ops.feed_tokens(ws, this->ws[(work.step + 1) % 2].ids, src);
+        [ws.encoder waitForFence:fence];
+        if (fed) ops.feed_previous_tokens(ws, this->ws[(work.step + 1) % 2].next_token_ids, src);
         const int L = mem.spec.n_layers();
         layers(ops, ws, L);
-        ops.dense(L, ws);
+        ops.apply_weights(L, ws);
         std::vector<SampleParams> params;
         for (const DecodeRow& r : work.rows) params.push_back(r.sampler);
-        ops.lm_head(ws, params);
-        [ws.enc updateFence:fence];
-        [ws.enc endEncoding];
-        ws.enc = nil;
+        ops.pick_next_tokens(ws, params);
+        [ws.encoder updateFence:fence];
+        [ws.encoder endEncoding];
+        ws.encoder = nil;
         [cb encodeSignalEvent:event value:work.step + 1];
         [cb commit];
         mem.arena.committed = work.step + 1;  // units released from now on wait for this step
@@ -323,7 +323,7 @@ std::vector<std::pair<int, int>> DecodeLane::poll() {
             }
         const DecodeWork& w = q.front().w;
         if (event.signaledValue < w.step + 1) return {};
-        std::vector<int> ids = ops.ids(ws[w.step % 2]);
+        std::vector<int> ids = ops.next_tokens(ws[w.step % 2]);
         std::vector<std::pair<int, int>> done;
         for (size_t b = 0; b < ids.size(); b++) done.emplace_back(w.rows[b].req_id, ids[b]);
         q.pop_front();

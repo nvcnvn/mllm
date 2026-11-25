@@ -75,20 +75,24 @@ private:
 // Activation buffers, sized once for rows = max(chunk, max_batch) (py/mllm/gpu.py docstring has the fields).
 // Row-major [rows, ...] in bf16, except tokens (int32).
 struct Workspace {
-    id<MTLBuffer> tokens, x, o, q, k, v, gate, qkv, z, b, a;
-    id<MTLBuffer> logits;  // [max_batch, vocab]
-    int B = 0, S = 0;      // tokens' shape this step (the lane sets it); dense ops work on B * S rows
-    id<MTLBuffer> table;   // this step's StepTables copy, row b = workspace row b (the lane sets it; attn reads it)
-    id<MTLComputeCommandEncoder> enc;  // GpuOps encodes into it (the lane sets it; GpuOps::pre orders it)
-    int rows = 0, max_ctx = 0;         // capacity: B * S <= rows, pos + n <= max_ctx
+    id<MTLBuffer> token_ids, residual, attention_result, query, key, value, query_gate;
+    id<MTLBuffer> query_key_value, output_gate, update_rate_input, decay_input;  // linear attention's inputs
+    id<MTLBuffer> next_token_scores;  // [max_batch, vocab]
+    // token_ids' shape this step (the lane sets it): apply_weights works on request_count * tokens_per_request rows
+    int request_count = 0, tokens_per_request = 0;
+    id<MTLBuffer> step_table;  // this step's StepTables copy, row b = workspace row b (the lane sets it)
+    id<MTLComputeCommandEncoder> encoder;  // GpuOps encodes into it (the lane sets it)
+    int max_rows = 0, max_context = 0;     // capacity: rows <= max_rows, pos + n <= max_context
 
     // GpuOps' scratch (GpuOps::workspace allocates it), one set per workspace so lanes on two queues never share:
-    // [rows, ...] bf16: h (residual after attn), xn (normed), t (projection out), g / u (MLP), qg (q_proj out);
+    // [rows, ...] bf16: h (residual after attn), xn (normed), t (projection out), g / u (MLP), qg (query_projection out);
     // splitk: qmm_t_splitk's and qmm_t_decode's fp32 partial sums. Attention: ao (attention out, MLX's [B, H, S, D]); partials / sums /
     // maxs (sdpa 2-pass); kc / vc (prefill: the row's K/V gathered, [Hkv, max_ctx, D]); scores [H, rows, max_ctx].
     // Linear attention: nqkv (normed q / k, [rows, conv_dim]), gdn_g (fp32) / beta [rows, Hv].
     // ids: lm_head's argmax per row (int32), read by sample after the command buffer completed.
-    id<MTLBuffer> h, xn, t, g, u, qg, splitk, ao, partials, sums, maxs, kc, vc, scores, nqkv, gdn_g, beta, ids;
+    id<MTLBuffer> after_attention, normalized, projected, gate_values, up_values, query_and_gate, partial_sums;
+    id<MTLBuffer> attention_heads, two_pass_partials, two_pass_sums, two_pass_maxes, gathered_keys, gathered_values;
+    id<MTLBuffer> attention_scores, normalized_query_key, decay, update_rate, next_token_ids;
 };
 
 // Per-step uint32 slot lists the GPU reads, 2 copies by step parity (memory-design "Step tables").
@@ -99,7 +103,7 @@ struct Workspace {
 struct StepTables {
     struct Row {
         int pos, n;
-        std::span<const uint32_t> slots;
+        std::span<const uint32_t> pages;
         std::span<const uint32_t> state = {};  // the request's state units, in span order
     };
     id<MTLBuffer> copies[2];
@@ -121,7 +125,7 @@ public:
         return slots * ((tokens + page_tokens - 1) / page_tokens + state_units_of(s, page_tokens)) * unit_of(s, page_tokens);
     }
 
-    uint32_t units_for(size_t n_tokens) const { return (uint32_t)((n_tokens + T - 1) / T); }
+    uint32_t units_for(size_t n_tokens) const { return (uint32_t)((n_tokens + page_tokens - 1) / page_tokens); }
     // Byte offsets, identical to memory.py's numpy views. KV within a unit: [g, kv, head, token, dim], g = index
     // among full layers. State: a slot list concatenated into one span; per linear layer conv then delta.
     size_t kv_offset(int g, int kv, int head, int token) const;
@@ -146,7 +150,7 @@ public:
 
     ModelSpec spec;
     id<MTLDevice> device;
-    int T;  // tokens per page
+    int page_tokens;  // tokens per page
     Arena arena;
     id<MTLBuffer> arena_buffer;  // n_units * unit_bytes, shared, untracked, pre-touched, in the residency set
     size_t conv_bytes, delta_bytes;

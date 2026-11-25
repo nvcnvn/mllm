@@ -78,7 +78,7 @@ int main() {
     auto py_kv = [&](size_t slot, int gi, int kv, int h, int t) {
         return slot * st[0] + gi * st[1] + kv * st[2] + h * st[3] + t * st[4];
     };
-    const int G = (int)s.full_layers().size(), H = s.n_kv_heads, T = mem.T, D = s.head_dim;
+    const int G = (int)s.full_layers().size(), H = s.key_value_heads, T = mem.page_tokens, D = s.head_dim;
     for (int gi = 0; gi < G; gi++)
         for (int kv = 0; kv < 2; kv++)
             for (int h = 0; h < H; h++)
@@ -158,7 +158,7 @@ int main() {
     // --- workspace + step tables at startup, then nothing allocates
     const int chunk = g["chunk"], max_batch = 8;
     mllm::Workspace ws = mem.workspace(chunk, max_batch);
-    assert(ws.x.length >= (size_t)chunk * s.hidden * ELEM && ws.logits.length == (size_t)max_batch * s.vocab * ELEM);
+    assert(ws.residual.length >= (size_t)chunk * s.hidden * ELEM && ws.next_token_scores.length == (size_t)max_batch * s.vocab_size * ELEM);
     mllm::StepTables tables = mem.step_tables(max_batch);
     mem.freeze();
     const int n_alloc = mem.allocations;

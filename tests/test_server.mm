@@ -181,7 +181,7 @@ int main() {
     // a repeated prompt: usage reports the prefix cache's tokens (its last full page) the second time
     std::string longp;
     for (int i = 0; i < 20; i++) longp += "The tide comes in and the tide goes out. ";
-    const int P = ((int)e.tok.encode(longp).size() - 1) / 32 * 32;
+    const int P = ((int)e.tokenizer.encode(longp).size() - 1) / 32 * 32;
     for (int want_cached : {0, P}) {
         auto u = c.Post("/v1/completions",
                         json({{"prompt", longp}, {"max_tokens", 2}, {"stream", true},
@@ -222,6 +222,6 @@ int main() {
     assert(s.live_requests() == 0);  // stop() cancels everything, so check before it
     s.stop();
     t.join();
-    assert(listened && e.reqs.empty());
+    assert(listened && e.requests.empty());
     printf("PASS\n");
 }

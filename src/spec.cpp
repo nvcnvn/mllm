@@ -53,14 +53,14 @@ ModelSpec load(const std::string& model) {
     s.path = path;
     for (const auto& k : t.at("layer_types")) s.kinds.push_back(k == "full_attention" ? "full" : "linear");
     s.hidden = t.at("hidden_size");
-    s.vocab = t.at("vocab_size");
-    s.n_heads = t.at("num_attention_heads");
-    s.n_kv_heads = t.at("num_key_value_heads");
+    s.vocab_size = t.at("vocab_size");
+    s.query_heads = t.at("num_attention_heads");
+    s.key_value_heads = t.at("num_key_value_heads");
     s.head_dim = t.at("head_dim");
-    s.lin_k_heads = t.at("linear_num_key_heads");
-    s.lin_v_heads = t.at("linear_num_value_heads");
-    s.lin_k_dim = t.at("linear_key_head_dim");
-    s.lin_v_dim = t.at("linear_value_head_dim");
+    s.linear_key_heads = t.at("linear_num_key_heads");
+    s.linear_value_heads = t.at("linear_num_value_heads");
+    s.linear_key_dim = t.at("linear_key_head_dim");
+    s.linear_value_dim = t.at("linear_value_head_dim");
     s.conv_kernel = t.at("linear_conv_kernel_dim");
     return s;
 }

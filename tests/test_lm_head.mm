@@ -1,4 +1,4 @@
-// lm_head + sampling. (1) golden decode0..2: ws.x after dense(L) -> logits and greedy ids equal decodeN/logits,
+// lm_head + sampling. (1) golden decode0..2: ws.residual after dense(L) -> logits and greedy ids equal decodeN/logits,
 // decodeN/argmax. (2) lm_head.safetensors: the quantized matmul at N = vocab for M = 1..16 (MLX switches kernels by
 // M) bit-exact at M 1..6 and 13..16, by tolerance at 7..12 (qmm_t_decode), rows past M untouched, argmax = the
 // lowest index of the row's max. (3) argmax ties and edges. (4) make_sampler semantics, drawn on the GPU:
@@ -15,23 +15,23 @@
 #include "lanes.h"
 
 struct mllm::GpuOpsTest {
-    static void argmax(GpuOps& ops, id<MTLCommandQueue> q, Workspace& ws, id<MTLBuffer> x, id<MTLBuffer> out, int rows,
+    static void greedy_tokens(GpuOps& ops, id<MTLCommandQueue> q, Workspace& ws, id<MTLBuffer> x, id<MTLBuffer> out, int rows,
                        int V) {
         mllm::encode_and_wait(q, ws, [&] {
-            ops.use(ws);
-            ops.argmax({x}, {out}, rows, V);
+            ops.begin(ws);
+            ops.greedy_tokens({x}, {out}, rows, V);
         });
     }
-    static std::vector<int> sample(GpuOps& ops, id<MTLCommandQueue> q, Workspace& ws,
+    static std::vector<int> sample_tokens(GpuOps& ops, id<MTLCommandQueue> q, Workspace& ws,
                                    const std::vector<SampleParams>& params) {
-        ws.B = (int)params.size();
+        ws.request_count = (int)params.size();
         @autoreleasepool {
             mllm::encode_and_wait(q, ws, [&] {
-                ops.use(ws);
-                ops.sample({ws.logits}, {ws.ids}, ops.spec.vocab, params);
+                ops.begin(ws);
+                ops.sample_tokens({ws.next_token_scores}, {ws.next_token_ids}, ops.spec.vocab_size, params);
             });
         }
-        return ops.ids(ws);
+        return ops.next_tokens(ws);
     }
 };
 
@@ -61,27 +61,27 @@ int main() {
     id<MTLDevice> dev = MTLCreateSystemDefaultDevice();
     mllm::Weights w(s.path, dev);
     mllm::Memory mem(s, dev, 64 << 20);
-    const int max_batch = 16, V = s.vocab;
+    const int max_batch = 16, V = s.vocab_size;
     mllm::GpuOps ops(mem, w);
     mllm::Workspace ws = ops.workspace(1, max_batch, 64);
     id<MTLCommandQueue> q = [dev newCommandQueue];
     id<MTLBuffer> ids = mem.buffer(max_batch * 4);
     mem.freeze();
-    uint8_t* logits = (uint8_t*)ws.logits.contents;
-    ws.S = 1;
+    uint8_t* logits = (uint8_t*)ws.next_token_scores.contents;
+    ws.tokens_per_request = 1;
     auto exact = [&](const std::string& name, const mllm::Tensor& want, const uint8_t* data) {
         bool same = !memcmp(logits, data, want.nbytes);
         if (!same) golden::matches(name, want, data, logits, 1, 0);  // prints cos and max |diff|
         return same;
     };
     auto run = [&](int B) {
-        ws.B = B;
+        ws.request_count = B;
         @autoreleasepool {
             mllm::encode_and_wait(q, ws, [&] {
-                ops.lm_head(ws);
+                ops.pick_next_tokens(ws);
             });
         }
-        return ops.ids(ws);  // greedy
+        return ops.next_tokens(ws);  // greedy
     };
 
     // (1) golden decode steps
@@ -93,7 +93,7 @@ int main() {
         snprintf(key, sizeof key, "%s/L%02d/dense/x", c.c_str(), s.n_layers());
         const mllm::Tensor& x = tr.at(key);
         const mllm::Tensor &want = tr.at(c + "/logits"), &am = tr.at(c + "/argmax");
-        memcpy(ws.x.contents, tr.data(x), x.nbytes);
+        memcpy(ws.residual.contents, tr.data(x), x.nbytes);
         std::vector<int> got = run((int)x.shape[0]);
         assert(exact(c + "/logits", want, tr.data(want)));
         for (size_t b = 0; b < got.size(); b++) assert(got[b] == golden::load<int32_t>(tr.data(am), b));
@@ -101,7 +101,7 @@ int main() {
     }
     // (2) M = 1..16 at N = vocab
     const mllm::Tensor& xs = sw.at("x");
-    memcpy(ws.x.contents, sw.data(xs), xs.nbytes);
+    memcpy(ws.residual.contents, sw.data(xs), xs.nbytes);
     for (int M = 1; M <= 16; M++) {
         const mllm::Tensor& want = sw.at(std::to_string(M) + "/logits");
         const size_t row = (size_t)V * 2, rest = (max_batch - M) * row;
@@ -124,7 +124,7 @@ int main() {
     L[(size_t)V + V - 1] = to_bf16(1);                      // row 1: the last index
     std::fill(L + 2 * (size_t)V, L + 3 * (size_t)V, ninf);  // row 2: all -inf (MLX: 0)
     L[3 * (size_t)V + 7] = L[3 * (size_t)V + 6] = to_bf16(-2.5);  // row 3: adjacent tie
-    mllm::GpuOpsTest::argmax(ops, q, ws, ws.logits, ids, 4, V);
+    mllm::GpuOpsTest::greedy_tokens(ops, q, ws, ws.next_token_scores, ids, 4, V);
     const int32_t* id = (const int32_t*)ids.contents;
     assert(id[0] == 1000 && id[1] == V - 1 && id[2] == 0 && id[3] == 6);
 
@@ -133,35 +133,35 @@ int main() {
     for (int i = 0; i < V; i++) L[i] = to_bf16(-60 - (i % 32) * 0.5f);
     const std::pair<int, float> live[] = {{5, 2.0f}, {77, 1.3f}, {V - 1, 0.8f}, {0, 0.4f}};
     for (auto [i, v] : live) L[i] = to_bf16(v);
-    ws.B = 1;
+    ws.request_count = 1;
     // (temp, top_p, tokens kept: apply_top_p in Python on this row)
     struct Case {
-        float temp, top_p;
+        float temperature, top_p;
         int kept;
     };
     // chi-square over the kept tokens, 99.9% quantile per degree of freedom (1..3)
-    auto draw = [&](mllm::SampleParams p) { return mllm::GpuOpsTest::sample(ops, q, ws, {p})[0]; };
+    auto draw = [&](mllm::SampleParams p) { return mllm::GpuOpsTest::sample_tokens(ops, q, ws, {p})[0]; };
     const int draws = 5000;
     const double chi2_max[] = {0, 10.83, 13.82, 16.27};
     for (Case k : {Case{1, 0, 4}, Case{0.7f, 0.7f, 2}, Case{0.7f, 0.8f, 3}, Case{1.5f, 0.95f, 4}}) {
         std::mt19937_64 rng(42);
-        mllm::SampleParams p{k.temp, k.top_p, &rng};
+        mllm::SampleParams p{k.temperature, k.top_p, &rng};
         std::map<int, int> n;
         for (int i = 0; i < draws; i++) n[draw(p)]++;
         double z = 0, chi2 = 0;
-        for (int j = 0; j < k.kept; j++) z += std::exp(from_bf16(L[live[j].first]) / k.temp);
+        for (int j = 0; j < k.kept; j++) z += std::exp(from_bf16(L[live[j].first]) / k.temperature);
         for (int j = 0; j < 4; j++) {
             int t = live[j].first;
-            double want = j < k.kept ? draws * std::exp(from_bf16(L[t]) / k.temp) / z : 0;
+            double want = j < k.kept ? draws * std::exp(from_bf16(L[t]) / k.temperature) / z : 0;
             if (j < k.kept) chi2 += (n[t] - want) * (n[t] - want) / want;
             assert(j < k.kept || n[t] == 0);
         }
-        printf("  temp %.1f top_p %.2f: chi2 %.2f (df %d, max %.2f)\n", k.temp, k.top_p, chi2, k.kept - 1, chi2_max[k.kept - 1]);
+        printf("  temp %.1f top_p %.2f: chi2 %.2f (df %d, max %.2f)\n", k.temperature, k.top_p, chi2, k.kept - 1, chi2_max[k.kept - 1]);
         assert(chi2 < chi2_max[k.kept - 1]);
         assert((int)std::count_if(n.begin(), n.end(), [](auto& e) { return e.second > 0; }) == k.kept);
         std::mt19937_64 r1(7), r2(7);  // seeded: the same draws
         for (int i = 0; i < 100; i++)
-            assert(draw({k.temp, k.top_p, &r1}) == draw({k.temp, k.top_p, &r2}));
+            assert(draw({k.temperature, k.top_p, &r1}) == draw({k.temperature, k.top_p, &r2}));
     }
     // -inf tokens never drawn; an all -inf row gives 0
     std::fill(L, L + V, ninf);
@@ -198,7 +198,7 @@ int main() {
     for (int r = 1; r < 4; r++) std::copy(L, L + V, L + (size_t)r * V);
     std::mt19937_64 a1(11), a2(11), b1(12), b2(12);
     for (int i = 0; i < 50; i++) {
-        const std::vector<int> got = mllm::GpuOpsTest::sample(ops, q, ws, {{}, {0.7f, 0.7f, &a1}, {}, {1.5f, 0.95f, &b1}});
+        const std::vector<int> got = mllm::GpuOpsTest::sample_tokens(ops, q, ws, {{}, {0.7f, 0.7f, &a1}, {}, {1.5f, 0.95f, &b1}});
         assert(got[0] == 5 && got[2] == 5 && (got[1] == 5 || got[1] == 77));
         assert(got[1] == draw({0.7f, 0.7f, &a2}) && got[3] == draw({1.5f, 0.95f, &b2}));
     }

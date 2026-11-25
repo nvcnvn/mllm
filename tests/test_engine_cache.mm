@@ -40,10 +40,10 @@ static Run run(mllm::Engine& e, const std::vector<int>& ids, int max_tokens = N)
     const int id = e.submit(ids, {.max_tokens = max_tokens});
     Run r;
     std::vector<uint32_t> pages, st;
-    while (e.reqs.count(id)) {
+    while (e.requests.count(id)) {
         for (const mllm::Event& ev : e.step()) r.toks.push_back(ev.token);
-        auto it = e.reqs.find(id);
-        if (it != e.reqs.end() && it->second.state != mllm::State::WAITING)
+        auto it = e.requests.find(id);
+        if (it != e.requests.end() && it->second.state != mllm::State::WAITING)
             pages = it->second.pages, st = it->second.state_slots, r.cached = it->second.cached;
     }
     if (max_tokens > 1) return r;
@@ -53,9 +53,9 @@ static Run run(mllm::Engine& e, const std::vector<int>& ids, int max_tokens = N)
     for (int t = 0; t < (int)ids.size(); t++)
         for (int g = 0; g < (int)m.spec.full_layers().size(); g++)
             for (int kv = 0; kv < 2; kv++)
-                for (int h = 0; h < m.spec.n_kv_heads; h++)
+                for (int h = 0; h < m.spec.key_value_heads; h++)
                     for (int d = 0; d < m.spec.head_dim; d++)
-                        r.kv.push_back(bf16(base + pages[t / m.T] * ub + m.kv_offset(g, kv, h, t % m.T) + d * 2));
+                        r.kv.push_back(bf16(base + pages[t / m.page_tokens] * ub + m.kv_offset(g, kv, h, t % m.page_tokens) + d * 2));
     auto at = [&](size_t b) { return base + st[b / ub] * ub + b % ub; };  // the state span's byte b
     for (int l : m.spec.linear_layers()) {
         const size_t off = m.state_offset(l);
@@ -114,7 +114,7 @@ static void invariants(const mllm::Engine& e) {
         if (e.cache->nodes.count(n.parent)) kids[n.parent]++;
     }
     uint32_t reserved = 0, unheld = 0, cache_only = 0;
-    for (auto& [_, r] : e.reqs) {
+    for (auto& [_, r] : e.requests) {
         if (r.state == mllm::State::DONE) continue;
         reserved += r.reserved;
         for (uint32_t u : r.pages) req[u]++;
@@ -152,8 +152,8 @@ static void stress(int chunk, int seed) {
     auto last_ev = std::chrono::steady_clock::now();
     int submitted = 0;
     std::set<int> hit;
-    while (submitted < 80 || !e.reqs.empty()) {
-        if (submitted < 80 && e.reqs.size() < 10 && pick(g) < 30) {
+    while (submitted < 80 || !e.requests.empty()) {
+        if (submitted < 80 && e.requests.size() < 10 && pick(g) < 30) {
             std::vector<int> p;
             const int k = pick(g);
             if (k < 30 && !history.empty()) {  // multi-turn: an earlier prompt + more
@@ -179,7 +179,7 @@ static void stress(int chunk, int seed) {
         // no token for this long = stalled; 0.8B prefills 2500 tokens in < 1 s, the 27B on the GPU in ~20-35 s
         assert(std::chrono::steady_clock::now() - last_ev < std::chrono::seconds(getenv("MLLM_MODEL") ? 120 : 10) &&
                "stalled");
-        for (auto& [id, r] : e.reqs) {
+        for (auto& [id, r] : e.requests) {
             if (r.state == mllm::State::DONE || r.cancelled) continue;
             const auto [at_pos, at_out] = plans[id];
             if ((at_pos >= 0 && r.state == mllm::State::PREFILL && r.pos >= at_pos) ||
@@ -358,12 +358,12 @@ int main(int argc, char** argv) {
             doomed.insert(on.submit(p, {.max_tokens = 16}));
         std::set<uint64_t> seen;
         std::set<int> hit;
-        while (!on.reqs.empty()) {
+        while (!on.requests.empty()) {
             for (const mllm::Event& ev : on.step()) got[ev.req_id].push_back(ev.token);
             for (int id : doomed)
-                if (on.reqs.count(id) && on.reqs.at(id).pos >= 256 && !on.reqs.at(id).cancelled) on.cancel(id);
+                if (on.requests.count(id) && on.requests.at(id).pos >= 256 && !on.requests.at(id).cancelled) on.cancel(id);
             for (auto& [h, _] : on.cache->nodes) seen.insert(h);
-            for (auto& [id, r] : on.reqs)
+            for (auto& [id, r] : on.requests)
                 if (r.state != mllm::State::WAITING && r.cached > 0) hit.insert(id);
         }
         int evicted = 0;
@@ -381,12 +381,12 @@ int main(int argc, char** argv) {
         const int id = on.submit(long1300, {.max_tokens = (int)(on.mem.arena.n_units - on.mem.state_units) * 32 - 1300});
         assert(on.cache->match(long1300).S > 0);
         const auto t0 = std::chrono::steady_clock::now();
-        while (on.reqs.at(id).state == mllm::State::WAITING) {
+        while (on.requests.at(id).state == mllm::State::WAITING) {
             on.step();
             assert(std::chrono::steady_clock::now() - t0 < std::chrono::seconds(5) && "a big hit waits forever");
         }
         on.cancel(id);
-        while (!on.reqs.empty()) on.step();
+        while (!on.requests.empty()) on.step();
         check_idle(on);
     }
     if (part.empty()) stress(512, 3), stress(32, 1);

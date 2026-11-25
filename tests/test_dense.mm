@@ -25,8 +25,8 @@ int main() {
     id<MTLCommandQueue> q = [dev newCommandQueue];
     mem.freeze();
 
-    std::map<std::string, id<MTLBuffer>> field = {{"x", ws.x}, {"q", ws.q}, {"k", ws.k}, {"v", ws.v},
-        {"gate", ws.gate}, {"qkv", ws.qkv}, {"z", ws.z}, {"b", ws.b}, {"a", ws.a}};
+    std::map<std::string, id<MTLBuffer>> field = {{"x", ws.residual}, {"q", ws.query}, {"k", ws.key}, {"v", ws.value},
+        {"gate", ws.query_gate}, {"qkv", ws.query_key_value}, {"z", ws.output_gate}, {"b", ws.update_rate_input}, {"a", ws.decay_input}};
     auto load = [&](const std::string& key, id<MTLBuffer> dst) {
         const mllm::Tensor& t = tr.at(key);
         assert(t.nbytes <= dst.length);
@@ -44,7 +44,7 @@ int main() {
     for (const auto& call : g["calls"]) {
         std::string c = call["name"].get<std::string>();
         const mllm::Tensor& tok = tr.at(c + "/tokens");
-        ws.B = (int)tok.shape[0], ws.S = (int)tok.shape[1];
+        ws.request_count = (int)tok.shape[0], ws.tokens_per_request = (int)tok.shape[1];
         for (int i = 0; i <= L; i++) {
             char li[8], lp[8];
             snprintf(li, sizeof li, "L%02d", i), snprintf(lp, sizeof lp, "L%02d", i - 1);
@@ -52,14 +52,14 @@ int main() {
             if (i && !tr.tensors.count(c + "/" + lp + "/attn/o")) continue;  // big models: a few layers (dump_golden)
             runs++;
             if (i == 0) {
-                load(c + "/tokens", ws.tokens);
+                load(c + "/tokens", ws.token_ids);
             } else {
-                load(c + "/" + lp + "/dense/x", ws.x);
-                load(c + "/" + lp + "/attn/o", ws.o);
+                load(c + "/" + lp + "/dense/x", ws.residual);
+                load(c + "/" + lp + "/attn/o", ws.attention_result);
             }
             @autoreleasepool {
                 mllm::encode_and_wait(q, ws, [&] {
-                    ops.dense(i, ws);
+                    ops.apply_weights(i, ws);
                 });
             }
 
@@ -105,10 +105,10 @@ int main() {
     assert(ok);
 
     // M = 1 (no golden call has it): the merged matmuls (GpuOps::merge) give the same bytes as the separate ones.
-    // Row 0 of decode0's inputs; z / b / a / v are read where the merged row leaves them (ws.qkv, ws.qg).
-    const size_t E = 2, C = s.conv_dim(), vd = (size_t)s.lin_v_heads * s.lin_v_dim, Hv = s.lin_v_heads;
-    const size_t qd = (size_t)s.n_heads * s.head_dim, kvd = (size_t)s.n_kv_heads * s.head_dim;
-    ws.B = 1, ws.S = 1;
+    // Row 0 of decode0's inputs; z / b / a / v are read where the merged row leaves them (ws.query_key_value, ws.query_and_gate).
+    const size_t E = 2, C = s.conv_dim(), vd = (size_t)s.linear_value_heads * s.linear_value_dim, Hv = s.linear_value_heads;
+    const size_t qd = (size_t)s.query_heads * s.head_dim, kvd = (size_t)s.key_value_heads * s.head_dim;
+    ws.request_count = 1, ws.tokens_per_request = 1;
     int m1_checked = 0;
     for (int i = 0; i <= L; i++) {
         char lp[8];
@@ -117,25 +117,25 @@ int main() {
         const bool lin = i < L && s.kinds[i] == "linear", full = i < L && !lin;
         // (name, separate path's buffer, merged path's buffer and byte offset, bytes)
         std::vector<std::tuple<std::string, id<MTLBuffer>, id<MTLBuffer>, size_t, size_t>> f = {
-            {"x", ws.x, ws.x, 0, s.hidden * E}};
+            {"x", ws.residual, ws.residual, 0, s.hidden * E}};
         if (lin)
-            f.insert(f.end(), {{"qkv", ws.qkv, ws.qkv, 0, C * E}, {"z", ws.z, ws.qkv, C * E, vd * E},
-                               {"b", ws.b, ws.qkv, (C + vd) * E, Hv * E}, {"a", ws.a, ws.qkv, (C + vd + Hv) * E, Hv * E}});
+            f.insert(f.end(), {{"qkv", ws.query_key_value, ws.query_key_value, 0, C * E}, {"z", ws.output_gate, ws.query_key_value, C * E, vd * E},
+                               {"b", ws.update_rate_input, ws.query_key_value, (C + vd) * E, Hv * E}, {"a", ws.decay_input, ws.query_key_value, (C + vd + Hv) * E, Hv * E}});
         if (full)
-            f.insert(f.end(), {{"q", ws.q, ws.q, 0, qd * E}, {"gate", ws.gate, ws.gate, 0, qd * E}, {"k", ws.k, ws.k, 0, kvd * E},
-                               {"v", ws.v, ws.qg, (2 * qd + kvd) * E, kvd * E}});
+            f.insert(f.end(), {{"q", ws.query, ws.query, 0, qd * E}, {"gate", ws.query_gate, ws.query_gate, 0, qd * E}, {"k", ws.key, ws.key, 0, kvd * E},
+                               {"v", ws.value, ws.query_and_gate, (2 * qd + kvd) * E, kvd * E}});
         std::vector<std::vector<uint8_t>> want;
         for (bool merge : {false, true}) {
             if (i == 0) {
-                load("decode0/tokens", ws.tokens);
+                load("decode0/tokens", ws.token_ids);
             } else {
-                load(std::string("decode0/") + lp + "/dense/x", ws.x);
-                load(std::string("decode0/") + lp + "/attn/o", ws.o);
+                load(std::string("decode0/") + lp + "/dense/x", ws.residual);
+                load(std::string("decode0/") + lp + "/attn/o", ws.attention_result);
             }
             for (auto& [name, sep, mb, off, n] : f) memset((uint8_t*)mb.contents + off, 0xFF, n), memset(sep.contents, 0xFF, n);
-            ops.merge = merge;
+            ops.merge_projections = merge;
             @autoreleasepool {
-                mllm::encode_and_wait(q, ws, [&] { ops.dense(i, ws); });
+                mllm::encode_and_wait(q, ws, [&] { ops.apply_weights(i, ws); });
             }
             for (size_t k = 0; k < f.size(); k++) {
                 auto& [name, sep, mb, off, n] = f[k];

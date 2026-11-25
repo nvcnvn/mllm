@@ -7,7 +7,7 @@
 // and output is an IOSurface (Memory::surface), fp16 row-major [rows, cols] like the workspace's bf16 [n, C]. S is the
 // largest chunk size (512 and S are built); a chunk runs on the smallest that holds it, zero-padded.
 //
-// The residual x goes through ws.x (bf16) between blocks: keeping it fp16 on the ANE side drifted further from the GPU
+// The residual x goes through ws.residual (bf16) between blocks: keeping it fp16 on the ANE side drifted further from the GPU
 // path (worst state cos 0.99868 vs 0.99884 on golden chat/0 with the earlier baked-weight blocks).
 #pragma once
 #import <CoreML/CoreML.h>
@@ -27,13 +27,13 @@ public:
     AneOps(GpuOps& gpu, Memory& mem, int S);
 
     // set: which of the 2 surface sets (two chunks in flight, one set each; PrefillLane uses chunk parity).
-    // Encode into ws.enc: block i's inputs (ws.x, and ws.o for i > 0) into its surfaces, zero past ws.S tokens, and
-    // its weights and gammas into the set's weight surfaces. i = 0 first embeds ws.tokens into ws.x.
-    void inputs(int i, Workspace& ws, int set);
+    // Encode into ws.encoder: block i's inputs (ws.residual, and ws.attention_result for i > 0) into its surfaces, zero past ws.tokens_per_request tokens, and
+    // its weights and gammas into the set's weight surfaces. i = 0 first embeds ws.token_ids into ws.residual.
+    void prepare_inputs(int i, Workspace& ws, int set);
     // Runs block i on the ANE (blocks the thread until done; its inputs must be on the surfaces, i.e. the command
-    // buffer that encoded inputs(i) completed), then encodes into ws.enc its outputs' first ws.S tokens -> ws.x and
-    // ws.q / k / v / gate or ws.qkv / z / b / a.
-    void dense(int i, Workspace& ws, int set);
+    // buffer that encoded inputs(i) completed), then encodes into ws.encoder its outputs' first ws.tokens_per_request tokens -> ws.residual and
+    // ws.query / k / v / gate or ws.query_key_value / z / b / a.
+    void apply_weights(int i, Workspace& ws, int set);
 
     struct Surface {
         Memory::Surface s;
@@ -53,7 +53,7 @@ public:
     };
     // What inputs(i) writes into a weight surface: a 4-bit weight (w), or a norm's bf16 gamma of dim values
     struct Param {
-        const QLinear* w;
+        const QuantizedWeights* w;
         Buf gamma;
         int dim;
         Surface* surface[2];
