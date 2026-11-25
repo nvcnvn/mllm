@@ -78,3 +78,29 @@ GpuOps' constructor loads each field from its model-file key; that is the one pl
 
 `query_heads`, `key_value_heads` (was `n_heads`, `n_kv_heads`); `linear_key_heads`, `linear_value_heads`,
 `linear_key_dim`, `linear_value_dim` (was `lin_k_heads` ...); `vocab_size` (was `vocab`).
+
+## GPU kernels (`GpuOps` members, gpu.h)
+
+Each holds one MLX (or our) kernel; the kernel's name is in the comment next to it.
+
+| Now | Was | Used for |
+|---|---|---|
+| `multiply_one_row`, `multiply_few_rows[]` | `qmv_fast`, `qmv_wide` | 4-bit weights times 1, or 2..12 rows |
+| `multiply_tiles_32[]`, `multiply_tiles_64[]`, `multiply_split_inner[]`, `sum_splits` | `qmm_t`, `qmm_t_64`, `qmm_t_splitk`, `splitk_accum` | 4-bit weights times many rows (prefill) |
+| `multiply_decode_rows[][]` | `qmm_t_decode` | batched decode, 7..16 rows |
+| `multiply_bf16(...)`, `multiply_few_rows_bf16`, `multiply_tiles_bf16` | `matmul`, `gemv_wide_ps`, `steel_ps` | query x keys and scores x values when the fused attention doesn't fit |
+| `attention_short_context`, `attention_long_context_blocks[]`, `attention_long_context_combine` | `sdpa_ps`, `sdpa_2pass_1`, `sdpa_2pass_2` | fused attention, one pass below 1024 keys, two above |
+| `rotate_positions_kernel`, `write_keys_values_kernel` | `rope_ps`, `write_kv_ps` | RoPE; writing K/V into the pages |
+| `conv_kernel`, `conv_and_normalize_kernel`, `decay_and_update_rate_kernel`, `gated_delta_kernel` | `conv1d_silu_ps`, `conv_norm_qk_ps`, `gdn_gates_ps`, `gated_delta_ps` | linear attention |
+| `independent`, `before_dispatch()` | `indep`, `pre()` | skip the barrier before the next dispatch |
+
+## Lanes, engine, Neural Engine
+
+| Now | Was |
+|---|---|
+| `PrefillLane::in_flight`, `queued_chunks`, `chunks_committed`, `run_ane_thread()`, `take_turn()` | `q`, `todo`, `n`, `run()`, `turn()` |
+| `Request::prompt`, `position`, `generated`, `snapshot_points` | `ids`, `pos`, `out`, `snaps` |
+| `Engine::step()` steps: `take_finished_chunks`, `take_decoded_tokens`, `admit_waiting_requests`, `submit_prefill_chunks`, `submit_decode_step`, `wait_for_a_lane` | one long `step()` |
+| `StepTables::Row::start_position`, `token_count` | `pos`, `n` |
+| `Arena::free_bitmap`, `request_refs` | `free`, `req_refs` |
+| `AneOps::WeightInput`, `weight_inputs`, `chunk_sizes`, `block_kind` | `Param`, `params`, `sizes`, `kind_of` |
