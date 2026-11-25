@@ -10,16 +10,15 @@ namespace mllm {
 // ponytail: a fixed interval; the OS may unwire idle memory sooner under pressure, then the first step after pays.
 constexpr auto RESIDENCY_EVERY = std::chrono::seconds(10);
 
-static std::unique_ptr<AneOps> ane_ops(const std::string& on, GpuOps& ops, Memory& mem, int chunk,
-                                       const std::string& weights) {
+static std::unique_ptr<AneOps> ane_ops(const std::string& on, GpuOps& ops, Memory& mem, int chunk) {
     if (on != "gpu" && on != "ane") throw std::invalid_argument("prefill_on: \"gpu\" or \"ane\", not " + on);
-    return on == "ane" ? std::make_unique<AneOps>(ops, mem, chunk, weights) : nullptr;
+    return on == "ane" ? std::make_unique<AneOps>(ops, mem, chunk) : nullptr;
 }
 
 Engine::Engine(const std::string& model, size_t arena_bytes, int chunk, int page_tokens, int max_batch, int max_ctx,
-               const std::string& prefill_on, const std::string& ane_weights, bool prefix_cache)
+               const std::string& prefill_on, bool prefix_cache)
     : spec(spec::load(model)), tok(spec.path), device(MTLCreateSystemDefaultDevice()), weights(spec.path, device),
-      mem(spec, device, arena_bytes, page_tokens), ops(mem, weights), ane(ane_ops(prefill_on, ops, mem, chunk, ane_weights)),
+      mem(spec, device, arena_bytes, page_tokens), ops(mem, weights), ane(ane_ops(prefill_on, ops, mem, chunk)),
       prefill(ops, mem, chunk, max_ctx, ane.get()),
       decode(ops, mem, max_batch, max_ctx), cache(prefix_cache ? std::make_unique<PrefixCache>(mem.arena, page_tokens) : nullptr),
       chunk(chunk), max_batch(max_batch), max_ctx(max_ctx),

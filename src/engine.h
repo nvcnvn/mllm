@@ -56,13 +56,12 @@ class Engine {
 public:
     // chunk: prefill tokens per submit (a multiple of page_tokens, so chunks start on a page). max_batch: decode rows
     // per step. max_ctx: the longest request (prompt + max_tokens); sizes the prefill attention scratch.
-    // prefill_on: "gpu" or "ane" (dense blocks on the Neural Engine, built by Python; ane_weights: shared, the GPU's
-    // weights fed in per layer (ane.h), or fp16, int8, lut6, lut4 baked per layer for S = chunk, as ane.py _compress).
-    // Decode always runs on the GPU.
+    // prefill_on: "gpu" or "ane" (dense blocks on the Neural Engine, the GPU's weights fed in per layer: ane.h; the
+    // blocks are built by Python for 512 and chunk). Decode always runs on the GPU.
     // prefix_cache: reuse prompt pages and linear state across requests (prefix_cache.h); off = no lookups, no splits.
     explicit Engine(const std::string& model, size_t arena_bytes = (size_t)1 << 30, int chunk = 512,
                     int page_tokens = 32, int max_batch = 16, int max_ctx = 16384, const std::string& prefill_on = "gpu",
-                    const std::string& ane_weights = "shared", bool prefix_cache = true);
+                    bool prefix_cache = true);
 
     int submit(std::vector<int> ids, GenParams p = {});  // throws std::invalid_argument
     int submit(const std::vector<Message>& chat, GenParams p = {});

@@ -266,15 +266,15 @@ static double arena_gib = 0;
 static int max_ctx = 16384;
 static const char* prog = "mllm";  // argv[0]'s name: mmmllm through the package
 static size_t arena(double def_gib) { return (size_t)((arena_gib ? arena_gib : def_gib) * (1 << 30)); }
-// prefill chunk: shared-weight ANE blocks run 1024-token chunks (1.5x GPU prefill at 27B vs 1.3x at 512,
+// prefill chunk: ANE blocks run 1024-token chunks (1.5x GPU prefill at 27B vs 1.3x at 512,
 // target-27b.md §5; shorter ones run the 512 block). Fixed at 1024 for this project's M4 Pro (user, 2026-11-25).
-static int chunk(const std::string& on, const std::string& ane_weights) {
-    return on == "ane" && ane_weights == "shared" ? 1024 : 512;
+static int chunk(const std::string& on) {
+    return on == "ane" ? 1024 : 512;
 }
 
 static void generate(const std::string& model, const std::string& prompt, mllm::GenParams p, const std::string& on,
-                     const std::string& ane_weights, bool prefix_cache) {
-    mllm::Engine e(model, arena(1), chunk(on, ane_weights), 32, 16, max_ctx, on, ane_weights, prefix_cache);
+                     bool prefix_cache) {
+    mllm::Engine e(model, arena(1), chunk(on), 32, 16, max_ctx, on, prefix_cache);
     e.generate({{"user", prompt}}, p, [](const std::string& t) {
         fputs(t.c_str(), stdout);
         fflush(stdout);
@@ -289,8 +289,8 @@ static void generate(const std::string& model, const std::string& prompt, mllm::
 static std::atomic<bool> interrupted;
 
 static void chat(const std::string& model, mllm::GenParams p, bool default_max, const std::string& on,
-                 const std::string& ane_weights, bool prefix_cache) {
-    mllm::Engine e(model, arena(1), chunk(on, ane_weights), 32, 16, max_ctx, on, ane_weights, prefix_cache);
+                 bool prefix_cache) {
+    mllm::Engine e(model, arena(1), chunk(on), 32, 16, max_ctx, on, prefix_cache);
     const bool tty = isatty(0);
     if (tty) fprintf(stderr, "%s chat: Ctrl-C stops a reply, Ctrl-D quits\n", prog);
     std::vector<mllm::Message> history;
@@ -350,8 +350,8 @@ static void chat(const std::string& model, mllm::GenParams p, bool default_max, 
 // one as each finishes), left out of the fields above; stream_tps = its prompt tokens done / the trial's time. Measures
 // what a concurrent prefill costs decode (architecture.md "Concurrency").
 static void bench(const std::string& model, int P, int G, int B, int n, const std::string& on,
-                  const std::string& ane_weights, int stream, bool prefix_cache) {
-    mllm::Engine e(model, arena(1), chunk(on, ane_weights), 32, 16, max_ctx, on, ane_weights, prefix_cache);
+                  int stream, bool prefix_cache) {
+    mllm::Engine e(model, arena(1), chunk(on), 32, 16, max_ctx, on, prefix_cache);
     e.tok.eos.clear();  // as mlx_lm.benchmark: never stop early
     std::mt19937 rng(0);
     std::uniform_int_distribution<int> tok(0, e.spec.vocab - 1);
@@ -415,9 +415,9 @@ static void bench(const std::string& model, int P, int G, int B, int n, const st
 }
 
 // mllm serve: /v1/completions on 127.0.0.1 until killed. A 2 GiB arena: 32 requests of 512 + 256 tokens need 0.9.
-static int serve(const std::string& model, int port, const std::string& on, const std::string& ane_weights,
+static int serve(const std::string& model, int port, const std::string& on,
                  int max_batch, bool prefix_cache) {
-    mllm::Engine e(model, arena(2), chunk(on, ane_weights), 32, max_batch, max_ctx, on, ane_weights, prefix_cache);
+    mllm::Engine e(model, arena(2), chunk(on), 32, max_batch, max_ctx, on, prefix_cache);
     mllm::Server s(e, model);
     fprintf(stderr, "%s serve: http://127.0.0.1:%d/v1 (chat/completions, completions; prefill on %s, max batch %d, "
             "prefix cache %s)\n", prog, port, on.c_str(), max_batch, prefix_cache ? "on" : "off");
@@ -436,10 +436,8 @@ static int usage() {
             "         /v1/completions on 127.0.0.1\n"
             "       %1$s bench-ops MODEL                      GPU time per op and per decode step, next to the roofline\n"
             "MODEL: repo id under $HF_HOME, or a local dir\n"
-            "PREFILL: [--prefill gpu|ane] [--ane-weights shared|fp16|int8|lut6|lut4]: dense blocks of prefill on the\n"
-            "         Neural Engine (Core ML models built by py/mllm/ane.py). shared (default): no weight copy of its\n"
-            "         own, the GPU feeds it its weights a layer at a time, 1024-token chunks; the others bake the\n"
-            "         weights into per-layer blocks of 512 (small models only: a copy of their own)\n"
+            "PREFILL: [--prefill gpu|ane]: prefill's matmuls on the Neural Engine, the GPU feeding it its own weights a\n"
+            "         layer at a time (Core ML blocks built by py/mllm/ane.py), 1024-token chunks\n"
             "         [--prefix-cache on|off]: reuse prompt prefixes across requests (default on; off for bench, whose\n"
             "         trials repeat the same prompts)\n"
             "ENGINE (generate, bench, serve): [--arena-gib G] (default 1, serve 2; 12 at 2 MiB units, the 27B)\n"
@@ -478,32 +476,32 @@ int main(int argc, char** argv) {
         if (cmd == "generate") {
             mllm::GenParams p{std::stoi(flag("--max-tokens", "256")), std::stof(flag("--temp", "0")),
                               std::stof(flag("--top-p", "0"))};
-            const std::string on = flag("--prefill", "gpu"), aw = flag("--ane-weights", "shared");
+            const std::string on = flag("--prefill", "gpu");
             const bool pc = prefix_cache("on");
             if (!flags.empty()) return usage();
-            generate(argv[2], argv[3], p, on, aw, pc);
+            generate(argv[2], argv[3], p, on, pc);
         } else if (cmd == "chat") {
             const bool default_max = !flags.count("--max-tokens");
             mllm::GenParams p{std::stoi(flag("--max-tokens", "1")), std::stof(flag("--temp", "0")),
                               std::stof(flag("--top-p", "0"))};
-            const std::string on = flag("--prefill", "gpu"), aw = flag("--ane-weights", "shared");
+            const std::string on = flag("--prefill", "gpu");
             const bool pc = prefix_cache("on");
             if (!flags.empty()) return usage();
-            chat(argv[2], p, default_max, on, aw, pc);
+            chat(argv[2], p, default_max, on, pc);
         } else if (cmd == "bench") {
             const int P = std::stoi(flag("-p", "512")), G = std::stoi(flag("-g", "1024")), B = std::stoi(flag("-b", "1"));
             const int n = std::stoi(flag("-n", "5"));
-            const std::string on = flag("--prefill", "gpu"), aw = flag("--ane-weights", "shared");
+            const std::string on = flag("--prefill", "gpu");
             const int stream = std::stoi(flag("--stream", "0"));
             const bool pc = prefix_cache("off");
             if (!flags.empty() || P < 2 || G < 1 || B < 1 || n < 1 || stream < 0 || stream == 1) return usage();
-            bench(argv[2], P, G, B, n, on, aw, stream, pc);
+            bench(argv[2], P, G, B, n, on, stream, pc);
         } else if (cmd == "serve") {
             const int port = std::stoi(flag("--port", "8080")), max_batch = std::stoi(flag("--max-batch", "32"));
-            const std::string on = flag("--prefill", "gpu"), aw = flag("--ane-weights", "shared");
+            const std::string on = flag("--prefill", "gpu");
             const bool pc = prefix_cache("on");
             if (!flags.empty() || max_batch < 1) return usage();
-            return serve(argv[2], port, on, aw, max_batch, pc);
+            return serve(argv[2], port, on, max_batch, pc);
         } else if (cmd == "bench-ops") {
             if (!flags.empty()) return usage();
             mllm::GpuOpsTest::bench_ops(argv[2]);

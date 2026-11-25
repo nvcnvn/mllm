@@ -47,10 +47,8 @@ def _layers(dense, ops, mem, ws, rows, state_slot_lists):
 
 
 class PrefillLane:
-    def __init__(self, ops, mem, dense=None):
-        """dense: GpuOps.dense (default) or AneOps.dense; attn always runs on the GPU."""
+    def __init__(self, ops, mem):
         self.ops, self.mem, self.done = ops, mem, []
-        self.dense = dense or ops.dense
 
     def busy(self):
         return False
@@ -59,7 +57,7 @@ class PrefillLane:
         ws = self.mem.workspace()
         ws.tokens = mx.array([w.tokens])
         # K/V and state only: the last layer's o_proj + FFN and lm_head never run.
-        _layers(self.dense, self.ops, self.mem, ws, [(w.start_pos, w.slots)], [w.state_slots])
+        _layers(self.ops.dense, self.ops, self.mem, ws, [(w.start_pos, w.slots)], [w.state_slots])
         self.done.append(w)
 
     def poll(self):

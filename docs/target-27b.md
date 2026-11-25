@@ -108,9 +108,9 @@ Expected shape (*estimates* from the 0.8B numbers, replaced by measurements as i
   Largest |value| in the fp16 dense: residual 868, down_proj out 502, FFN act 354 (fp16 max 65504). Not covered:
   the ANE's own accumulation (MLX fp16 matmuls accumulate in fp32). **Check** in the engine work: a real layer's
   ANE output against this emulation.
-- [x] **Engine** (2026-11-25): `--prefill ane` (`--ane-weights shared`, the default) (AneOps shared, src/ane.mm; blocks from
-  `ane.py build_shared`, 4 kinds x S 512 / 1024, 32 s to build at 27B). Chunks of 1024; a shorter one runs the 512
-  block; two chunks in flight, each with its own weight surfaces (~0.9 GB a set at 27B). Tests: test_ane_shared (0.8B:
+- [x] **Engine** (2026-11-25): `--prefill ane` (AneOps, src/ane.mm; the baked-weight modes were removed; blocks from
+  `ane.py build`, 4 kinds x S 512 / 1024, 32 s to build at 27B). Chunks of 1024; a shorter one runs the 512
+  block; two chunks in flight, each with its own weight surfaces (~0.9 GB a set at 27B). Tests: test_ane (0.8B:
   K/V/state cos vs GPU 0.9952-0.9987, like the baked fp16 blocks; two in flight bit-exact; greedy = golden up to the
   first exact tie). 27B, `mllm bench`, M4 Pro:
 

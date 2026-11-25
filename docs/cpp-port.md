@@ -65,6 +65,7 @@ Each item is checked against the golden data for its layer. The goal is matching
 - [x] **Check (speed):** the same rows as [reports/mlx-lm baseline.md](../reports/mlx-lm%20baseline.md), recorded next to them. Targets: decode B=1 ≥ 300 tok/s, B=16 ≥ 1,064 tok/s; GPU prefill at 512 tokens ≥ 5,000 tok/s. *Result: prefill ≥ 5,000 at 512 and decode B=16 ≥ 1,064 met; decode B=1 is 295–299, just under 300 (see the report).*
 
 ## 6. `ane`
+- (2026-11-25: the baked per-layer blocks below were replaced by shared-weight blocks, target-27b.md §5.)
 - [x] Load the cached `.mlmodelc` for each dense block (`MLModel`, compute units CPU + NE). If a block is missing, tell the user to build it with `py/test_ane.py` / `ane.py`. **Check:** loads all 24 blocks for S = 512.
 - [x] IOSurface I/O: inputs and `outputBackings` are IOSurface-backed `MLMultiArray`s, and the GPU reads them with no copy. Apply the `tools/ane_iosurface.swift` findings: size = `bytesPerRow × rows` rounded to 16 KiB, check base alignment at startup, fall back to the texture view. **Check:** one block's output, read on the GPU, is bit-exact with the CPU copy.
 - [x] Layout and padding: channels-first `(1, C, 1, S)` ↔ the workspace, either as GPU kernels or by having `attn` read channels-first directly. Zero-pad the last chunk and slice it back. **Check:** golden K/V and state, cosine ≥ 0.999 for fp16 and ≥ 0.99 for int8 / LUT6, the same thresholds as `test_ane.py`.

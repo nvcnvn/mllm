@@ -131,7 +131,7 @@ static void invariants(const mllm::Engine& e) {
 // QA's stress (g8qa_cache): 80 random requests (shared bases, multi-turn extensions, repeats; random cancels in
 // prefill and decode) on a small arena. Invariants every step, cached units never change while cached, no stall.
 static void stress(int chunk, int seed) {
-    mllm::Engine e(golden::MODEL, SMALL, chunk, 32, 16, 16384, "gpu", "fp16", true);
+    mllm::Engine e(golden::MODEL, SMALL, chunk, 32, 16, 16384, "gpu", true);
     std::mt19937 g(seed);
     std::uniform_int_distribution<int> pick(0, 99), tokd(1000, 100000);
     auto rand_ids = [&](int n) {
@@ -262,8 +262,8 @@ int main(int argc, char** argv) {
     {
         // chunk 512, the served configuration
         std::map<std::vector<int>, std::vector<int>> off_toks;  // greedy 64, cache off
-        mllm::Engine off(golden::MODEL, ARENA, CHUNK, 32, 16, 16384, "gpu", "fp16", false);
-        mllm::Engine on(golden::MODEL, ARENA, CHUNK, 32, 16, 16384, "gpu", "fp16", true);
+        mllm::Engine off(golden::MODEL, ARENA, CHUNK, 32, 16, 16384, "gpu", false);
+        mllm::Engine on(golden::MODEL, ARENA, CHUNK, 32, 16, 16384, "gpu", true);
         assert(!off.cache && on.cache);
         for (const auto& p : all) {
             Run o = run(off, p);
@@ -313,8 +313,8 @@ int main(int argc, char** argv) {
     std::map<std::vector<int>, std::vector<int>> off32;  // greedy 64, cache off, chunk 32
     {
         // chunk 32: every chunk is one page with or without the cache, so a hit must be bit-exact: tokens, K/V, state
-        mllm::Engine off(golden::MODEL, ARENA, 32, 32, 16, 16384, "gpu", "fp16", false);
-        mllm::Engine on(golden::MODEL, ARENA, 32, 32, 16, 16384, "gpu", "fp16", true);
+        mllm::Engine off(golden::MODEL, ARENA, 32, 32, 16, 16384, "gpu", false);
+        mllm::Engine on(golden::MODEL, ARENA, 32, 32, 16, 16384, "gpu", true);
         for (const auto& p : all) off32[p] = run(off, p).toks;
         for (const auto& p : {X, Y, Z, Z2, X}) {
             Run h = run(on, p), h1 = run(on, p, 1), o1 = run(off, p, 1);
@@ -328,8 +328,8 @@ int main(int argc, char** argv) {
     }
     try {
         // ANE prefill: the same hits; long1300 tokens equal ANE's cache-off run (the others as at chunk 512)
-        mllm::Engine off(golden::MODEL, ARENA, CHUNK, 32, 16, 16384, "ane", "fp16", false);
-        mllm::Engine on(golden::MODEL, ARENA, CHUNK, 32, 16, 16384, "ane", "fp16", true);
+        mllm::Engine off(golden::MODEL, ARENA, CHUNK, 32, 16, 16384, "ane", false);
+        mllm::Engine on(golden::MODEL, ARENA, CHUNK, 32, 16, 16384, "ane", true);
         for (const auto& p : {long1300, X, Y, Z, Z3}) {
             Run o = run(off, p), cold = run(on, p), hit = run(on, p);
             const int P = ((int)p.size() - 1) / 32 * 32;
@@ -347,7 +347,7 @@ int main(int argc, char** argv) {
     {
         // SMALL (0.8B: 170 units; one request's state is 50): admissions evict; 20 mixed requests at once. Chunk 32
         // so that outputs must equal cache off's solo runs.
-        mllm::Engine on(golden::MODEL, SMALL, 32, 32, 16, 16384, "gpu", "fp16", true);
+        mllm::Engine on(golden::MODEL, SMALL, 32, 32, 16, 16384, "gpu", true);
         std::map<int, std::vector<int>> want, got;
         for (int i = 0; i < 20; i++) {
             const auto& p = all[(i / 2 * 5) % all.size()];  // in pairs: the second can hit what the first left

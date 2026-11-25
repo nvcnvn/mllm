@@ -58,7 +58,7 @@ Your `attn()` / `ffn()` split, cut where the hardware cuts:
 
 | Phase | `dense` | `attn` | Sampling |
 |---|---|---|---|
-| Prefill | ANE (`--prefill ane`; fp16 or int8 blocks, LUT4 fails on the 0.8B; or `--ane-weights shared`, the default: no weight copy of its own, the GPU feeds it its 4-bit weights per layer, 1024-token chunks, target-27b.md §5) or GPU (default), same interface | GPU | — |
+| Prefill | ANE (`--prefill ane`: no weight copy of its own, the GPU feeds it its 4-bit weights per layer, 1024-token chunks, target-27b.md §5) or GPU (default), same interface | GPU | — |
 | Decode | GPU, 4-bit affine (MLX format) | GPU, paged | GPU |
 
 ## Components
@@ -148,14 +148,14 @@ Python reuses mlx-lm wherever it can: `mlx_lm.load` for weights and the GPU dens
 
 ## Checks
 - `py/test_engine.py`: with GPU-only prefill, greedy 64 tokens on a fixed prompt must equal `mlx_lm.generate` on the same weights. The arena layout and the `prompt[:-1]` trick are then proven against a reference.
-- `py/test_ane.py [fp16|int8|lut6|lut4]`: ANE prefill and GPU prefill write the same prompt into separate units. Every full layer's K/V and every linear layer's conv and recurrent state must reach cosine ≥ 0.999 (fp16) or ≥ 0.99 (compressed formats). Then greedy decode after ANE prefill is compared with mlx-lm.
+- `py/test_ane.py [fp16|int8|lut6|lut4]` (removed 2026-11-25 with the baked-weight blocks; tests/test_ane.mm covers the shared-weight ones): ANE prefill and GPU prefill write the same prompt into separate units. Every full layer's K/V and every linear layer's conv and recurrent state must reach cosine ≥ 0.999 (fp16) or ≥ 0.99 (compressed formats). Then greedy decode after ANE prefill is compared with mlx-lm.
 - The arena bookkeeping gets its own unit test (memory-design build step 2). Python and C++ run the same test cases.
 - Greedy batched output equals solo only away from near-ties: at batch ≥ 2 the matmuls run other kernels (`qmv_wide` / split-k instead of `qmv_fast` at M=1) that round differently, so near-tied top-2 tokens can flip, as in MLX itself (QA: 11 divergences, all with MLX's top-2 within 0–2 bf16 ulps). The golden batched check passes because its prompts have no such tie.
 
 ## Build order
 1. `spec`, `tokenizer`, `engine`, both lanes GPU-only, `attn` over the numpy arena for both layer kinds of the first model: full attention (K/V pages) and Gated DeltaNet (state slot). Pass the mlx-lm match on Qwen3.5-0.8B. **Done (2026-11-22, `py/test_engine.py`): bit-exact with mlx-lm greedy for 3 prompts × 64 tokens, solo and batched, and with requests waiting on a one-request arena. Unit 384 KiB, state slot 50 units (~19.5 MiB per request).** The basic arena bookkeeping from step 2 (`admit` / `alloc` / `release`) is already in, without refcounts or `pending`.
 2. Real arena bookkeeping (`admit` / `alloc` / `release` / `pending`) and several requests through `submit` + `step`.
-3. `AneOps.dense` for prefill: one Core ML model per dense block, built with `tools/hetero_bench.py`'s builder from real weights. Pass the K/V comparison. **Done (2026-11-22, `py/mllm/ane.py`, `py/test_ane.py`), on Qwen3.5-0.8B, S = 128, a 392-token prompt (4 chunks, last one padded):**
+3. `AneOps.dense` for prefill: one Core ML model per dense block, built with `tools/hetero_bench.py`'s builder from real weights (replaced 2026-11-25 by blocks that take the GPU's weights as inputs, target-27b.md §5; the baked fp16 / int8 / LUT path and Python's AneOps are gone). Pass the K/V comparison. **Done (2026-11-22, `py/mllm/ane.py`, `py/test_ane.py`), on Qwen3.5-0.8B, S = 128, a 392-token prompt (4 chunks, last one padded):**
    - **One model per block** (`o + FFN + norm + next q,k,v`), 24 blocks. Every op lands on the ANE, including RMSNorm (as `layer_norm([x, −x])`, Anemll's trick) and the per-head q/k norms. Embedding is a GPU gather before block 0.
    - **Speed (Python):** `predict()` alone takes 27 ms per chunk, 4,700 tok/s (≈ 4.5 TFLOPS, small shapes). The whole lane, with numpy copies and GPU `attn`, does 1,370 tok/s, against 2,400–3,100 for GPU `dense` in the same Python lane. The ANE time is mostly copies and Python, which C++ removes.
    - **fp16 precision:** the ANE is ~6× further from an fp32 GPU run than bf16 is (median 1−cos 3.2e-4 vs 5e-5). fp16 has more mantissa than bf16, so this comes from the ANE's internal arithmetic, not storage. It is still small: greedy decode after ANE prefill gives mlx-lm's exact 64 tokens.
