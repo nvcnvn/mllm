@@ -10,14 +10,18 @@ copied from MLX for the M4 family only). **Models:** Qwen3.5 / Qwen3.6 in mlx-co
 ## Use
 
 ```sh
-uvx mmmllm serve mlx-community/Qwen3.5-0.8B-4bit          # http://127.0.0.1:8080/v1/completions
+uvx mmmllm chat mlx-community/Qwen3.5-0.8B-4bit           # multi-turn chat in the terminal; Ctrl-C stops a reply
+uvx mmmllm serve mlx-community/Qwen3.5-0.8B-4bit          # OpenAI-style API on http://127.0.0.1:8080/v1
 uvx mmmllm generate mlx-community/Qwen3.5-0.8B-4bit "Hello"
 pip install mmmllm                                       # or install it; the command is the same
 ```
 
-Repo ids download to the Hugging Face cache on first use. `serve` streams OpenAI-style completions:
+Repo ids download to the Hugging Face cache on first use. `serve` speaks the OpenAI API (`/v1/chat/completions`,
+`/v1/completions`, `/v1/models`; streamed or not, `stop` strings), so the openai clients and chat UIs work with
+`base_url="http://127.0.0.1:8080/v1"`. The model thinks first: chat replies carry that part as `reasoning_content`.
 
 ```sh
+curl localhost:8080/v1/chat/completions -d '{"messages": [{"role": "user", "content": "Hi!"}]}'
 curl -N localhost:8080/v1/completions -d '{"prompt": "The capital of France is", "max_tokens": 32, "stream": true}'
 ```
 

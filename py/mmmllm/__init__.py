@@ -1,4 +1,4 @@
-"""mmmllm: downloads the model if needed, then runs the C++ engine (generate, serve, bench, bench-ops).
+"""mmmllm: downloads the model if needed, then runs the C++ engine (generate, chat, serve, bench, bench-ops).
 `mmmllm compare` runs mlx-lm's benchmark and ours on the same settings and prints the ratio."""
 import importlib.metadata as md
 import os
@@ -73,9 +73,9 @@ def main():
         print("usage: mmmllm compare [MODEL] [-p 512] [-g 128] [-b 1] [-n 3]   mlx-lm and mmmllm, same settings, ratio\n"
               "       (MODEL defaults to " + DEFAULT + "; repo ids download on first use)", file=sys.stderr)
         a = []
-    i = 1 if a[:1] and a[0] in ("generate", "bench", "serve", "bench-ops") else 0
+    i = 1 if a[:1] and a[0] in ("generate", "chat", "bench", "serve", "bench-ops") else 0
     if len(a) > i and not a[i].startswith("-"):
         local(a[i])  # keep the repo id (API responses name the model): the engine finds it in the same cache
         from huggingface_hub import constants
         os.environ["HF_HUB_CACHE"] = constants.HF_HUB_CACHE
-    os.execv(BIN, [str(BIN), *a])
+    os.execv(BIN, ["mmmllm", *a])  # argv[0]: the name its usage and errors print

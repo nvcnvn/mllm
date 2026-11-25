@@ -66,6 +66,7 @@ public:
     int submit(std::vector<int> ids, GenParams p = {});  // throws std::invalid_argument
     int submit(const std::vector<Message>& chat, GenParams p = {});
     void cancel(int req_id);  // one in a lane finishes when step() polls it
+    int ctx_limit() const { return max_ctx; }
     std::vector<Event> step();
     // on_text gets each piece of text; returning false stops early (cancels the request). Throws if it aborts.
     // Other requests' events still come out of step().

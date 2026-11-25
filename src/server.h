@@ -1,6 +1,7 @@
-// Minimal OpenAI-style server over an Engine, just what tools/serve_bench.py needs: POST /v1/completions with
-// stream: true (SSE), GET /v1/models. One engine thread owns the Engine (architecture.md rule 3); httplib's handler
-// threads only queue requests and read their events. A client that disconnects cancels its request.
+// OpenAI-style server over an Engine: POST /v1/completions and /v1/chat/completions (messages through the chat
+// template; the reasoning before "</think>" comes as reasoning_content), streamed (SSE) or not, with stop strings;
+// GET /v1/models. One engine thread owns the Engine (architecture.md rule 3); httplib's handler threads only queue
+// requests and read their text. A client that disconnects cancels its request.
 //
 //   mllm::Server s(engine, "mlx-community/Qwen3.5-0.8B-4bit");
 //   s.listen("127.0.0.1", 8080);  // blocks until s.stop() from another thread
@@ -15,6 +16,8 @@
 
 namespace httplib {
 class Server;
+struct Request;
+struct Response;
 }
 
 namespace mllm {
@@ -34,6 +37,7 @@ public:
 
 private:
     void loop();  // the engine thread
+    void handle(const httplib::Request& req, httplib::Response& res, bool chat);
 
     Engine& e;
     std::string model;

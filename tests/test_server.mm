@@ -1,6 +1,7 @@
 // Server on 127.0.0.1:18007, in this process (an assert can't leave it running): one streamed greedy completion
-// equals `mllm generate`'s text, bad requests get 400 / 413 + a JSON error, and a client that hangs up cancels its
-// request (else it would keep generating its 15000 tokens).
+// equals `mllm generate`'s text, and so do the non-streamed one and chat completions (streamed and not; reasoning
+// split at "</think>"); stop strings cut the text; bad requests get 400 / 413 + a JSON error, and a client that hangs
+// up cancels its request (else it would keep generating its 15000 tokens).
 #include <cassert>
 #include <chrono>
 #include <cstdio>
@@ -19,6 +20,21 @@
 using json = nlohmann::json;
 constexpr int PORT = 18007;
 constexpr const char* PROMPT = "Write a haiku about the sea.";
+
+// an SSE body's data lines, [DONE] last and only once
+static std::vector<json> events(const std::string& body) {
+    std::vector<json> out;
+    bool done = false;
+    for (size_t at = 0, nl; (nl = body.find('\n', at)) != std::string::npos; at = nl + 1) {
+        const std::string line = body.substr(at, nl - at);
+        if (!line.starts_with("data: ")) continue;
+        assert(!done);  // nothing after [DONE]
+        if (line == "data: [DONE]") done = true;
+        else out.push_back(json::parse(line.substr(6)));
+    }
+    assert(done);
+    return out;
+}
 
 static std::string run(const std::string& cmd) {
     FILE* f = popen(cmd.c_str(), "r");
@@ -89,6 +105,76 @@ int main() {
     assert(done && text == want);
     assert(finish == "length" ? completion == 48 : finish == "stop" && completion > 0 && completion < 48);
 
+    // not streamed: the same text and usage
+    auto post = [&](const char* path, json b) {
+        auto r = c.Post(path, b.dump(), "application/json");
+        assert(r);
+        return r;
+    };
+    body.erase("stream"), body.erase("stream_options");
+    r = post("/v1/completions", body);
+    assert(r->status == 200);
+    json d = json::parse(r->body);
+    assert(d["choices"][0]["text"] == want && d["choices"][0]["finish_reason"] == finish &&
+           d["usage"]["completion_tokens"] == completion);
+
+    // chat: the same tokens (generate templates the same message); reasoning is the text before "</think>"
+    std::string want_reasoning = want, want_content;
+    if (size_t at = want.find("</think>"); at != std::string::npos) {
+        want_reasoning = want.substr(0, at);
+        want_content = want.substr(at + 8);
+        want_content.erase(0, want_content.find_first_not_of('\n'));
+    }
+    const json msgs = {{{"role", "user"}, {"content", PROMPT}}};
+    r = post("/v1/chat/completions", {{"messages", msgs}, {"max_tokens", 48}, {"stream", true}});
+    assert(r->status == 200);
+    std::string reasoning, content, chat_finish;
+    const std::vector<json> evs = events(r->body);
+    assert(evs[0]["choices"][0]["delta"]["role"] == "assistant");
+    for (const json& d : evs) {
+        assert(d["object"] == "chat.completion.chunk" && chat_finish.empty());
+        const json& delta = d["choices"][0]["delta"];
+        reasoning += delta.value("reasoning_content", ""), content += delta.value("content", "");
+        if (!d["choices"][0]["finish_reason"].is_null()) chat_finish = d["choices"][0]["finish_reason"];
+    }
+    printf("chat: reasoning %zu bytes, content %zu bytes, finish %s\n", reasoning.size(), content.size(),
+           chat_finish.c_str());
+    assert(reasoning == want_reasoning && content == want_content && chat_finish == finish);
+    r = post("/v1/chat/completions", {{"messages", msgs}, {"max_completion_tokens", 48}});
+    assert(r->status == 200);
+    d = json::parse(r->body);
+    const json& msg = d["choices"][0]["message"];
+    assert(d["object"] == "chat.completion" && msg["role"] == "assistant" && msg["content"] == want_content &&
+           msg.value("reasoning_content", "") == want_reasoning && d["choices"][0]["finish_reason"] == finish);
+    // the same with text parts as content
+    r = post("/v1/chat/completions", {{"messages", {{{"role", "user"}, {"content", {{{"type", "text"}, {"text", PROMPT}}}}}}},
+                                      {"max_tokens", 48}});
+    assert(r->status == 200 && json::parse(r->body)["choices"][0]["message"]["content"] == want_content);
+
+    // stop strings: the text ends before the first one, which isn't returned; streamed and not
+    const std::string stop = want.substr(want.size() / 2, 4);
+    const std::string cut = want.substr(0, want.find(stop));
+    for (bool streamed : {false, true}) {
+        r = post("/v1/completions", {{"prompt", chat}, {"max_tokens", 48}, {"stop", {"never in it", stop}},
+                                     {"stream", streamed}});
+        assert(r->status == 200);
+        std::string got, why;
+        if (!streamed) {
+            d = json::parse(r->body);
+            got = d["choices"][0]["text"], why = d["choices"][0]["finish_reason"];
+        } else {
+            for (const json& d : events(r->body)) {
+                got += d["choices"][0]["text"];
+                if (!d["choices"][0]["finish_reason"].is_null()) why = d["choices"][0]["finish_reason"];
+            }
+        }
+        printf("stop \"%s\" (%s): %zu of %zu bytes, finish %s\n", stop.c_str(), streamed ? "streamed" : "not streamed",
+               got.size(), want.size(), why.c_str());
+        assert(got == cut && why == "stop");
+    }
+    r = post("/v1/completions", {{"prompt", chat}, {"max_tokens", 48}, {"stop", "never in it"}});
+    assert(json::parse(r->body)["choices"][0]["text"] == want);
+
     // a repeated prompt: usage reports the prefix cache's tokens (its last full page) the second time
     std::string longp;
     for (int i = 0; i < 20; i++) longp += "The tide comes in and the tide goes out. ";
@@ -110,10 +196,15 @@ int main() {
                                    json({{"prompt", "hi"}, {"max_tokens", 16384}, {"stream", true}}).dump(),
                                    json({{"prompt", "hi"}, {"temperature", "hot"}, {"stream", true}}).dump(),
                                    json({{"prompt", "hi"}, {"max_tokens", 4294967298}, {"stream", true}}).dump(),
-                                   json({{"prompt", "hi"}, {"top_p", true}, {"stream", true}}).dump()}) {
+                                   json({{"prompt", "hi"}, {"top_p", true}, {"stream", true}}).dump(),
+                                   json({{"prompt", "hi"}, {"stop", {"a", "b", "c", "d", "e"}}}).dump(),
+                                   json({{"prompt", "hi"}, {"stop", ""}}).dump()}) {
         auto b = c.Post("/v1/completions", bad, "application/json");
         assert(b && b->status == 400 && json::parse(b->body).contains("error"));
     }
+    for (const char* bad : {R"({"prompt": "hi"})", R"({"messages": [{"role": "tool", "content": "x"}]})",
+                            R"({"messages": []})", R"({"messages": [{"role": "user", "content": [{"type": "image_url"}]}]})"})
+        assert(post("/v1/chat/completions", json::parse(bad))->status == 400);
     auto big = c.Post("/v1/completions", json({{"prompt", std::string(2 << 20, 'a')}, {"stream", true}}).dump(),
                       "application/json");
     assert(big && big->status == 413 && json::parse(big->body).contains("error"));

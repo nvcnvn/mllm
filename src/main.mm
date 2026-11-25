@@ -1,14 +1,19 @@
-// mllm CLI: print the model spec, generate (streams text), bench (mlx_lm.benchmark's fields), bench-ops (GPU time per op).
+// mllm CLI: print the model spec, generate (streams text), chat (multi-turn in the terminal), bench (mlx_lm.benchmark's fields), bench-ops (GPU time per op).
 #include <algorithm>
+#include <atomic>
 #include <cassert>
 #include <chrono>
 #include <cmath>
+#include <csignal>
 #include <cstdio>
 #include <cstring>
 #include <exception>
+#include <iostream>
 #include <map>
 #include <random>
 #include <string>
+
+#include <unistd.h>
 
 #include "engine.h"
 #include "lanes.h"
@@ -264,6 +269,7 @@ void GpuOpsTest::bench_ops(const std::string& model) {
 // ENGINE: --arena-gib (0: the command's default) and --max-ctx, for generate / bench / serve
 static double arena_gib = 0;
 static int max_ctx = 16384;
+static const char* prog = "mllm";  // argv[0]'s name: mmmllm through the package
 static size_t arena(double def_gib) { return (size_t)((arena_gib ? arena_gib : def_gib) * (1 << 30)); }
 
 static void generate(const std::string& model, const std::string& prompt, mllm::GenParams p, const std::string& on,
@@ -275,6 +281,65 @@ static void generate(const std::string& model, const std::string& prompt, mllm::
         return true;
     });
     printf("\n");
+}
+
+// mllm chat: a REPL over one engine. The history is re-templated each turn; the prefix cache supplies the part the
+// last turn already prefilled (up to its last full page before the reply), so a turn prefills about the last reply
+// plus the new message. Ctrl-C stops a reply (the turn is dropped), at the prompt it quits, as does Ctrl-D.
+static std::atomic<bool> interrupted;
+
+static void chat(const std::string& model, mllm::GenParams p, bool default_max, const std::string& on,
+                 const std::string& ane_weights, bool prefix_cache) {
+    mllm::Engine e(model, arena(1), 512, 32, 16, max_ctx, on, ane_weights, prefix_cache);
+    const bool tty = isatty(0);
+    if (tty) fprintf(stderr, "%s chat: Ctrl-C stops a reply, Ctrl-D quits\n", prog);
+    std::vector<mllm::Message> history;
+    for (std::string line;;) {
+        if (tty) fputs(">>> ", stdout), fflush(stdout);
+        if (!std::getline(std::cin, line)) break;
+        if (line.empty()) continue;
+        history.push_back({"user", line});
+        using clock = std::chrono::steady_clock;
+        const auto t0 = clock::now();
+        std::vector<int> ids = e.tok.encode_chat(history);
+        const int n = ids.size();
+        if (default_max) p.max_tokens = std::max(1, std::min(4096, e.ctx_limit() - n));
+        int rid;
+        try {
+            rid = e.submit(std::move(ids), p);
+        } catch (const std::invalid_argument& x) {
+            fprintf(stderr, "%s: %s\n", prog, x.what());
+            history.pop_back();
+            continue;
+        }
+        interrupted = false;
+        signal(SIGINT, [](int) { interrupted = true; });
+        std::string reply;
+        int out = 0, cached = 0;
+        clock::time_point t1;
+        for (bool done = false; !done && !interrupted;)
+            for (const mllm::Event& ev : e.step()) {
+                if (ev.req_id != rid) continue;
+                if (ev.token < 0) throw std::runtime_error("request aborted");
+                if (!out++) t1 = clock::now();
+                cached = ev.cached, done = ev.done;
+                reply += ev.text;
+                fputs(ev.text.c_str(), stdout);
+                fflush(stdout);
+            }
+        signal(SIGINT, SIG_DFL);
+        const auto t2 = clock::now();
+        auto sec = [](auto d) { return std::chrono::duration<double>(d).count(); };
+        if (interrupted) {
+            e.cancel(rid);
+            history.pop_back();
+            fprintf(stderr, "\n[stopped]\n");
+            continue;
+        }
+        history.push_back({"assistant", reply});
+        fprintf(stderr, "\n[prompt %d tokens, %d cached, first token %.2f s; %d tokens at %.1f tok/s]\n", n, cached,
+                sec(t1 - t0), out, out > 1 ? (out - 1) / sec(t2 - t1) : 0.0);
+    }
 }
 
 // mllm bench: mlx_lm.benchmark's protocol and fields. Random prompt tokens, EOS ignored, one warmup run, n trials.
@@ -354,36 +419,40 @@ static int serve(const std::string& model, int port, const std::string& on, cons
                  int max_batch, bool prefix_cache) {
     mllm::Engine e(model, arena(2), 512, 32, max_batch, max_ctx, on, ane_weights, prefix_cache);
     mllm::Server s(e, model);
-    fprintf(stderr, "mllm serve: http://127.0.0.1:%d/v1/completions (prefill on %s, max batch %d, prefix cache %s)\n",
-            port, on.c_str(), max_batch, prefix_cache ? "on" : "off");
+    fprintf(stderr, "%s serve: http://127.0.0.1:%d/v1 (chat/completions, completions; prefill on %s, max batch %d, "
+            "prefix cache %s)\n", prog, port, on.c_str(), max_batch, prefix_cache ? "on" : "off");
     if (!s.listen("127.0.0.1", port)) throw std::runtime_error("can't listen on port " + std::to_string(port));
     return 0;
 }
 
 static int usage() {
     fprintf(stderr,
-            "usage: mllm MODEL                                print the model spec\n"
-            "       mllm generate MODEL PROMPT [--max-tokens N] [--temp T] [--top-p P] [PREFILL]\n"
-            "       mllm bench MODEL [-p 512] [-g 1024] [-b 1] [-n 5] [--stream P] [PREFILL]   mlx_lm.benchmark's\n"
+            "usage: %1$s MODEL                                print the model spec\n"
+            "       %1$s generate MODEL PROMPT [--max-tokens N] [--temp T] [--top-p P] [PREFILL]\n"
+            "       %1$s chat MODEL [--max-tokens N] [--temp T] [--top-p P] [PREFILL]   multi-turn chat in the terminal\n"
+            "       %1$s bench MODEL [-p 512] [-g 1024] [-b 1] [-n 5] [--stream P] [PREFILL]   mlx_lm.benchmark's\n"
             "         fields; --stream P: a P-token prefill runs alongside throughout, its own tok/s reported\n"
-            "       mllm serve MODEL [--port 8080] [--max-batch 32] [PREFILL]   streaming /v1/completions on 127.0.0.1\n"
-            "       mllm bench-ops MODEL                      GPU time per op and per decode step, next to the roofline\n"
+            "       %1$s serve MODEL [--port 8080] [--max-batch 32] [PREFILL]   OpenAI-style /v1/chat/completions and\n"
+            "         /v1/completions on 127.0.0.1\n"
+            "       %1$s bench-ops MODEL                      GPU time per op and per decode step, next to the roofline\n"
             "MODEL: repo id under $HF_HOME, or a local dir\n"
             "PREFILL: [--prefill gpu|ane] [--ane-weights fp16|int8|lut6|lut4]: dense blocks of prefill on the Neural\n"
             "         Engine (Core ML models built by py/mllm/ane.py for S = 512)\n"
             "         [--prefix-cache on|off]: reuse prompt prefixes across requests (default on; off for bench, whose\n"
             "         trials repeat the same prompts)\n"
             "ENGINE (generate, bench, serve): [--arena-gib G] (default 1, serve 2; 12 at 2 MiB units, the 27B)\n"
-            "         [--max-ctx N] (default 16384; 32768 at 2 MiB units)\n");
+            "         [--max-ctx N] (default 16384; 32768 at 2 MiB units)\n", prog);
     return 2;
 }
 
 int main(int argc, char** argv) {
+    if (const char* sl = strrchr(argv[0], '/')) prog = sl + 1;
+    else prog = argv[0];
     if (argc < 2) return usage();
     const std::string cmd = argv[1];
     // flags after the positional arguments: name -> value
     std::map<std::string, std::string> flags;
-    const int npos = cmd == "generate" ? 4 : cmd == "bench" || cmd == "bench-ops" || cmd == "serve" ? 3 : 2;
+    const int npos = cmd == "generate" ? 4 : cmd == "bench" || cmd == "bench-ops" || cmd == "serve" || cmd == "chat" ? 3 : 2;
     if (argc < npos || (argc - npos) % 2) return usage();
     for (int i = npos; i < argc; i += 2) flags[argv[i]] = argv[i + 1];
     auto flag = [&](const char* name, const char* def) {
@@ -411,6 +480,14 @@ int main(int argc, char** argv) {
             const bool pc = prefix_cache("on");
             if (!flags.empty()) return usage();
             generate(argv[2], argv[3], p, on, aw, pc);
+        } else if (cmd == "chat") {
+            const bool default_max = !flags.count("--max-tokens");
+            mllm::GenParams p{std::stoi(flag("--max-tokens", "1")), std::stof(flag("--temp", "0")),
+                              std::stof(flag("--top-p", "0"))};
+            const std::string on = flag("--prefill", "gpu"), aw = flag("--ane-weights", "fp16");
+            const bool pc = prefix_cache("on");
+            if (!flags.empty()) return usage();
+            chat(argv[2], p, default_max, on, aw, pc);
         } else if (cmd == "bench") {
             const int P = std::stoi(flag("-p", "512")), G = std::stoi(flag("-g", "1024")), B = std::stoi(flag("-b", "1"));
             const int n = std::stoi(flag("-n", "5"));
@@ -435,7 +512,7 @@ int main(int argc, char** argv) {
                    s.full_layers().size(), s.linear_layers().size(), s.hidden, s.vocab);
         }
     } catch (const std::exception& e) {
-        fprintf(stderr, "mllm: %s\n", e.what());
+        fprintf(stderr, "%s: %s\n", prog, e.what());
         return 1;
     }
 }
