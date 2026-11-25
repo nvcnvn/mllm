@@ -70,7 +70,7 @@ void mllm::GpuOpsTest::run() {
     auto lnorm = w["language_model.model.layers.0.linear_attn.norm.weight"];
     for (bool gated : {false, true}) {
         int rows = 64, dim = gated ? s.linear_value_dim : s.hidden;
-        mllm::Buf weight = gated ? mllm::Buf{lnorm.buffer, lnorm.offset} : ops.norm;
+        mllm::Buf weight = gated ? mllm::Buf{lnorm.buffer, lnorm.offset} : ops.final_norm;
         fill(x, (size_t)rows * dim, 3), fill(z, (size_t)rows * dim, 2);
         std::vector<double> want((size_t)rows * dim);
         for (int r = 0; r < rows; r++) {
@@ -144,7 +144,7 @@ void mllm::GpuOpsTest::run() {
 
     // qmm_t: MLX's 32 x 32 tiles and the 64 x 64 ones give the same bytes (each output's K in the same order through
     // the same MMA), on full and partial M tiles (100 = 64 + 36, 200 = 3 x 64 + 8), N % 64 == 0 and == 32
-    const int tile64_rows = ops.tile64_rows;
+    const int tile64_rows = ops.large_tiles_from_rows;
     for (int M : {100, 200})
         for (int cut : {0, 32}) {
             mllm::QuantizedWeights l = l0.feed_forward_gate;
@@ -153,14 +153,14 @@ void mllm::GpuOpsTest::run() {
             ws.tokens_per_request = M;
             for (int rows : {INT_MAX, 0}) {
                 const size_t d0 = ops.dispatch_count;
-                ops.tile64_rows = rows;
+                ops.large_tiles_from_rows = rows;
                 mllm::encode_and_wait(q, ws, [&] {
                     ops.begin(ws);
                     ops.multiply_weights(l, {x}, {rows ? y : z}, M);
                 });
                 assert(ops.dispatch_count - d0 == 1 && "qmm_t, not split-k");
             }
-            ops.tile64_rows = tile64_rows;
+            ops.large_tiles_from_rows = tile64_rows;
             assert(!memcmp(ys, zs, (size_t)M * l.out_size * 2) && "qmm_t 64 x 64 tiles != MLX's 32 x 32");
         }
     printf("qmm_t 64 x 64 tiles == 32 x 32, M 100 / 200, N %% 64 = 0 / 32\n");

@@ -1,5 +1,6 @@
-// GpuOps: dense(i), attn(i), lm_head and sampling on Metal (py/mllm/gpu.py; Python samples on the CPU). Kernels are MLX's (src/vendor/mlx),
-// dispatched the way MLX v0.32.4 dispatches them, so results match mlx-lm bit for bit.
+// GpuOps: apply_weights(i), apply_attention(i), pick_next_tokens and sampling on Metal (py/mllm/gpu.py: dense, attn,
+// lm_head; Python samples on the CPU). Kernels are MLX's (src/vendor/mlx), dispatched the way MLX v0.32.4 dispatches
+// them, so results match mlx-lm bit for bit.
 #pragma once
 #import <Metal/Metal.h>
 
@@ -17,16 +18,17 @@ struct Buf {
     size_t offset = 0;
 };
 
-// 4-bit affine linear, MLX format: weight U32 [N, K / 8], scales / biases bf16 [N, K / 64]. y = x @ dequant(w)ᵀ.
+// 4-bit affine weights, MLX format: packed U32 [out_size, in_size / 8], scales / biases bf16 [out_size, in_size / 64].
+// output = input @ dequantize(packed)ᵀ.
 struct QuantizedWeights {
     Buf packed, scales, biases;
     int out_size = 0, in_size = 0;
 };
 
-// One row's sampler, mlx-lm make_sampler(temp, top_p): temp 0 = greedy; top_p in (0, 1) keeps the nucleus.
+// One row's sampler, mlx-lm make_sampler(temp, top_p): temperature 0 = greedy; top_p in (0, 1) keeps the nucleus.
 struct SampleParams {
     float temperature = 0, top_p = 0;
-    std::mt19937_64* rng = nullptr;  // the request's; needed when temp > 0
+    std::mt19937_64* rng = nullptr;  // the request's; needed when temperature > 0
 };
 
 class GpuOps {
@@ -37,70 +39,101 @@ public:
     Workspace workspace(int chunk, int max_batch, int max_ctx);
 
     // Every op below encodes into ws.encoder and uses ws's scratch.
-    // All the big matmuls between attn(i - 1) and attn(i), i = 0 .. n_layers, over ws.request_count * ws.tokens_per_request rows.
-    // Fields as in gpu.py, except q, k, v are row-major [B, S, H, D] (gpu.py's [B, H, S, D] transpose is only
-    // for MLX's SDPA).
+    // All the big weight multiplies between apply_attention(i - 1) and apply_attention(i), i = 0 .. n_layers, over
+    // ws.request_count * ws.tokens_per_request rows. Fields as in gpu.py, except query, key, value are row-major
+    // [requests, tokens, heads, head_dim] (gpu.py's [requests, heads, tokens, head_dim] transpose is only for MLX's
+    // attention kernel).
     void apply_weights(int i, Workspace& ws);
 
-    // Everything of layer i that touches the arena (gpu.py attn): ws.query/k/v/gate of ws.request_count rows x ws.tokens_per_request tokens -> ws.attention_result
-    // [B, S, H * D]. ws.step_table: this step's StepTables copy (row b = ws row b); only each row's n valid tokens are
-    // written. Full layers: RoPE, K/V into pages, attention over pos + n keys, * sigmoid(gate).
-    // Linear layers: ws.query_key_value/z/b/a -> conv (its state updated in the row's state span), gated delta rule (state
-    // updated in place), gated RMSNorm -> ws.attention_result [B, S, Hv * Dv]; ws.query_key_value is overwritten.
-    // Rows may differ in pos and pages; B > 1 needs S == 1 (decode).
+    // Everything of layer i that touches the arena (gpu.py attn): ws.query / key / value / query_gate of
+    // ws.request_count rows x ws.tokens_per_request tokens -> ws.attention_result [requests, tokens, heads * head_dim].
+    // ws.step_table: this step's StepTables copy (row b = ws row b); only each row's n valid tokens are written.
+    // Full layers: RoPE, keys / values into pages, attention over pos + n keys, * sigmoid(query_gate).
+    // Linear layers: ws.query_key_value / output_gate / update_rate_input / decay_input -> conv (its state updated in
+    // the row's state span), gated delta rule (state updated in place), gated RMSNorm -> ws.attention_result
+    // [requests, tokens, linear_value_heads * linear_value_dim]; ws.query_key_value is overwritten.
+    // Rows may differ in pos and pages; more than one request needs tokens_per_request == 1 (decode).
     void apply_attention(int i, Workspace& ws);
 
-    // gpu.py lm_head and sample. lm_head: logits of ws.residual's B rows (decode, S == 1: prefill never samples) ->
-    // ws.next_token_scores [B, vocab] bf16, then each row's token -> ws.next_token_ids: params[b] (empty: all greedy) as sample() below.
-    // ids, after that command buffer completed: ws.next_token_ids' B tokens.
+    // gpu.py lm_head and sample: scores of ws.residual's request_count rows (decode, one token each: prefill never
+    // samples) -> ws.next_token_scores [requests, vocab_size] bf16, then each row's token -> ws.next_token_ids:
+    // params[b] (empty: all greedy) as sample_tokens() below.
+    // next_tokens, after that command buffer completed: ws.next_token_ids' request_count tokens.
     void pick_next_tokens(Workspace& ws, const std::vector<SampleParams>& params = {});
     std::vector<int> next_tokens(const Workspace& ws) const;
-    // bf16 logits [rows = params.size(), V] -> int32 token per row (sample.metal): temp 0 = argmax; else top_p, then a
-    // draw seeded from the row's rng (one 64-bit draw per call, so a request's tokens follow its seed).
-    void sample_tokens(Buf x, Buf out, int V, const std::vector<SampleParams>& params);
+    // bf16 scores [rows = params.size(), vocab_size] -> int32 token per row (sample.metal): temperature 0 = argmax;
+    // else top_p, then a draw seeded from the row's rng (one 64-bit draw per call, so a request's tokens follow its seed).
+    void sample_tokens(Buf scores, Buf output, int vocab_size, const std::vector<SampleParams>& params);
 
-    // Decode only, no Python counterpart (Python never runs ahead): ws.token_ids[b] = prev_ids[src[b]] for src[b] >= 0,
-    // so a greedy row's next step is encoded before the CPU has seen its token. Encode it before dense(0).
-    void feed_previous_tokens(Workspace& ws, id<MTLBuffer> prev_ids, const std::vector<int>& src);
+    // Decode only, no Python counterpart (Python never runs ahead):
+    // ws.token_ids[b] = previous_token_ids[source_rows[b]] for source_rows[b] >= 0, so a greedy row's next step is
+    // encoded before the CPU has seen its token. Encode it before apply_weights(0).
+    void feed_previous_tokens(Workspace& ws, id<MTLBuffer> previous_token_ids, const std::vector<int>& source_rows);
 
 
 private:
     friend struct GpuOpsTest;  // tests and bench-ops reach the kernel helpers below (Metal types, rule 1)
-    friend class AneOps;       // embed and pipeline() for the ANE path
+    friend class AneOps;       // look_up_embeddings and pipeline() for the ANE path
 
-    // The kernels dense() is made of. Encoded into the current command buffer.
-    void look_up_embeddings(Buf tokens, Buf out, int rows);
-    // out may be x; w_stride 0: one weight for all (mx.fast.rms_norm without weight).
+    // The kernels apply_weights() is made of. Encoded into the current command buffer.
+    void look_up_embeddings(Buf token_ids, Buf output, int rows);
+    // output may be input; weight_stride 0: one weight for all (mx.fast.rms_norm without weight).
     // ponytail: eps default = rms_norm_eps, 1e-6 for every Qwen3.5 (mlx-lm reads config.json); add it to ModelSpec
     // when a model differs.
-    void normalize(Buf weight, Buf x, Buf out, int rows, int dim, float eps = 1e-6f, uint32_t w_stride = 1);
-    void normalize_and_gate(Buf weight, Buf x, Buf z, Buf out, int rows, int dim);  // RMSNormGated(x, z); out may be x
-    void multiply_weights(const QuantizedWeights& l, Buf x, Buf y, int M);
-    void add(Buf x, Buf y, Buf out, size_t n);
-    void activate_gate(Buf gate, Buf x, Buf out, size_t n);
-    void greedy_tokens(Buf x, Buf out, int rows, int V) { sample_tokens(x, out, V, std::vector<SampleParams>(rows)); }
+    void normalize(Buf weight, Buf input, Buf output, int rows, int width, float eps = 1e-6f, uint32_t weight_stride = 1);
+    // RMSNormGated(input, gate); output may be input
+    void normalize_and_gate(Buf weight, Buf input, Buf gate, Buf output, int rows, int width);
+    void multiply_weights(const QuantizedWeights& weights, Buf input, Buf output, int rows);
+    void add(Buf first, Buf second, Buf output, size_t count);
+    void activate_gate(Buf gate, Buf input, Buf output, size_t count);
+    void greedy_tokens(Buf scores, Buf output, int rows, int vocab_size) {
+        sample_tokens(scores, output, vocab_size, std::vector<SampleParams>(rows));
+    }
+
+    // multiply_weights' paths, by row count (see there)
+    void multiply_decode_batch(const QuantizedWeights& weights, Buf input, Buf output, int rows);
+    void multiply_many_rows(const QuantizedWeights& weights, Buf input, Buf output, int rows);
+    void bind_weights(id<MTLComputePipelineState> kernel, const QuantizedWeights& weights, Buf input);
+    void sum_split_parts(Buf output, int rows, int out_size, int split_count, int split_stride);
 
     struct Layer {
         bool is_linear;
-        int full_index = -1;  // index among full layers (its K/V in a unit)
+        int full_index = -1;  // index among full layers (its keys / values in a unit)
         Buf attention_norm, feed_forward_norm;
-        QuantizedWeights feed_forward_gate, feed_forward_up, feed_forward_down, attention_output;  // attention_output: o_proj (full) or out_proj (linear)
-        QuantizedWeights query_projection, key_projection, value_projection;              // full
+        // attention_output: o_proj (full) or out_proj (linear)
+        QuantizedWeights feed_forward_gate, feed_forward_up, feed_forward_down, attention_output;
+        QuantizedWeights query_projection, key_projection, value_projection;  // full
         Buf query_norm, key_norm;
         QuantizedWeights query_key_value_projection, output_gate_projection, update_rate_projection, decay_projection;  // linear
         Buf conv_weights, decay_log_base, decay_bias, output_norm;
-        // M = 1 (see merge): the projections that read xn as one matmul, weights concatenated along N. merged_linear_projections:
-        // qkv | z | b | a (linear), merged_query_key_value: q | k | v (full), merged_gate_up: gate | up. The parts above are views into it.
+        // One row (see merge_projections): the projections that read ws.normalized as one multiply, weights back to
+        // back along out_size. merged_linear_projections: query_key_value | output_gate | update_rate | decay (linear),
+        // merged_query_key_value: query | key | value (full), merged_gate_up: gate | up. The parts above are views into it.
         QuantizedWeights merged_linear_projections, merged_query_key_value, merged_gate_up;
     };
     std::vector<Layer> layers;
-    void full_attn(const Layer& l, Workspace& ws);
-    void linear_attn(int i, const Layer& l, Workspace& ws);
+    void load_kernels();
+    Layer load_layer(const Weights& weights, int i, int& full_layers_so_far);
+
+    // apply_weights' two halves: the rest of layer i - 1 after its attention, then layer i up to its attention
+    void finish_layer(const Layer& previous, Workspace& ws, int rows);
+    void start_layer(const Layer& layer, Workspace& ws, int rows);
+
+    void full_attention(const Layer& layer, Workspace& ws);
+    void rotate_positions(id<MTLBuffer> heads_buffer, int heads, const Workspace& ws);
+    void write_keys_values(const Layer& layer, Workspace& ws);
+    void attention_fused(const Layer& layer, const Workspace& ws, int shortest_context, int longest_context);
+    void attention_unfused(const Layer& layer, const Workspace& ws, int longest_context);
+
+    void linear_attention(int i, const Layer& layer, Workspace& ws);
+    void conv_and_normalize(const Layer& layer, Workspace& ws, uint64_t conv_offset);
+    void update_state(Buf decay_input, Buf update_rate_input, const Layer& layer, Workspace& ws, uint64_t delta_offset);
+
     QuantizedWeights embed_tokens;
     QuantizedWeights lm;  // language_model.lm_head, or embed_tokens when tied (Qwen3.5 <= 9B: embed_tokens.as_linear)
-    Buf norm;
+    Buf final_norm;
 
-    void elementwise(id<MTLComputePipelineState> ps, Buf a, Buf b, Buf out, size_t n);
+    void elementwise(id<MTLComputePipelineState> kernel, Buf first, Buf second, Buf output, size_t count);
     id<MTLComputePipelineState> pipeline(NSString* name, MTLFunctionConstantValues* constants = nil);
 
     ModelSpec spec;
@@ -112,49 +145,67 @@ private:
     void begin(const Workspace& ws) {
         if (owner == std::thread::id()) owner = std::this_thread::get_id();
         assert(owner == std::this_thread::get_id() && "GpuOps used from two threads");
-        enc = ws.encoder, splitk = ws.partial_sums, decode = ws.tokens_per_request == 1;
+        encoder = ws.encoder, partial_sums = ws.partial_sums, is_decode = ws.tokens_per_request == 1;
     }
     std::thread::id owner;  // the first thread that encoded with this object
-    id<MTLComputeCommandEncoder> enc;
-    id<MTLBuffer> splitk;
-    bool decode = false;  // ws.tokens_per_request == 1: linear() may pick qmm_t_decode (batched decode, by tolerance)
+    id<MTLComputeCommandEncoder> encoder;
+    id<MTLBuffer> partial_sums;
+    // ws.tokens_per_request == 1: multiply_weights() may pick multiply_decode_batch (batched decode, checked by tolerance)
+    bool is_decode = false;
 
-    id<MTLComputePipelineState> qmv_fast, qmv_wide[6], qmm_t[2], qmm_t_64[2], qmm_t_splitk[2], splitk_accum;
-    // qmm_t in 64 x 64 tiles from this many rows (prefill); shorter tails keep MLX's 32 x 32 (a 64-row tile of a
-    // <= 32-row tail is mostly padding). At 33..63 rows 64 x 64 is ~1% faster (27B, M 40 / 48 / 56: -2..-3% on
-    // q / gate / query_key_value_projection, +2% on feed_forward_down). Tests set it to compare the two paths.
-    int tile64_rows = 33;
-    id<MTLComputePipelineState> qmm_t_decode[2][2];  // [BM 8 / 16][split-k float partials / bf16 output]
-    id<MTLComputePipelineState> embed_ps, rms_ps, rms_looped_ps, add_ps, swiglu_ps, precise_swiglu_ps, split_q_gate_ps;
-    id<MTLComputePipelineState> rope_ps, write_kv_ps, sdpa_ps, sdpa_2pass_1[2], sdpa_2pass_2, sigmoid_gate_ps;
-    id<MTLComputePipelineState> gather_kv_ps, causal_mask_ps, scale_ps, softmax_ps[2];
-    id<MTLComputePipelineState> conv1d_silu_ps, conv_norm_qk_ps, scale_qk_ps, gdn_gates_ps, gdn_gates_bf16_ps, gated_delta_ps, sample_ps, feed_ps;
-    // the fallback's matmul variants: gemv_wide [nv 4/5][k_lanes 16/32]; steel [nt/nn][align M][align N][align K]
-    id<MTLComputePipelineState> gemv_wide_ps[3][2], steel_ps[2][2][2][2];
+    // Weight multiplies (MLX kernel names in load_kernels): one row, 2..5 rows per threadgroup (index = rows),
+    // tiles of 32 x 32 / 64 x 64 [aligned out_size], split along in_size [aligned out_size] and the sum of the splits.
+    id<MTLComputePipelineState> multiply_one_row, multiply_few_rows[6], multiply_tiles_32[2], multiply_tiles_64[2],
+        multiply_split_inner[2], sum_splits;
+    // multiply_tiles_32 in 64 x 64 tiles from this many rows (prefill); shorter tails keep MLX's 32 x 32 (a 64-row tile
+    // of a <= 32-row tail is mostly padding). At 33..63 rows 64 x 64 is ~1% faster (27B, rows 40 / 48 / 56: -2..-3% on
+    // query / gate / query_key_value_projection, +2% on feed_forward_down). Tests set it to compare the two paths.
+    int large_tiles_from_rows = 33;
+    // ours, for batched decode: [8 / 16 rows per tile][split-k float partials / bf16 output]
+    id<MTLComputePipelineState> multiply_decode_rows[2][2];
+    id<MTLComputePipelineState> embed_kernel, normalize_kernel, normalize_wide_kernel, add_kernel, activate_gate_kernel,
+        activate_gate_precise_kernel, split_query_gate_kernel;
+    // full attention: attention_long_context_blocks [threads per group fit / exceed the limit]
+    id<MTLComputePipelineState> rotate_positions_kernel, write_keys_values_kernel, attention_short_context,
+        attention_long_context_blocks[2], attention_long_context_combine, sigmoid_gate_kernel;
+    // the unfused fallback; softmax_kernel [one block / looped]
+    id<MTLComputePipelineState> gather_keys_values_kernel, causal_mask_kernel, scale_kernel, softmax_kernel[2];
+    // linear attention, sampling, feed_previous_tokens
+    id<MTLComputePipelineState> conv_kernel, conv_and_normalize_kernel, scale_query_key_kernel, decay_and_update_rate_kernel,
+        decay_and_update_rate_bf16_kernel, gated_delta_kernel, sample_kernel, feed_tokens_kernel;
+    // the fallback's bf16 multiply variants: multiply_few_rows_bf16 [rows per pass 3/4/5][16 / 32 lanes along the
+    // inner size]; multiply_tiles_bf16 [second transposed / not][aligned rows][aligned columns][aligned inner size]
+    id<MTLComputePipelineState> multiply_few_rows_bf16[3][2], multiply_tiles_bf16[2][2][2][2];
     id<MTLComputePipelineState> pipeline(NSString* name, std::initializer_list<std::pair<int, bool>> constants);
-    // MLX's bf16 matmul for the attention fallback over the 8 (kv head, repeat) batches: steel_gemm_fused
-    // (transpose_b: nt) or gemv_wide (nt, M 2..15). a_bs / b_bs: batch strides over [Hkv, gqa].
-    void matmul(bool transpose_b, Buf a, Buf b, Buf d, int M, int N, int K, int lda, int ldb, int ldd,
-                const int64_t a_bs[2], const int64_t b_bs[2], int64_t d_bs);
+    // MLX's bf16 multiply for the attention fallback over the (key_value head, repeat) batches: steel_gemm_fused
+    // (second transposed or not) or gemv_wide (second transposed, rows 2..15). *_batch_strides: over
+    // [key_value_heads, heads_per_key_value].
+    void multiply_bf16(bool second_transposed, Buf first, Buf second, Buf output, int rows, int columns, int inner,
+                       int first_row_stride, int second_row_stride, int output_row_stride,
+                       const int64_t first_batch_strides[2], const int64_t second_batch_strides[2],
+                       int64_t output_batch_stride);
 
-    id<MTLBuffer> one;  // bf16 1, read only
+    id<MTLBuffer> one_bf16;  // bf16 1, read only
 
     // Before every dispatch. The decode lane's encoder is concurrent: a buffer-scope barrier (it covers the untracked
-    // arena too) orders each dispatch after the ones before it, unless the call site set indep: the next dispatch
-    // neither reads what the dispatches since the last barrier write, nor writes what they read or write (scratch
-    // such as ws.partial_sums counts: linear() clears indep for split-k). Serial encoders ignore barriers.
-    bool indep = false;
-    void pre() {
+    // arena too) orders each dispatch after the ones before it, unless the call site set independent: the next
+    // dispatch neither reads what the dispatches since the last barrier write, nor writes what they read or write
+    // (scratch such as ws.partial_sums counts: multiply_weights() clears independent for split-k). Serial encoders
+    // ignore barriers.
+    bool independent = false;
+    void before_dispatch() {
         dispatch_count++;
-        if (!indep) [enc memoryBarrierWithScope:MTLBarrierScopeBuffers];
-        indep = false;
+        if (!independent) [encoder memoryBarrierWithScope:MTLBarrierScopeBuffers];
+        independent = false;
     }
 
 public:
-    // dense(i) at M = 1 runs each Layer's merged matmuls: one output row [part | part ...] in ws.query_key_value (merged_linear_projections),
-    // ws.query_and_gate (merged_query_key_value) or ws.gate_values (merged_gate_up), and attn(i) reads z / b / a / v as slices of it. qmv_fast computes each
-    // output from its own weight row the same way for any N, so the values equal the separate matmuls'. False in
-    // AneOps' copy (the ANE writes each workspace field) and in tests that load the fields themselves.
+    // apply_weights(i) on one row runs each Layer's merged multiplies: one output row [part | part ...] in
+    // ws.query_key_value (merged_linear_projections), ws.query_and_gate (merged_query_key_value) or ws.gate_values
+    // (merged_gate_up), and apply_attention(i) reads output_gate / update_rate / decay / value as slices of it.
+    // multiply_one_row computes each output from its own weight row the same way for any out_size, so the values equal
+    // the separate multiplies'. False in AneOps' copy (the ANE writes each workspace field) and in tests that load the
+    // fields themselves.
     bool merge_projections = true;
     size_t dispatch_count = 0;  // kernels encoded so far (bench-ops reports it per decode step)
 };
