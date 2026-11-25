@@ -11,8 +11,8 @@ constexpr int T = 4, STATE = 3;
 static void check(const mllm::Arena& a) {  // the counts from the refcounts
     uint32_t cache_only = 0, unheld = 0;
     for (uint32_t s = 0; s < a.n_units; s++) {
-        cache_only += !a.req_refs[s] && a.cache_refs[s];
-        unheld += !a.req_refs[s] && !a.cache_refs[s];
+        cache_only += !a.request_refs[s] && a.cache_refs[s];
+        unheld += !a.request_refs[s] && !a.cache_refs[s];
     }
     assert(cache_only == a.cache_only_units && unheld == a.free_units);
 }
@@ -35,7 +35,7 @@ static Req run(mllm::Arena& a, mllm::PrefixCache& c, std::vector<int> ids, int n
     mllm::PrefixCache::Match m = c.match(ids);
     for (uint32_t u : m.pages) a.ref(u);
     Req r{std::move(ids), m.pages};
-    for (uint32_t u : alloc(a, n_pages - m.S)) r.pages.push_back(u);
+    for (uint32_t u : alloc(a, n_pages - m.resume_pages)) r.pages.push_back(u);
     std::vector<uint32_t> snap = alloc(a, STATE);
     c.insert(r.ids, n_pages, r.pages, snap);
     a.release(snap);
@@ -64,17 +64,17 @@ int main() {
 
     // the same prompt: everything; one token shorter: page 5 ends at len - 1, so it isn't matched
     mllm::PrefixCache::Match m = c.match(ia);
-    assert(m.L == 5 && m.S == 5 && m.pages == A.pages && m.snapshot.size() == STATE);
+    assert(m.matched_pages == 5 && m.resume_pages == 5 && m.pages == A.pages && m.snapshot.size() == STATE);
     Req A2 = run(a, c, ia, 5);  // computes nothing; its snapshot copy is dropped: page 5 keeps A's
     assert(A2.pages == A.pages && c.match(ia).snapshot == m.snapshot && a.cache_only_units == 5 + STATE - 5);
     a.release(A2.pages);
     m = c.match(prompt({1, 2, 3, 4, 5}, 0));
-    assert(m.L == 4 && m.S == 0 && m.pages.empty() && m.snapshot.empty());
+    assert(m.matched_pages == 4 && m.resume_pages == 0 && m.pages.empty() && m.snapshot.empty());
 
     // B branches after page 3: K/V matches 3 pages, but no snapshot there; B snapshots at the branch point
     const std::vector<int> ib = prompt({1, 2, 3, 7, 8}, 2);
     m = c.match(ib);
-    assert(m.L == 3 && m.S == 0);
+    assert(m.matched_pages == 3 && m.resume_pages == 0);
     Req B = run(a, c, ib, 3);  // recomputes pages 0..2 into its own units; the cache keeps A's
     assert(c.nodes.size() == 5 && a.cache_only_units == 5 + 2 * STATE && c.has_snapshot(ib, 3));
     for (int i = 0; i < 3; i++) assert(B.pages[i] != A.pages[i] && a.cache_refs[B.pages[i]] == 0);
@@ -86,14 +86,14 @@ int main() {
     std::vector<int> id = ia;
     id[2 * T - 1] = 77;
     m = c.match(id);
-    assert(m.L == 1 && m.S == 0 && m.pages.empty() && m.snapshot.empty());
+    assert(m.matched_pages == 1 && m.resume_pages == 0 && m.pages.empty() && m.snapshot.empty());
     // C: same three pages, then its own: hits B's snapshot, reuses A's pages
     const std::vector<int> ic = prompt({1, 2, 3, 9}, 3);
     m = c.match(ic);
-    assert(m.L == 3 && m.S == 3 && m.pages == std::vector<uint32_t>(A.pages.begin(), A.pages.begin() + 3));
+    assert(m.matched_pages == 3 && m.resume_pages == 3 && m.pages == std::vector<uint32_t>(A.pages.begin(), A.pages.begin() + 3));
     Req C = run(a, c, ic, 4);  // inserts page 3 = 9 under A's page 2
     assert(c.nodes.size() == 6 && a.cache_only_units == 5 + 3 * STATE - 3);  // C holds pages 0..2
-    for (int i = 0; i < 3; i++) assert(a.req_refs[A.pages[i]] == 1);  // C holds them
+    for (int i = 0; i < 3; i++) assert(a.request_refs[A.pages[i]] == 1);  // C holds them
 
     // collision: a node whose hash matches but whose tokens differ is a miss, and insert stops there
     uint64_t h4 = 0;
@@ -101,7 +101,7 @@ int main() {
         if (n.tokens[0] == 4) h4 = h;
     c.nodes.at(h4).tokens[1] = 42;
     m = c.match(ia);
-    assert(m.L == 3 && m.S == 3);
+    assert(m.matched_pages == 3 && m.resume_pages == 3);
     const uint32_t before = a.cache_only_units;
     std::vector<uint32_t> own = alloc(a, 5), snap = alloc(a, STATE);
     c.insert(ia, 5, own, snap);
@@ -121,7 +121,7 @@ int main() {
     assert(a.free_units == free0 + 2 + STATE && c.nodes.size() == 4);
     check(a);
     assert(c.evict());  // C's page 3: C holds it, so only its snapshot frees
-    assert(a.free_units == free0 + 2 + 2 * STATE && a.req_refs[C.pages[3]] == 1 && !a.cache_refs[C.pages[3]]);
+    assert(a.free_units == free0 + 2 + 2 * STATE && a.request_refs[C.pages[3]] == 1 && !a.cache_refs[C.pages[3]]);
     check(a);
     a.release(C.pages);  // pages 0..2 still cached (B's snapshot on page 2): cache-only again; page 3 frees
     check(a);
@@ -134,7 +134,7 @@ int main() {
     uint64_t h1 = 0;
     for (auto& [h, n] : c.nodes)
         if (n.tokens[0] == 1) h1 = h;
-    c.nodes.at(h1).used = 0;  // oldest, but not a leaf
+    c.nodes.at(h1).last_used = 0;  // oldest, but not a leaf
     assert(a.admit(5, [&] { return c.evict(); }));  // evicts page 2 (+ snapshot: 4 units), enough
     assert(c.nodes.size() == 2 && c.nodes.count(h1) && a.reserved == 5 && a.cache_only_units == 2);
     check(a);

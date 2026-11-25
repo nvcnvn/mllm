@@ -8,55 +8,59 @@
 namespace mllm {
 
 // ponytail: a fixed interval; the OS may unwire idle memory sooner under pressure, then the first step after pays.
-constexpr auto RESIDENCY_EVERY = std::chrono::seconds(10);
+constexpr auto RESIDENCY_INTERVAL = std::chrono::seconds(10);
 
-static std::unique_ptr<AneOps> ane_ops(const std::string& on, GpuOps& gpu, Memory& mem, int chunk) {
-    if (on != "gpu" && on != "ane") throw std::invalid_argument("prefill_on: \"gpu\" or \"ane\", not " + on);
-    return on == "ane" ? std::make_unique<AneOps>(gpu, mem, chunk) : nullptr;
+static std::unique_ptr<AneOps> make_ane_ops(const std::string& prefill_on, GpuOps& gpu, Memory& mem, int chunk) {
+    if (prefill_on != "gpu" && prefill_on != "ane")
+        throw std::invalid_argument("prefill_on: \"gpu\" or \"ane\", not " + prefill_on);
+    return prefill_on == "ane" ? std::make_unique<AneOps>(gpu, mem, chunk) : nullptr;
 }
 
-Engine::Engine(const std::string& model, size_t arena_bytes, int chunk, int page_tokens, int max_batch, int max_ctx,
-               const std::string& prefill_on, bool prefix_cache)
+Engine::Engine(const std::string& model, size_t arena_bytes, int chunk, int page_tokens, int max_batch,
+               int max_context, const std::string& prefill_on, bool prefix_cache)
     : spec(spec::load(model)), tokenizer(spec.path), device(MTLCreateSystemDefaultDevice()), weights(spec.path, device),
-      mem(spec, device, arena_bytes, page_tokens), gpu(mem, weights), ane(ane_ops(prefill_on, gpu, mem, chunk)),
-      prefill(gpu, mem, chunk, max_ctx, ane.get()),
-      decode(gpu, mem, max_batch, max_ctx), cache(prefix_cache ? std::make_unique<PrefixCache>(mem.arena, page_tokens) : nullptr),
-      chunk(chunk), max_batch(max_batch), max_ctx(max_ctx),
-      residency_at(std::chrono::steady_clock::now()) {
+      mem(spec, device, arena_bytes, page_tokens), gpu(mem, weights), ane(make_ane_ops(prefill_on, gpu, mem, chunk)),
+      prefill(gpu, mem, chunk, max_context, ane.get()), decode(gpu, mem, max_batch, max_context),
+      cache(prefix_cache ? std::make_unique<PrefixCache>(mem.arena, page_tokens) : nullptr), chunk(chunk),
+      max_batch(max_batch), max_context(max_context), residency_requested_at(std::chrono::steady_clock::now()) {
     if (chunk % page_tokens) throw std::invalid_argument("chunks start on a page boundary: chunk % page_tokens != 0");
-    // ponytail: full_attn has no steel attention (MLX's path for a first chunk >= 2048); lift when it's ported
+    // ponytail: full attention has no steel attention (MLX's path for a first chunk >= 2048); lift when it's ported
     if (chunk >= 2048) throw std::invalid_argument("chunk >= 2048 needs steel attention (not ported)");
-    for (id<MTLBuffer> b : weights.buffers) [mem.residency addAllocation:b];  // the lanes' queues hold the set
+    for (id<MTLBuffer> buffer : weights.buffers) [mem.residency addAllocation:buffer];  // the lanes' queues hold the set
     [mem.residency commit];
     [mem.residency requestResidency];
     mem.freeze();
-    size_t wbytes = 0;
-    for (id<MTLBuffer> b : weights.buffers) wbytes += b.length;
+    size_t weight_bytes = 0;
+    for (id<MTLBuffer> buffer : weights.buffers) weight_bytes += buffer.length;
     fprintf(stderr, "mllm: weights %.2f GB, arena %.2f GiB (%u units of %zu KiB, %u per state slot), workspace %.1f MiB "
-            "(chunk %d, max batch %d, max_ctx %d)\n", wbytes / 1e9, mem.arena_buffer.length / double(1 << 30),
+            "(chunk %d, max batch %d, max_ctx %d)\n", weight_bytes / 1e9, mem.arena_buffer.length / double(1 << 30),
             mem.arena.n_units, mem.arena.unit_bytes >> 10, mem.state_units,
-            (mem.allocated - mem.arena_buffer.length) / double(1 << 20), chunk, max_batch, max_ctx);
+            (mem.allocated - mem.arena_buffer.length) / double(1 << 20), chunk, max_batch, max_context);
 }
 
-int Engine::submit(std::vector<int> ids, GenParams p) {
-    if (ids.empty() || p.max_tokens < 1) throw std::invalid_argument("empty prompt or max_tokens < 1");
-    if (!(std::isfinite(p.temperature) && p.temperature >= 0 && p.top_p >= 0 && p.top_p <= 1))
+int Engine::submit(std::vector<int> prompt, GenParams params) {
+    if (prompt.empty() || params.max_tokens < 1) throw std::invalid_argument("empty prompt or max_tokens < 1");
+    if (!(std::isfinite(params.temperature) && params.temperature >= 0 && params.top_p >= 0 && params.top_p <= 1))
         throw std::invalid_argument("need finite temperature >= 0 and 0 <= top_p <= 1");
-    for (int t : ids)  // embed doesn't bounds-check
-        if (t < 0 || t >= spec.vocab_size) throw std::invalid_argument("token id out of range: " + std::to_string(t));
-    if (ids.size() + p.max_tokens > (size_t)max_ctx)
-        throw std::invalid_argument("prompt + max_tokens > max_ctx " + std::to_string(max_ctx));
-    Request r{.id = next_id, .ids = std::move(ids), .max_tokens = p.max_tokens, .sampler = {p.temperature, p.top_p},
-              .rng = std::mt19937_64(std::random_device{}()), .detok = tokenizer.detokenizer()};
-    if (demand(r) > mem.arena.n_units)
-        throw std::invalid_argument("request needs " + std::to_string(demand(r)) + " units, arena has " +
+    for (int token : prompt)  // look_up_embeddings doesn't bounds-check
+        if (token < 0 || token >= spec.vocab_size)
+            throw std::invalid_argument("token id out of range: " + std::to_string(token));
+    if (prompt.size() + params.max_tokens > (size_t)max_context)
+        throw std::invalid_argument("prompt + max_tokens > max_ctx " + std::to_string(max_context));
+    Request r{.id = next_request_id, .prompt = std::move(prompt), .max_tokens = params.max_tokens,
+              .sampler = {params.temperature, params.top_p}, .random_engine = std::mt19937_64(std::random_device{}()),
+              .detokenizer = tokenizer.detokenizer()};
+    if (units_needed(r) > mem.arena.n_units)
+        throw std::invalid_argument("request needs " + std::to_string(units_needed(r)) + " units, arena has " +
                                     std::to_string(mem.arena.n_units));
-    Request& in = requests.emplace(r.id, std::move(r)).first->second;
-    in.sampler.rng = &in.rng;
-    return next_id++;
+    Request& stored = requests.emplace(r.id, std::move(r)).first->second;
+    stored.sampler.rng = &stored.random_engine;
+    return next_request_id++;
 }
 
-int Engine::submit(const std::vector<Message>& chat, GenParams p) { return submit(tokenizer.encode_chat(chat), p); }
+int Engine::submit(const std::vector<Message>& chat, GenParams params) {
+    return submit(tokenizer.encode_chat(chat), params);
+}
 
 void Engine::cancel(int req_id) {
     auto it = requests.find(req_id);
@@ -67,166 +71,207 @@ void Engine::cancel(int req_id) {
 
 std::vector<Event> Engine::step() {
     @autoreleasepool {
-        if (std::chrono::steady_clock::now() - residency_at > RESIDENCY_EVERY) {
-            mem.request_residency();
-            residency_at = std::chrono::steady_clock::now();
-        }
+        keep_memory_resident();
         mem.arena.retire(decode.signaled());
-
-        // a failed poll aborts the lane's in-flight rows, like a failed submit
-        auto in_lane = [&](State s) {
-            std::vector<Request*> rows;
-            for (auto& [_, r] : requests)
-                if (r.in_flight && r.state == s) rows.push_back(&r);
-            return rows;
-        };
-        bool progress = false;  // polled, admitted or submitted anything
-        std::vector<PrefillWork> chunks;
-        try {
-            chunks = prefill.poll();
-        } catch (...) {
-            abort(in_lane(State::PREFILL));
-            throw;
-        }
-        progress |= !chunks.empty();
-        for (const PrefillWork& w : chunks) {
-            Request& r = requests.at(w.req_id);
-            r.in_flight--;
-            if (r.cancelled) {
-                if (!r.in_flight) finish(r);
-                continue;
-            }
-            r.pos += w.n_valid();
-            // ponytail: only completed snapshot points are cached; a cancelled or aborted request's later pages aren't
-            if (!r.snaps.empty() && r.pos == r.snaps.front()) {
-                snapshot(r);
-                r.snaps.erase(r.snaps.begin());
-            }
-            if (r.pos == (int)r.ids.size() - 1) r.state = State::DECODE;
-        }
-        std::vector<std::pair<int, int>> toks;
-        try {
-            toks = decode.poll();
-        } catch (...) {
-            abort(in_lane(State::DECODE));
-            throw;
-        }
-        progress |= !toks.empty();
-        for (auto [req_id, t] : toks) {
-            auto it = requests.find(req_id);
-            if (it == requests.end() || it->second.state == State::DONE) continue;  // ran one step past its end (fed)
-            Request& r = it->second;
-            r.in_flight--;
-            if (r.cancelled) {
-                finish(r);
-                continue;
-            }
-            r.pos += 1;
-            r.out.push_back(t);
-            const bool eos = tokenizer.eos.count(t);
-            const bool done = eos || (int)r.out.size() >= r.max_tokens;
-            std::string text = eos ? "" : r.detok.push(t);
-            if (done) {
-                text += r.detok.flush();
-                finish(r);
-            }
-            emit({req_id, t, std::move(text), done, r.cached});
-        }
-
-        for (auto& [_, r] : requests) {
-            if (r.state != State::WAITING) continue;
-            if (!admit(r)) break;  // arrival order: later requests never overtake the oldest waiter
-            progress = true;
-        }
-
-        // the oldest request with tokens left to send; a second chunk of the same one too, unless the first ends at a
-        // snapshot point (the copy needs that chunk done and the next one not started)
-        while (prefill.can_submit()) {
-            auto it = std::find_if(requests.begin(), requests.end(), [](auto& kv) {
-                const Request& r = kv.second;
-                return r.state == State::PREFILL && !r.cancelled && r.sent < (int)r.ids.size() - 1 &&
-                       !(r.in_flight && !r.snaps.empty() && r.sent == r.snaps.front());
-            });
-            if (it == requests.end()) break;
-            Request& r = it->second;
-            int end = std::min(r.sent + chunk, (int)r.ids.size() - 1);
-            if (!r.snaps.empty()) end = std::min(end, r.snaps.front());
-            ensure_pages(r, end);
-            r.in_flight++, progress = true;
-            try {
-                prefill.submit({r.id, std::vector<int>(r.ids.begin() + r.sent, r.ids.begin() + end), r.sent, r.pages,
-                                r.state_slots});
-            } catch (...) {
-                if (--r.in_flight == 0) {
-                    abort({&r});
-                } else {  // its other chunk is still in the lane: end it like a cancel, poll finishes it
-                    r.cancelled = true;
-                    emit({r.id, -1, "", true});
-                }
-                throw;
-            }
-            r.sent = end;
-        }
-
-        // A request still in the step in flight joins the next one too: its token (greedy or sampled, both chosen
-        // on the GPU) is fed there. Unless that step makes its last token; an EOS there leaves one wasted row (its
-        // result is dropped at poll).
-        std::vector<Request*> batch;
-        for (auto& [_, r] : requests)
-            if (r.state == State::DECODE && !r.cancelled && (int)batch.size() < max_batch &&
-                (!r.in_flight || (r.in_flight == 1 && (int)r.out.size() + 1 < r.max_tokens)))
-                batch.push_back(&r);
-        if (!batch.empty() && decode.can_submit()) {
-            progress = true;
-            DecodeWork w{step_no, {}};
-            for (Request* r : batch) {
-                const int pos = r->pos + r->in_flight;
-                ensure_pages(*r, pos + 1);
-                w.rows.push_back({r->id, r->in_flight ? -1 : r->out.empty() ? r->ids.back() : r->out.back(), pos,
-                                  r->pages, r->state_slots, r->sampler});
-                r->in_flight++;
-            }
-            try {
-                decode.submit(std::move(w));
-            } catch (...) {
-                abort(batch);
-                throw;
-            }
-            step_no++;
-        }
-
-        std::erase_if(requests, [](auto& kv) { return kv.second.state == State::DONE; });
+        bool progress = take_finished_chunks();  // polled, admitted or submitted anything
+        progress |= take_decoded_tokens();
+        progress |= admit_waiting_requests();
+        progress |= submit_prefill_chunks();
+        progress |= submit_decode_step();
+        std::erase_if(requests, [](auto& entry) { return entry.second.state == State::DONE; });
         // Nothing to do until a lane finishes: block instead of handing a busy loop to the caller (a 1000-token
-        // generate spun 3.7 s of CPU, now 0.5 s). On the decode step when one runs: it is the short one, and a
-        // completion-handler semaphore that woke on either lane cost B = 1 2%. ponytail: prefill may then sit done
-        // for up to one decode step; a shared event for both lanes if that shows.
-        if (!progress && events.empty()) {
-            if (decode.busy()) decode.wait_oldest();
-            else prefill.wait_oldest();
-        }
+        // generate spun 3.7 s of CPU, now 0.5 s).
+        if (!progress && events.empty()) wait_for_a_lane();
         return std::exchange(events, {});
     }
 }
 
-void Engine::generate(const std::vector<Message>& chat, GenParams p,
+void Engine::keep_memory_resident() {
+    if (std::chrono::steady_clock::now() - residency_requested_at <= RESIDENCY_INTERVAL) return;
+    mem.request_residency();
+    residency_requested_at = std::chrono::steady_clock::now();
+}
+
+// A failed poll aborts the lane's in-flight rows, like a failed submit.
+std::vector<Request*> Engine::requests_in_lane(State state) {
+    std::vector<Request*> rows;
+    for (auto& [_, r] : requests)
+        if (r.in_flight && r.state == state) rows.push_back(&r);
+    return rows;
+}
+
+// Prefill chunks the lane finished: their tokens are now in the arena.
+bool Engine::take_finished_chunks() {
+    std::vector<PrefillWork> chunks;
+    try {
+        chunks = prefill.poll();
+    } catch (...) {
+        abort(requests_in_lane(State::PREFILL));
+        throw;
+    }
+    for (const PrefillWork& work : chunks) {
+        Request& r = requests.at(work.req_id);
+        r.in_flight--;
+        if (r.cancelled) {
+            if (!r.in_flight) finish(r);
+            continue;
+        }
+        r.position += work.n_valid();
+        // ponytail: only completed snapshot points are cached; a cancelled or aborted request's later pages aren't
+        if (!r.snapshot_points.empty() && r.position == r.snapshot_points.front()) {
+            save_snapshot(r);
+            r.snapshot_points.erase(r.snapshot_points.begin());
+        }
+        if (r.position == (int)r.prompt.size() - 1) r.state = State::DECODE;
+    }
+    return !chunks.empty();
+}
+
+// Tokens the decode lane chose: each becomes an event (with its text), and ends its request at EOS or max_tokens.
+bool Engine::take_decoded_tokens() {
+    std::vector<std::pair<int, int>> tokens;
+    try {
+        tokens = decode.poll();
+    } catch (...) {
+        abort(requests_in_lane(State::DECODE));
+        throw;
+    }
+    for (auto [req_id, token] : tokens) {
+        auto it = requests.find(req_id);
+        if (it == requests.end() || it->second.state == State::DONE) continue;  // ran one step past its end (fed)
+        Request& r = it->second;
+        r.in_flight--;
+        if (r.cancelled) {
+            finish(r);
+            continue;
+        }
+        r.position += 1;
+        r.generated.push_back(token);
+        const bool end_of_text = tokenizer.eos.count(token);
+        const bool done = end_of_text || (int)r.generated.size() >= r.max_tokens;
+        std::string text = end_of_text ? "" : r.detokenizer.push(token);
+        if (done) {
+            text += r.detokenizer.flush();
+            finish(r);
+        }
+        emit({req_id, token, std::move(text), done, r.cached});
+    }
+    return !tokens.empty();
+}
+
+bool Engine::admit_waiting_requests() {
+    bool admitted = false;
+    for (auto& [_, r] : requests) {
+        if (r.state != State::WAITING) continue;
+        if (!admit(r)) break;  // arrival order: later requests never overtake the oldest waiter
+        admitted = true;
+    }
+    return admitted;
+}
+
+// The oldest request with prompt tokens left to send. One with a chunk in flight may send a second chunk too, unless
+// that first chunk ends at a snapshot point (the copy needs that chunk done and the next one not started).
+Request* Engine::next_to_prefill() {
+    for (auto& [_, r] : requests)
+        if (r.state == State::PREFILL && !r.cancelled && r.sent < (int)r.prompt.size() - 1 &&
+            !(r.in_flight && !r.snapshot_points.empty() && r.sent == r.snapshot_points.front()))
+            return &r;
+    return nullptr;
+}
+
+bool Engine::submit_prefill_chunks() {
+    bool submitted = false;
+    while (prefill.can_submit()) {
+        Request* next = next_to_prefill();
+        if (!next) break;
+        Request& r = *next;
+        int end = std::min(r.sent + chunk, (int)r.prompt.size() - 1);
+        if (!r.snapshot_points.empty()) end = std::min(end, r.snapshot_points.front());
+        ensure_pages(r, end);
+        r.in_flight++, submitted = true;
+        try {
+            prefill.submit({r.id, std::vector<int>(r.prompt.begin() + r.sent, r.prompt.begin() + end), r.sent, r.pages,
+                            r.state_slots});
+        } catch (...) {
+            abort_failed_chunk(r);
+            throw;
+        }
+        r.sent = end;
+    }
+    return submitted;
+}
+
+// prefill.submit threw for r's chunk (already counted in in_flight).
+void Engine::abort_failed_chunk(Request& r) {
+    if (--r.in_flight == 0) {
+        abort({&r});
+        return;
+    }
+    // its other chunk is still in the lane: end it like a cancel, poll finishes it
+    r.cancelled = true;
+    emit({r.id, -1, "", true});
+}
+
+// A request still in the step in flight joins the next one too: its token (greedy or sampled, both chosen on the GPU)
+// is fed there. Unless that step makes its last token; an EOS there leaves one wasted row (its result is dropped at
+// poll).
+static bool ready_to_decode(const Request& r) {
+    return r.state == State::DECODE && !r.cancelled &&
+           (!r.in_flight || (r.in_flight == 1 && (int)r.generated.size() + 1 < r.max_tokens));
+}
+
+bool Engine::submit_decode_step() {
+    std::vector<Request*> batch;
+    for (auto& [_, r] : requests)
+        if ((int)batch.size() < max_batch && ready_to_decode(r)) batch.push_back(&r);
+    if (batch.empty() || !decode.can_submit()) return false;
+    DecodeWork work{decode_steps, {}};
+    for (Request* r : batch) {
+        const int position = r->position + r->in_flight;
+        ensure_pages(*r, position + 1);
+        // -1: the GPU feeds the token the step in flight chooses
+        const int fed_token = r->in_flight ? -1 : r->generated.empty() ? r->prompt.back() : r->generated.back();
+        work.rows.push_back({r->id, fed_token, position, r->pages, r->state_slots, r->sampler});
+        r->in_flight++;
+    }
+    try {
+        decode.submit(std::move(work));
+    } catch (...) {
+        abort(batch);
+        throw;
+    }
+    decode_steps++;
+    return true;
+}
+
+// Waits on the decode step when one runs: it is the short one, and a completion-handler semaphore that woke on either
+// lane cost 2% at one request. ponytail: prefill may then sit done for up to one decode step; a shared event for both
+// lanes if that shows.
+void Engine::wait_for_a_lane() {
+    if (decode.busy()) decode.wait_oldest();
+    else prefill.wait_oldest();
+}
+
+void Engine::generate(const std::vector<Message>& chat, GenParams params,
                       const std::function<bool(const std::string&)>& on_text) {
-    const int rid = submit(chat, p);
-    std::deque<Event>& q = inbox[rid];
+    const int request_id = submit(chat, params);
+    std::deque<Event>& mine = inbox[request_id];
     auto cleanup = [&] {
-        inbox.erase(rid);
-        cancel(rid);
+        inbox.erase(request_id);
+        cancel(request_id);
     };
     try {
         for (;;) {
-            while (q.empty()) {
-                std::vector<Event> ev = step();  // not ours: hand back to the next step() caller
-                events.insert(events.end(), std::make_move_iterator(ev.begin()), std::make_move_iterator(ev.end()));
+            while (mine.empty()) {
+                std::vector<Event> others = step();  // not ours: hand back to the next step() caller
+                events.insert(events.end(), std::make_move_iterator(others.begin()),
+                              std::make_move_iterator(others.end()));
             }
-            Event e = std::move(q.front());
-            q.pop_front();
-            if (e.token < 0) throw std::runtime_error("request " + std::to_string(rid) + " aborted");
-            if (!e.text.empty() && !on_text(e.text)) break;
-            if (e.done) break;
+            Event event = std::move(mine.front());
+            mine.pop_front();
+            if (event.token < 0) throw std::runtime_error("request " + std::to_string(request_id) + " aborted");
+            if (!event.text.empty() && !on_text(event.text)) break;
+            if (event.done) break;
         }
     } catch (...) {
         cleanup();
@@ -236,94 +281,114 @@ void Engine::generate(const std::vector<Message>& chat, GenParams p,
 }
 
 // Units for the whole request up front. ponytail: no generation top-up yet (memory-design `admit`).
-uint32_t Engine::demand(const Request& r) const {
-    return mem.units_for(r.ids.size() + r.max_tokens) + mem.state_units;
+uint32_t Engine::units_needed(const Request& r) const {
+    return mem.units_for(r.prompt.size() + r.max_tokens) + mem.state_units;
 }
 
-uint32_t Engine::alloc(Request& r) {
-    Arena& a = mem.arena;
-    a.retire(decode.signaled());
-    if (std::none_of(a.free.begin(), a.free.end(), [](uint64_t w) { return w; })) {
+uint32_t Engine::allocate_unit(Request& r) {
+    Arena& arena = mem.arena;
+    arena.retire(decode.signaled());
+    if (std::none_of(arena.free_bitmap.begin(), arena.free_bitmap.end(), [](uint64_t word) { return word; })) {
         decode.wait();  // admit counted units still pending on the step in flight
-        a.retire(decode.signaled());
+        arena.retire(decode.signaled());
     }
-    // demand() must cover every alloc, or this request quietly takes another's reservation (vLLM 0ff1bf9bb)
+    // units_needed() must cover every allocation, or this request quietly takes another's reservation
+    // (vLLM 0ff1bf9bb)
     assert(r.reserved > 0 && "request allocates past its reservation");
     r.reserved--;
-    return a.alloc();
+    return arena.alloc();
+}
+
+// With the prefix cache: the deepest cached snapshot of r's prompt, and the positions ahead where r's state is to be
+// copied into the cache (snapshot_points). Without it: no match.
+PrefixCache::Match Engine::match_prefix(const Request& r, std::vector<int>& snapshot_points) {
+    if (!cache) return {};
+    const int page_tokens = mem.page_tokens, last = (int)r.prompt.size() - 1;  // the last prompt token is fed by decode
+    PrefixCache::Match match = cache->match(r.prompt);
+    // the branch point (the next request with this prefix resumes there: shared system prompts) and the prompt's last
+    // full page (multi-turn: the next turn extends this prompt)
+    if (match.matched_pages > match.resume_pages) snapshot_points.push_back(match.matched_pages * page_tokens);
+    if (const int last_page_start = last / page_tokens * page_tokens;
+        last_page_start > match.resume_pages * page_tokens &&
+        (snapshot_points.empty() || last_page_start > snapshot_points[0]))
+        snapshot_points.push_back(last_page_start);
+    // While admitting, a hit holds its resume_pages pages and its snapshot: units neither free nor cache-only.
+    // ponytail: a request that can't fit with all that drops its copies (the branch point's first), then its hit (cold
+    // always fits: submit checks units_needed), instead of waiting forever
+    const auto need = [&] {
+        return units_needed(r) - match.resume_pages + snapshot_points.size() * mem.state_units + match.resume_pages +
+               match.snapshot.size();
+    };
+    while (need() > mem.arena.n_units && !snapshot_points.empty()) snapshot_points.erase(snapshot_points.begin());
+    if (need() > mem.arena.n_units) match = {};
+    return match;
 }
 
 // Reserve the request's units and give it its state; with the prefix cache, start at the deepest cached snapshot.
 bool Engine::admit(Request& r) {
-    Arena& a = mem.arena;
-    const int T = mem.page_tokens, last = (int)r.ids.size() - 1;  // the last prompt token is fed by decode
-    PrefixCache::Match m;
-    std::vector<int> snaps;
-    if (cache) {
-        m = cache->match(r.ids);
-        // the branch point (the next request with this prefix resumes there: shared system prompts) and the
-        // prompt's last full page (multi-turn: the next turn extends this prompt)
-        if (m.L > m.S) snaps.push_back(m.L * T);
-        if (const int p = last / T * T; p > m.S * T && (snaps.empty() || p > snaps[0])) snaps.push_back(p);
-        // While admitting, a hit holds its S pages and its snapshot: units neither free nor cache-only. ponytail: a
-        // request that can't fit with all that drops its copies (the branch point's first), then its hit (cold
-        // always fits: submit checks demand), instead of waiting forever
-        const auto need = [&] { return demand(r) - m.S + snaps.size() * mem.state_units + m.S + m.snapshot.size(); };
-        while (need() > a.n_units && !snaps.empty()) snaps.erase(snaps.begin());
-        if (need() > a.n_units) m = {};
-    }
+    Arena& arena = mem.arena;
+    std::vector<int> snapshot_points;
+    const PrefixCache::Match match = match_prefix(r, snapshot_points);
     // hold what the match returned, so admit's evictions can't free it
-    for (uint32_t u : m.pages) a.ref(u);
-    for (uint32_t u : m.snapshot) a.ref(u);
-    const uint32_t n = demand(r) - m.S + (uint32_t)snaps.size() * mem.state_units;
-    if (!a.admit(n, [&] { return cache && cache->evict(); })) {
-        a.release(m.pages), a.release(m.snapshot);
+    for (uint32_t unit : match.pages) arena.ref(unit);
+    for (uint32_t unit : match.snapshot) arena.ref(unit);
+    const uint32_t count = units_needed(r) - match.resume_pages + (uint32_t)snapshot_points.size() * mem.state_units;
+    if (!arena.admit(count, [&] { return cache && cache->evict(); })) {
+        arena.release(match.pages), arena.release(match.snapshot);
         return false;
     }
-    r.reserved = n, r.pages = m.pages, r.pos = r.sent = r.cached = m.S * T, r.snaps = std::move(snaps);
-    for (uint32_t j = 0; j < mem.state_units; j++) r.state_slots.push_back(alloc(r));
-    if (m.S) {
-        copy_units(r.state_slots, m.snapshot);  // requests update their state in place
-        a.release(m.snapshot);
-    } else {
-        for (uint32_t u : r.state_slots)  // reused units hold an old request's state
-            memset((uint8_t*)mem.arena_buffer.contents + u * mem.arena.unit_bytes, 0, mem.arena.unit_bytes);
-    }
-    r.state = r.pos < last ? State::PREFILL : State::DECODE;
+    r.reserved = count, r.pages = match.pages;
+    r.position = r.sent = r.cached = match.resume_pages * mem.page_tokens;
+    r.snapshot_points = std::move(snapshot_points);
+    start_state(r, match);
+    r.state = r.position < (int)r.prompt.size() - 1 ? State::PREFILL : State::DECODE;
     return true;
 }
 
-// r.pos is a snapshot point and its chunk has completed (the next one isn't submitted): copy its state into fresh
-// units and cache its pages up to here. Its pages from pos on stay its own.
-void Engine::snapshot(Request& r) {
-    const int n_pages = r.pos / mem.page_tokens;
-    if (cache->has_snapshot(r.ids, n_pages)) {  // another request got here first: return the copy's reservation
+// r's state units: a copy of the matched snapshot (requests update their state in place), or zeros.
+void Engine::start_state(Request& r, const PrefixCache::Match& match) {
+    for (uint32_t j = 0; j < mem.state_units; j++) r.state_slots.push_back(allocate_unit(r));
+    if (match.resume_pages) {
+        copy_units(r.state_slots, match.snapshot);
+        mem.arena.release(match.snapshot);
+        return;
+    }
+    for (uint32_t unit : r.state_slots)  // reused units hold an old request's state
+        memset((uint8_t*)mem.arena_buffer.contents + unit * mem.arena.unit_bytes, 0, mem.arena.unit_bytes);
+}
+
+// r.position is a snapshot point and its chunk has completed (the next one isn't submitted): copy its state into
+// fresh units and cache its pages up to here. Its pages from position on stay its own.
+void Engine::save_snapshot(Request& r) {
+    const int page_count = r.position / mem.page_tokens;
+    if (cache->has_snapshot(r.prompt, page_count)) {  // another request got here first: return the copy's reservation
         mem.arena.unreserve(mem.state_units);
         r.reserved -= mem.state_units;
         return;
     }
-    std::vector<uint32_t> snap;
-    for (uint32_t j = 0; j < mem.state_units; j++) snap.push_back(alloc(r));
-    copy_units(snap, r.state_slots);
-    cache->insert(r.ids, n_pages, r.pages, snap);
-    mem.arena.release(snap);  // the cache's refs keep them
+    std::vector<uint32_t> snapshot;
+    for (uint32_t j = 0; j < mem.state_units; j++) snapshot.push_back(allocate_unit(r));
+    copy_units(snapshot, r.state_slots);
+    cache->insert(r.prompt, page_count, r.pages, snapshot);
+    mem.arena.release(snapshot);  // the cache's refs keep them
 }
 
 // CPU copy on the shared arena (~19 MB for Qwen3.5-0.8B's state): no GPU work reads or writes either side now
-void Engine::copy_units(const std::vector<uint32_t>& dst, const std::vector<uint32_t>& src) {
+void Engine::copy_units(const std::vector<uint32_t>& destination, const std::vector<uint32_t>& source) {
     uint8_t* base = (uint8_t*)mem.arena_buffer.contents;
-    const size_t ub = mem.arena.unit_bytes;
-    for (size_t j = 0; j < dst.size(); j++) memcpy(base + dst[j] * ub, base + src[j] * ub, ub);
+    const size_t unit_bytes = mem.arena.unit_bytes;
+    for (size_t j = 0; j < destination.size(); j++)
+        memcpy(base + destination[j] * unit_bytes, base + source[j] * unit_bytes, unit_bytes);
 }
 
-void Engine::ensure_pages(Request& r, int n_tokens) {
-    while ((int)r.pages.size() * mem.page_tokens < n_tokens) r.pages.push_back(alloc(r));
+void Engine::ensure_pages(Request& r, int tokens) {
+    while ((int)r.pages.size() * mem.page_tokens < tokens) r.pages.push_back(allocate_unit(r));
 }
 
-void Engine::emit(Event ev) {
-    auto it = inbox.find(ev.req_id);
-    if (it != inbox.end()) it->second.push_back(std::move(ev));
-    else events.push_back(std::move(ev));
+void Engine::emit(Event event) {
+    auto it = inbox.find(event.req_id);
+    if (it != inbox.end()) it->second.push_back(std::move(event));
+    else events.push_back(std::move(event));
 }
 
 // A lane call failed: rows may be half-written (in-place state), so end them, never retry.
@@ -339,11 +404,11 @@ void Engine::finish(Request& r) {
     // pending reclaim follows decode steps only: a unit a prefill chunk still reads must not be released (cancel waits
     // for the chunk; abort zeroes in_flight once the lane let go of it)
     assert((r.in_flight == 0 || r.state == State::DECODE) && "released while a prefill chunk reads its units");
-    Arena& a = mem.arena;
-    a.unreserve(r.reserved);
-    std::vector<uint32_t> all = r.pages;
-    all.insert(all.end(), r.state_slots.begin(), r.state_slots.end());
-    a.release(all);
+    Arena& arena = mem.arena;
+    arena.unreserve(r.reserved);
+    std::vector<uint32_t> units = r.pages;
+    units.insert(units.end(), r.state_slots.begin(), r.state_slots.end());
+    arena.release(units);
     r.pages.clear(), r.state_slots.clear(), r.reserved = 0, r.state = State::DONE;
 }
 

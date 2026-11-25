@@ -99,7 +99,7 @@ static std::string repeat(const std::string& s, int n) {
 static void check_idle(const mllm::Engine& e) {  // every unit free or held by the cache only
     const mllm::Arena& a = e.mem.arena;
     uint32_t cache_only = 0;
-    for (uint32_t s = 0; s < a.n_units; s++) assert(!a.req_refs[s]), cache_only += a.cache_refs[s] > 0;
+    for (uint32_t s = 0; s < a.n_units; s++) assert(!a.request_refs[s]), cache_only += a.cache_refs[s] > 0;
     assert(a.reserved == 0 && a.cache_only_units == cache_only && a.free_units + cache_only == a.n_units);
 }
 
@@ -121,7 +121,7 @@ static void invariants(const mllm::Engine& e) {
         for (uint32_t u : r.state_slots) req[u]++;
     }
     for (uint32_t s = 0; s < a.n_units; s++) {
-        assert(a.cache_refs[s] == cache[s] && a.req_refs[s] == req[s]);
+        assert(a.cache_refs[s] == cache[s] && a.request_refs[s] == req[s]);
         unheld += !req[s] && !cache[s], cache_only += !req[s] && cache[s];
     }
     assert(unheld == a.free_units && cache_only == a.cache_only_units && reserved == a.reserved);
@@ -182,8 +182,8 @@ static void stress(int chunk, int seed) {
         for (auto& [id, r] : e.requests) {
             if (r.state == mllm::State::DONE || r.cancelled) continue;
             const auto [at_pos, at_out] = plans[id];
-            if ((at_pos >= 0 && r.state == mllm::State::PREFILL && r.pos >= at_pos) ||
-                (at_out >= 0 && r.state == mllm::State::DECODE && (int)r.out.size() >= at_out))
+            if ((at_pos >= 0 && r.state == mllm::State::PREFILL && r.position >= at_pos) ||
+                (at_out >= 0 && r.state == mllm::State::DECODE && (int)r.generated.size() >= at_out))
                 e.cancel(id);
             if (r.cached > 0 && r.state != mllm::State::WAITING) hit.insert(id);
         }
@@ -361,7 +361,7 @@ int main(int argc, char** argv) {
         while (!on.requests.empty()) {
             for (const mllm::Event& ev : on.step()) got[ev.req_id].push_back(ev.token);
             for (int id : doomed)
-                if (on.requests.count(id) && on.requests.at(id).pos >= 256 && !on.requests.at(id).cancelled) on.cancel(id);
+                if (on.requests.count(id) && on.requests.at(id).position >= 256 && !on.requests.at(id).cancelled) on.cancel(id);
             for (auto& [h, _] : on.cache->nodes) seen.insert(h);
             for (auto& [id, r] : on.requests)
                 if (r.state != mllm::State::WAITING && r.cached > 0) hit.insert(id);
@@ -379,7 +379,7 @@ int main(int argc, char** argv) {
         // cold), not kept waiting forever (QA: demand == n_units, the same prompt again)
         run(on, long1300, 16);  // cached at 1280 (two copies don't fit: it keeps the last one)
         const int id = on.submit(long1300, {.max_tokens = (int)(on.mem.arena.n_units - on.mem.state_units) * 32 - 1300});
-        assert(on.cache->match(long1300).S > 0);
+        assert(on.cache->match(long1300).resume_pages > 0);
         const auto t0 = std::chrono::steady_clock::now();
         while (on.requests.at(id).state == mllm::State::WAITING) {
             on.step();

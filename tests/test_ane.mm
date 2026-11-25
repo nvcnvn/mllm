@@ -337,7 +337,7 @@ int main() {
         while (ea.requests.count(id)) ea.step(), usleep(40000);
         const std::vector<int> head(ids.begin(), ids.begin() + 1089);
         mllm::PrefixCache::Match m = ea.cache->match(head);
-        assert(m.S * mem.page_tokens == 1088 && m.snapshot.size() == mem.state_units);
+        assert(m.resume_pages * mem.page_tokens == 1088 && m.snapshot.size() == mem.state_units);
         Units u = prefill(ane_lane, head);
         const uint8_t* ea_arena = (const uint8_t*)ea.mem.arena_buffer.contents;
         size_t diff = 0;

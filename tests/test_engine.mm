@@ -57,7 +57,7 @@ int main() {
     {
         const mllm::Arena& a = e.mem.arena;
         for (uint32_t u = 0; u < a.n_units; u++)
-            if (!a.req_refs[u] && !a.cache_refs[u])
+            if (!a.request_refs[u] && !a.cache_refs[u])
                 memset((uint8_t*)e.mem.arena_buffer.contents + (size_t)u * a.unit_bytes, 0xFF, a.unit_bytes);
     }
     assert(run(e, prompts) == solo);

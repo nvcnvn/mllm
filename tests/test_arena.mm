@@ -7,7 +7,7 @@
 
 static int n_free_bits(const mllm::Arena& a) {
     int n = 0;
-    for (uint64_t w : a.free) n += __builtin_popcountll(w);
+    for (uint64_t w : a.free_bitmap) n += __builtin_popcountll(w);
     return n;
 }
 
@@ -39,7 +39,7 @@ int main() {
     a.ref(7);
     a.committed = 11;
     a.release({7});
-    assert(a.req_refs[7] == 1 && a.pending.empty() && a.free_units == 0);
+    assert(a.request_refs[7] == 1 && a.pending.empty() && a.free_units == 0);
     a.release({7});
     assert(a.pending.size() == 1 && a.free_units == 1);
     a.cache_ref(8);

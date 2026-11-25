@@ -77,7 +77,7 @@ struct Sim {
 
     uint32_t alloc(Req& r) {  // Engine::alloc
         a.retire(decode.signaled);
-        if (std::none_of(a.free.begin(), a.free.end(), [](uint64_t w) { return w; })) {
+        if (std::none_of(a.free_bitmap.begin(), a.free_bitmap.end(), [](uint64_t w) { return w; })) {
             decode.advance(decode.committed);  // decode.wait()
             a.retire(decode.signaled);
             st.alloc_waits++;
@@ -91,35 +91,35 @@ struct Sim {
     }
 
     void write(uint32_t u, uint64_t v) {
-        assert(a.req_refs[u] == 1 && !a.cache_refs[u] && "write to a shared or cached unit");
+        assert(a.request_refs[u] == 1 && !a.cache_refs[u] && "write to a shared or cached unit");
         content[u] = v;
     }
 
     bool admit(Req& r) {  // Engine::admit
         const int last = (int)r.ids.size() - 1;
         mllm::PrefixCache::Match m = c.match(r.ids);
-        assert((int)m.pages.size() == m.S && m.snapshot.size() == (m.S ? STATE : 0u) && m.S <= m.L);
+        assert((int)m.pages.size() == m.resume_pages && m.snapshot.size() == (m.resume_pages ? STATE : 0u) && m.resume_pages <= m.matched_pages);
         std::vector<int> snaps;
-        if (m.L > m.S) snaps.push_back(m.L * T);
-        if (const int p = last / T * T; p > m.S * T && (snaps.empty() || p > snaps[0])) snaps.push_back(p);
-        const auto need = [&] { return demand(r) - m.S + snaps.size() * STATE + m.S + m.snapshot.size(); };
+        if (m.matched_pages > m.resume_pages) snaps.push_back(m.matched_pages * T);
+        if (const int p = last / T * T; p > m.resume_pages * T && (snaps.empty() || p > snaps[0])) snaps.push_back(p);
+        const auto need = [&] { return demand(r) - m.resume_pages + snaps.size() * STATE + m.resume_pages + m.snapshot.size(); };
         if (need() > a.n_units) st.too_big_hits++;
         while (need() > a.n_units && !snaps.empty()) snaps.erase(snaps.begin());
         if (need() > a.n_units) m = {};
         for (uint32_t u : m.pages) a.ref(u);
         for (uint32_t u : m.snapshot) a.ref(u);
         check(false);
-        const uint32_t n = demand(r) - m.S + (uint32_t)snaps.size() * STATE;
+        const uint32_t n = demand(r) - m.resume_pages + (uint32_t)snaps.size() * STATE;
         if (!a.admit(n, [&] { return c.evict() && ++st.evictions; })) {
             a.release(m.pages), a.release(m.snapshot);
             return false;
         }
-        for (int i = 0; i < m.S; i++) assert(content[m.pages[i]] == H(r.ids, (i + 1) * T) && "stale page on a hit");
-        for (uint32_t u : m.snapshot) assert(content[u] == H(r.ids, m.S * T) && "stale snapshot on a hit");
-        st.hits += m.S > 0;
-        r.reserved = n, r.pages = m.pages, r.pos = r.sent = m.S * T, r.snaps = std::move(snaps);
+        for (int i = 0; i < m.resume_pages; i++) assert(content[m.pages[i]] == H(r.ids, (i + 1) * T) && "stale page on a hit");
+        for (uint32_t u : m.snapshot) assert(content[u] == H(r.ids, m.resume_pages * T) && "stale snapshot on a hit");
+        st.hits += m.resume_pages > 0;
+        r.reserved = n, r.pages = m.pages, r.pos = r.sent = m.resume_pages * T, r.snaps = std::move(snaps);
         for (int j = 0; j < STATE; j++) r.state_slots.push_back(alloc(r));
-        for (uint32_t u : r.state_slots) write(u, m.S ? content[m.snapshot[0]] : H(r.ids, 0));
+        for (uint32_t u : r.state_slots) write(u, m.resume_pages ? content[m.snapshot[0]] : H(r.ids, 0));
         a.release(m.snapshot);
         r.state = r.pos < last ? Req::PREFILL : Req::DECODE;
         return true;
@@ -282,11 +282,11 @@ struct Sim {
         for (auto [s, step] : a.pending) pend[s]++, assert(step <= a.committed);
         uint32_t unheld = 0, cache_only = 0;
         for (uint32_t s = 0; s < a.n_units; s++) {
-            assert(exact ? a.req_refs[s] == req[s] : a.req_refs[s] >= req[s]);
+            assert(exact ? a.request_refs[s] == req[s] : a.request_refs[s] >= req[s]);
             assert(a.cache_refs[s] == cache[s] && cache[s] <= 1 && "a unit in two cache entries");
-            const bool bit = a.free[s / 64] >> (s % 64) & 1, refs = a.req_refs[s] || cache[s];
+            const bool bit = a.free_bitmap[s / 64] >> (s % 64) & 1, refs = a.request_refs[s] || cache[s];
             assert((refs ? !bit && !pend[s] : bit + pend[s] == 1) && "leaked, double-freed or freed while held");
-            unheld += !refs, cache_only += !a.req_refs[s] && cache[s];
+            unheld += !refs, cache_only += !a.request_refs[s] && cache[s];
         }
         assert(unheld == a.free_units && cache_only == a.cache_only_units && a.reserved <= a.free_units);
         assert(reserved == a.reserved);
@@ -342,7 +342,7 @@ static void run(unsigned seed, uint32_t n_units, int n_requests, Stats& st) {
     while (sim.c.evict()) sim.check(true);
     sim.a.retire(sim.decode.signaled);
     assert(sim.a.free_units == n_units && sim.a.reserved == 0 && sim.a.cache_only_units == 0 && sim.a.pending.empty());
-    for (uint32_t s = 0; s < n_units; s++) assert(sim.a.free[s / 64] >> (s % 64) & 1);
+    for (uint32_t s = 0; s < n_units; s++) assert(sim.a.free_bitmap[s / 64] >> (s % 64) & 1);
 }
 
 int main(int argc, char** argv) {

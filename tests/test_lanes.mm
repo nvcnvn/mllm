@@ -101,7 +101,7 @@ int main() {
     usleep(50000);
     assert(decode.poll().empty() && decode.signaled() == step);
     a.retire(decode.signaled());
-    auto is_free = [&](uint32_t x) { return (a.free[x / 64] >> (x % 64)) & 1; };
+    auto is_free = [&](uint32_t x) { return (a.free_bitmap[x / 64] >> (x % 64)) & 1; };
     assert(!is_free(u) && a.pending.size() == 1);
     // every other unit can be taken; u is not among them
     const uint32_t others = a.free_units - 1;
