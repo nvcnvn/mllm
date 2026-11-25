@@ -6,257 +6,311 @@
 
 namespace mllm {
 
-static std::runtime_error failed(const char* lane, id<MTLCommandBuffer> cb) {
-    return std::runtime_error(std::string(lane) + ": command buffer failed" +
-                              (cb.error ? std::string(": ") + cb.error.localizedDescription.UTF8String : ""));
+static std::runtime_error command_buffer_failed(const char* lane_name, id<MTLCommandBuffer> command_buffer) {
+    return std::runtime_error(std::string(lane_name) + ": command buffer failed" +
+                              (command_buffer.error
+                                   ? std::string(": ") + command_buffer.error.localizedDescription.UTF8String
+                                   : ""));
 }
 
-// One command buffer on q: f encodes into ws.encoder (after fence's last update, then updating it, if a fence is given),
-// signaling `signal` with `value` at its end if given. Not committed.
-static id<MTLCommandBuffer> encode(id<MTLCommandQueue> q, Workspace& ws, const std::function<void()>& f, bool concurrent,
-                                   id<MTLFence> fence = nil, id<MTLSharedEvent> signal = nil, uint64_t value = 0) {
-    id<MTLCommandBuffer> cb = [q commandBuffer];
-    ws.encoder = [cb computeCommandEncoderWithDispatchType:concurrent ? MTLDispatchTypeConcurrent : MTLDispatchTypeSerial];
-    if (fence) [ws.encoder waitForFence:fence];
+// Waits for the command buffer; throws if it did not complete.
+static void wait_until_completed(const char* lane_name, id<MTLCommandBuffer> command_buffer) {
+    [command_buffer waitUntilCompleted];
+    if (command_buffer.status != MTLCommandBufferStatusCompleted) throw command_buffer_failed(lane_name, command_buffer);
+}
+
+// One command buffer on queue: encode_work encodes into workspace.encoder (after the fence's last update, then
+// updating it, if a fence is given), signaling `signal_event` with `signal_value` at its end if given. Not committed.
+static id<MTLCommandBuffer> encode_command_buffer(id<MTLCommandQueue> queue, Workspace& workspace,
+                                                  const std::function<void()>& encode_work, bool concurrent,
+                                                  id<MTLFence> fence = nil, id<MTLSharedEvent> signal_event = nil,
+                                                  uint64_t signal_value = 0) {
+    id<MTLCommandBuffer> command_buffer = [queue commandBuffer];
+    workspace.encoder = [command_buffer
+        computeCommandEncoderWithDispatchType:concurrent ? MTLDispatchTypeConcurrent : MTLDispatchTypeSerial];
+    if (fence) [workspace.encoder waitForFence:fence];
     try {
-        f();
+        encode_work();
     } catch (...) {  // the ANE's predict failed midway: close the encoder, drop the command buffer
-        [ws.encoder endEncoding];
-        ws.encoder = nil;
+        [workspace.encoder endEncoding];
+        workspace.encoder = nil;
         throw;
     }
-    if (fence) [ws.encoder updateFence:fence];
-    [ws.encoder endEncoding];
-    ws.encoder = nil;
-    if (signal) [cb encodeSignalEvent:signal value:value];
-    return cb;
+    if (fence) [workspace.encoder updateFence:fence];
+    [workspace.encoder endEncoding];
+    workspace.encoder = nil;
+    if (signal_event) [command_buffer encodeSignalEvent:signal_event value:signal_value];
+    return command_buffer;
 }
 
-static id<MTLCommandBuffer> commit(id<MTLCommandQueue> q, Workspace& ws, const std::function<void()>& f, bool concurrent,
-                                   id<MTLFence> fence = nil) {
-    id<MTLCommandBuffer> cb = encode(q, ws, f, concurrent, fence);
-    [cb commit];
-    return cb;
+static id<MTLCommandBuffer> encode_and_commit(id<MTLCommandQueue> queue, Workspace& workspace,
+                                              const std::function<void()>& encode_work, bool concurrent,
+                                              id<MTLFence> fence = nil) {
+    id<MTLCommandBuffer> command_buffer = encode_command_buffer(queue, workspace, encode_work, concurrent, fence);
+    [command_buffer commit];
+    return command_buffer;
 }
 
-double encode_and_wait(id<MTLCommandQueue> q, Workspace& ws, const std::function<void()>& f, bool concurrent) {
+double encode_and_wait(id<MTLCommandQueue> queue, Workspace& workspace, const std::function<void()>& encode_work,
+                       bool concurrent) {
     @autoreleasepool {
-        id<MTLCommandBuffer> cb = commit(q, ws, f, concurrent);
-        [cb waitUntilCompleted];
-        if (cb.status != MTLCommandBufferStatusCompleted) throw failed("encode_and_wait", cb);
-        return cb.GPUEndTime - cb.GPUStartTime;
+        id<MTLCommandBuffer> command_buffer = encode_and_commit(queue, workspace, encode_work, concurrent);
+        [command_buffer waitUntilCompleted];
+        if (command_buffer.status != MTLCommandBufferStatusCompleted)
+            throw command_buffer_failed("encode_and_wait", command_buffer);
+        return command_buffer.GPUEndTime - command_buffer.GPUStartTime;
     }
 }
 
-static id<MTLCommandQueue> lane_queue(Memory& mem) {
-    id<MTLCommandQueue> q = [mem.device newCommandQueue];
-    [q addResidencySet:mem.residency];
-    return q;
+static id<MTLCommandQueue> new_lane_queue(Memory& mem) {
+    id<MTLCommandQueue> queue = [mem.device newCommandQueue];
+    [queue addResidencySet:mem.residency];
+    return queue;
 }
 
-// lanes.py _layers: dense(i) then attn(i) for every layer, into ws.encoder
-static void layers(GpuOps& ops, Workspace& ws, int L) {
-    for (int i = 0; i < L; i++) {
-        ops.apply_weights(i, ws);
-        ops.apply_attention(i, ws);
+// lanes.py _layers: apply_weights(i) then apply_attention(i) for every layer, into workspace.encoder
+static void encode_layers(GpuOps& ops, Workspace& workspace, int layer_count) {
+    for (int layer = 0; layer < layer_count; layer++) {
+        ops.apply_weights(layer, workspace);
+        ops.apply_attention(layer, workspace);
     }
 }
 
-PrefillLane::PrefillLane(GpuOps& ops, Memory& mem, int chunk, int max_ctx, AneOps* ane)
-    : queue(lane_queue(mem)), event([mem.device newSharedEvent]), ops(ane ? ane->gpu : ops), mem(mem),
-      ws{ops.workspace(chunk, 1, max_ctx), {}}, tables(mem.step_tables(1, max_ctx)), ane(ane),
-      fence([mem.device newFence]) {
-    if (ane && ane->S != chunk) throw std::invalid_argument("ANE prefill: chunk must equal the blocks' compiled S");
+PrefillLane::PrefillLane(GpuOps& ops, Memory& mem, int chunk_tokens, int max_context, AneOps* ane)
+    : queue(new_lane_queue(mem)), event([mem.device newSharedEvent]), ops(ane ? ane->gpu : ops), mem(mem),
+      workspaces{ops.workspace(chunk_tokens, 1, max_context), {}}, step_tables(mem.step_tables(1, max_context)),
+      ane(ane), fence([mem.device newFence]) {
+    if (ane && ane->S != chunk_tokens)
+        throw std::invalid_argument("ANE prefill: chunk must equal the blocks' compiled S");
     if (ane) {
-        const Workspace own = mem.workspace(chunk, 1);
-        ws[1] = ws[0];
-        ws[1].token_ids = own.token_ids, ws[1].residual = own.residual, ws[1].attention_result = own.attention_result, ws[1].query = own.query, ws[1].key = own.key, ws[1].value = own.value;
-        ws[1].query_gate = own.query_gate, ws[1].query_key_value = own.query_key_value, ws[1].output_gate = own.output_gate, ws[1].update_rate_input = own.update_rate_input, ws[1].decay_input = own.decay_input;
+        // the second workspace shares the first's GPU scratch, with inputs and outputs of its own
+        const Workspace own = mem.workspace(chunk_tokens, 1);
+        Workspace& second = workspaces[1];
+        second = workspaces[0];
+        second.token_ids = own.token_ids;
+        second.residual = own.residual;
+        second.attention_result = own.attention_result;
+        second.query = own.query;
+        second.key = own.key;
+        second.value = own.value;
+        second.query_gate = own.query_gate;
+        second.query_key_value = own.query_key_value;
+        second.output_gate = own.output_gate;
+        second.update_rate_input = own.update_rate_input;
+        second.decay_input = own.decay_input;
     }
-    if (ane) thread = std::thread(&PrefillLane::run, this);
+    if (ane) ane_thread = std::thread(&PrefillLane::run_ane_thread, this);
 }
 
 PrefillLane::~PrefillLane() {
-    if (!thread.joinable()) return;
+    if (!ane_thread.joinable()) return;
     {
-        std::lock_guard l(m);
-        stop = true;
+        std::lock_guard lock(mutex);
+        stopping = true;
     }
-    cv.notify_one();
-    thread.join();  // after the chunks it started, if any
+    wakeup.notify_one();
+    ane_thread.join();  // after the chunks it started, if any
 }
 
 // The ANE thread. Turns take the started chunks in rotation, oldest first. A turn waits only for the command buffer
-// its own predict needs (its chunk's last one: it wrote the block's inputs), so the ANE runs one chunk's dense(i)
-// while the GPU runs the other's attn. The older chunk is never behind, so a request's later chunk commits each
-// layer's attn after its earlier chunk's.
-void PrefillLane::run() {
-    std::deque<Chunk> active;  // up to 2, in turn order
+// its own predict needs (its chunk's last one: it wrote the block's inputs), so the ANE runs one chunk's
+// apply_weights(i) while the GPU runs the other's apply_attention. The older chunk is never behind, so a request's
+// later chunk commits each layer's attention after its earlier chunk's.
+void PrefillLane::run_ane_thread() {
+    std::deque<Chunk> started;  // up to 2, in turn order
     for (;;) {
         @autoreleasepool {
-            {
-                std::unique_lock l(m);
-                cv.wait(l, [&] { return stop || !active.empty() || !todo.empty(); });
-                if (stop && active.empty()) return;
-                while (!stop && active.size() < 2 && !todo.empty()) {
-                    if (err) {  // a failed chunk dropped the ones in flight: drop later ones too, until poll sees it
-                        done = todo.front().k;
-                        event.signaledValue = done;
-                    } else {
-                        active.push_back(todo.front());
-                    }
-                    todo.pop_front();
-                }
-            }
-            if (active.empty()) continue;
-            Chunk c = active.front();
-            active.pop_front();
+            if (!take_queued_chunks(started)) return;
+            if (started.empty()) continue;
+            Chunk chunk = started.front();
+            started.pop_front();
             try {
-                if (turn(c, active)) active.push_back(c);
-            } catch (...) {  // drop every started chunk once the GPU is done with it
-                active.push_back(c);
-                uint64_t last = 0;
-                for (const Chunk& a : active) {
-                    if (a.cb) [a.cb waitUntilCompleted];
-                    last = std::max(last, a.k);
-                }
-                active.clear();
-                std::lock_guard l(m);
-                err = std::current_exception();
-                done = last;
-                event.signaledValue = last;  // wakes wait_oldest; poll trusts done
+                if (take_turn(chunk, started)) started.push_back(chunk);
+            } catch (...) {
+                started.push_back(chunk);
+                drop_started_chunks(started, std::current_exception());
             }
         }
     }
 }
 
-// One step of chunk c: start it, run one layer, or finish it. False when it's done.
-bool PrefillLane::turn(Chunk& c, const std::deque<Chunk>& others) {
-    const int L = mem.spec.n_layers(), set = (int)(c.k % 2);
-    Workspace& ws = this->ws[set];
-    auto wait = [&] {
-        [c.cb waitUntilCompleted];
-        if (c.cb.status != MTLCommandBufferStatusCompleted) throw failed("PrefillLane", c.cb);
-    };
+// Waits until there is something to do, then moves queued chunks into `started` (up to 2). False when the lane is
+// stopping and no chunk is started.
+bool PrefillLane::take_queued_chunks(std::deque<Chunk>& started) {
+    std::unique_lock lock(mutex);
+    wakeup.wait(lock, [&] { return stopping || !started.empty() || !queued_chunks.empty(); });
+    if (stopping && started.empty()) return false;
+    while (!stopping && started.size() < 2 && !queued_chunks.empty()) {
+        if (failure) {  // a failed chunk dropped the ones in flight: drop later ones too, until poll sees it
+            last_chunk_done = queued_chunks.front().number;
+            event.signaledValue = last_chunk_done;
+        } else {
+            started.push_back(queued_chunks.front());
+        }
+        queued_chunks.pop_front();
+    }
+    return true;
+}
+
+// A turn threw: drop every started chunk once the GPU is done with it.
+void PrefillLane::drop_started_chunks(std::deque<Chunk>& started, std::exception_ptr error) {
+    uint64_t last_started = 0;
+    for (const Chunk& chunk : started) {
+        if (chunk.last_command_buffer) [chunk.last_command_buffer waitUntilCompleted];
+        last_started = std::max(last_started, chunk.number);
+    }
+    started.clear();
+    std::lock_guard lock(mutex);
+    failure = error;
+    last_chunk_done = last_started;
+    event.signaledValue = last_started;  // wakes wait_oldest; poll trusts last_chunk_done
+}
+
+// One step of the chunk: start it, run one layer, or finish it. False when it's done.
+bool PrefillLane::take_turn(Chunk& chunk, const std::deque<Chunk>& others) {
+    const int layer_count = mem.spec.n_layers(), surface_set = (int)(chunk.number % 2);
+    Workspace& workspace = workspaces[surface_set];
     // ponytail: a GPU chunk is one command buffer of all 24 layers (~10-50 ms); the other chunk's per-layer buffers
     // queue behind it, so the ANE idles that long. Commit it per layer (or a few) to interleave if tails show in TTFT.
-    if (c.layer < 0 && c.gpu) {
-        if (std::any_of(others.begin(), others.end(), [&](const Chunk& o) { return o.k < c.k && o.req == c.req && o.layer < L; }))
+    if (chunk.layers_committed < 0 && chunk.all_on_gpu) {
+        const bool earlier_chunk_of_request_running = std::any_of(others.begin(), others.end(), [&](const Chunk& other) {
+            return other.number < chunk.number && other.request_id == chunk.request_id &&
+                   other.layers_committed < layer_count;
+        });
+        if (earlier_chunk_of_request_running) return true;
+        // as the GPU lane: no attention output projection / feed-forward of the last layer
+        chunk.last_command_buffer =
+            encode_and_commit(queue, workspace, [&] { encode_layers(ops, workspace, layer_count); }, false, fence);
+        chunk.layers_committed = layer_count;
+        return true;
+    }
+    if (chunk.layers_committed < 0) {
+        chunk.last_command_buffer =
+            encode_and_commit(queue, workspace, [&] { ane->prepare_inputs(0, workspace, surface_set); }, false, fence);
+        chunk.layers_committed = 0;
+        return true;
+    }
+    if (chunk.layers_committed == layer_count) {  // done in submit order: the event counts chunks
+        if (std::any_of(others.begin(), others.end(), [&](const Chunk& other) { return other.number < chunk.number; }))
             return true;
-        c.cb = commit(queue, ws, [&] { layers(ops, ws, L); }, false, fence);  // as the GPU lane: no o_proj / FFN of L - 1
-        c.layer = L;
-        return true;
-    }
-    if (c.layer < 0) {
-        c.cb = commit(queue, ws, [&] { ane->prepare_inputs(0, ws, set); }, false, fence);
-        c.layer = 0;
-        return true;
-    }
-    if (c.layer == L) {  // done in submit order: the event counts chunks
-        if (std::any_of(others.begin(), others.end(), [&](const Chunk& o) { return o.k < c.k; })) return true;
-        wait();
-        std::lock_guard l(m);
-        done = c.k;
-        event.signaledValue = c.k;  // wakes wait_oldest; poll trusts done
+        wait_until_completed("PrefillLane", chunk.last_command_buffer);
+        std::lock_guard lock(mutex);
+        last_chunk_done = chunk.number;
+        event.signaledValue = chunk.number;  // wakes wait_oldest; poll trusts last_chunk_done
         return false;
     }
-    wait();
+    wait_until_completed("PrefillLane", chunk.last_command_buffer);
     if (fail_next.exchange(false)) throw std::runtime_error("PrefillLane: injected failure");
-    const int i = c.layer;
-    c.cb = commit(queue, ws, [&] {  // K/V and state only: the last layer's o_proj + FFN never run
-        ane->apply_weights(i, ws, set);
-        ops.apply_attention(i, ws);
-        if (i + 1 < L) ane->prepare_inputs(i + 1, ws, set);
+    const int layer = chunk.layers_committed;
+    // K/V and state only: the last layer's attention output projection + feed-forward never run
+    chunk.last_command_buffer = encode_and_commit(queue, workspace, [&] {
+        ane->apply_weights(layer, workspace, surface_set);
+        ops.apply_attention(layer, workspace);
+        if (layer + 1 < layer_count) ane->prepare_inputs(layer + 1, workspace, surface_set);
     }, false, fence);
-    c.layer++;
+    chunk.layers_committed++;
     return true;
 }
 
 void PrefillLane::submit(PrefillWork work) {
     @autoreleasepool {
-        assert(can_submit() && work.n_valid() > 0 && work.n_valid() <= ws[0].max_rows);
+        assert(can_submit() && work.n_valid() > 0 && work.n_valid() <= workspaces[0].max_rows);
         if (fail_submit && --fail_submit == 0) throw std::runtime_error("PrefillLane: injected submit failure");
-        Workspace& ws = this->ws[ane ? (n + 1) % 2 : 0];
-        ws.request_count = 1, ws.tokens_per_request = work.n_valid();
-        std::copy(work.tokens.begin(), work.tokens.end(), (int32_t*)ws.token_ids.contents);
-        ws.step_table = tables.begin(n + 1, event.signaledValue);
-        tables.write(ws.step_table, {{work.start_pos, work.n_valid(), work.pages, work.state_slots}});
-        n++;
+        Workspace& workspace = workspaces[ane ? (chunks_committed + 1) % 2 : 0];
+        workspace.request_count = 1, workspace.tokens_per_request = work.n_valid();
+        std::copy(work.tokens.begin(), work.tokens.end(), (int32_t*)workspace.token_ids.contents);
+        workspace.step_table = step_tables.begin(chunks_committed + 1, event.signaledValue);
+        step_tables.write(workspace.step_table, {{work.start_pos, work.n_valid(), work.pages, work.state_slots}});
+        chunks_committed++;
         if (ane) {
-            const bool gpu = work.n_valid() < gpu_below;
-            gpu_chunks += gpu;
+            const bool on_gpu = work.n_valid() < gpu_below;
+            gpu_chunks += on_gpu;
             {
-                std::lock_guard l(m);
-                todo.push_back({n, work.req_id, gpu, -1, nil});
+                std::lock_guard lock(mutex);
+                queued_chunks.push_back({chunks_committed, work.req_id, on_gpu, -1, nil});
             }
-            cv.notify_one();
+            wakeup.notify_one();
         } else {
-            // The GPU runs both lanes' command buffers in commit order: a decode step committed after a whole chunk
-            // waited for all of it (27B: ~4 s for 512 tokens). So the chunk is encoded now as command buffers of K
-            // layers, and each is committed when the one before completes: a decode step waits for one at most.
-            // K/V and state only: the last layer's o_proj + FFN and lm_head never run.
-            const int L = mem.spec.n_layers();
-            // K 8 at 27B (~0.5 s each): a 2048-token prefill next to a B = 1 decode keeps 107 tok/s (131 alone)
-            // and the decode's longest step is 0.54 s (3.9 s committed whole); K 4: 85 tok/s, 0.31 s (report, g15)
-            constexpr int K = 8;
-            for (int a = 0; a < L; a += K)
-                cbs.push_back(encode(queue, ws, [&] {
-                    for (int i = a; i < std::min(a + K, L); i++) ops.apply_weights(i, ws), ops.apply_attention(i, ws);
-                }, false, fence, a + K >= L ? event : nil, n));
-            for (size_t j = 0; j + 1 < cbs.size(); j++) {
-                id<MTLCommandBuffer> next = cbs[j + 1];
-                [cbs[j] addCompletedHandler:^(id<MTLCommandBuffer>) { [next commit]; }];  // also after an error
-            }
-            [cbs[0] commit];
+            commit_gpu_chunk(workspace);
         }
-        q.push_back(std::move(work));
+        in_flight.push_back(std::move(work));
     }
+}
+
+// The GPU runs both lanes' command buffers in commit order: a decode step committed after a whole chunk waited for
+// all of it (27B: ~4 s for 512 tokens). So the chunk is encoded now as command buffers of a few layers each, and each
+// is committed when the one before completes: a decode step waits for one at most. K/V and state only: the last
+// layer's attention output projection + feed-forward and pick_next_tokens never run.
+void PrefillLane::commit_gpu_chunk(Workspace& workspace) {
+    const int layer_count = mem.spec.n_layers();
+    // 8 at 27B (~0.5 s each): a 2048-token prefill next to a decode of one request keeps 107 tok/s (131 alone) and
+    // the decode's longest step is 0.54 s (3.9 s committed whole); 4: 85 tok/s, 0.31 s (report, g15)
+    constexpr int layers_per_buffer = 8;
+    for (int first_layer = 0; first_layer < layer_count; first_layer += layers_per_buffer) {
+        const bool last_buffer = first_layer + layers_per_buffer >= layer_count;
+        gpu_command_buffers.push_back(encode_command_buffer(queue, workspace, [&] {
+            for (int layer = first_layer; layer < std::min(first_layer + layers_per_buffer, layer_count); layer++)
+                ops.apply_weights(layer, workspace), ops.apply_attention(layer, workspace);
+        }, false, fence, last_buffer ? event : nil, chunks_committed));
+    }
+    for (size_t j = 0; j + 1 < gpu_command_buffers.size(); j++) {
+        id<MTLCommandBuffer> next_buffer = gpu_command_buffers[j + 1];
+        [gpu_command_buffers[j] addCompletedHandler:^(id<MTLCommandBuffer>) {
+            [next_buffer commit];  // also after an error
+        }];
+    }
+    [gpu_command_buffers[0] commit];
 }
 
 std::vector<PrefillWork> PrefillLane::poll() {
     @autoreleasepool {
-        if (q.empty()) return {};
-        uint64_t d;
+        if (in_flight.empty()) return {};
+        uint64_t chunks_done;
         if (ane) {
-            std::exception_ptr e;
+            std::exception_ptr error;
             {
-                std::lock_guard l(m);
-                d = done;
-                if (err && d < n) return {};  // the thread is still dropping chunks
-                e = std::exchange(err, nullptr);
+                std::lock_guard lock(mutex);
+                chunks_done = last_chunk_done;
+                if (failure && chunks_done < chunks_committed) return {};  // the thread is still dropping chunks
+                error = std::exchange(failure, nullptr);
             }
-            if (e) {
-                q.clear();
-                std::rethrow_exception(e);
+            if (error) {
+                in_flight.clear();
+                std::rethrow_exception(error);
             }
         } else {
-            d = event.signaledValue;  // before the scan: once the last buffer signals, every status is final
-            for (id<MTLCommandBuffer> cb : cbs)
-                if (cb.status == MTLCommandBufferStatusError) {
-                    auto e = failed("PrefillLane", cb);
-                    // The chain commits them all, also after an error: let it end before the next chunk. Not
-                    // waitUntilCompleted alone: on a buffer not committed yet it asserts under API validation
-                    // (without validation it waits for the commit; g15 checked both).
-                    id<MTLCommandBuffer> last = cbs.back();
-                    while (last.status < MTLCommandBufferStatusCommitted) std::this_thread::yield();
-                    [last waitUntilCompleted];
-                    // a failed last buffer may skip its signal: mark the chunk done, as DecodeLane::poll does
-                    event.signaledValue = std::max(event.signaledValue, n);
-                    cbs.clear(), q.clear();
-                    throw e;
-                }
+            chunks_done = event.signaledValue;  // before the scan: once the last buffer signals, every status is final
+            throw_if_gpu_chunk_failed();
         }
-        std::vector<PrefillWork> out;
-        while (!q.empty() && n - q.size() + 1 <= d) out.push_back(std::move(q.front())), q.pop_front();
-        if (q.empty()) cbs.clear();
-        return out;
+        std::vector<PrefillWork> finished;
+        while (!in_flight.empty() && chunks_committed - in_flight.size() + 1 <= chunks_done)
+            finished.push_back(std::move(in_flight.front())), in_flight.pop_front();
+        if (in_flight.empty()) gpu_command_buffers.clear();
+        return finished;
     }
 }
 
-DecodeLane::DecodeLane(GpuOps& ops, Memory& mem, int max_batch, int max_ctx)
-    : queue(lane_queue(mem)), event([mem.device newSharedEvent]), fence([mem.device newFence]), ops(ops), mem(mem),
-      ws{ops.workspace(1, max_batch, max_ctx), ops.workspace(1, max_batch, max_ctx)},
-      tables(mem.step_tables(max_batch, max_ctx)) {}
+void PrefillLane::throw_if_gpu_chunk_failed() {
+    for (id<MTLCommandBuffer> command_buffer : gpu_command_buffers) {
+        if (command_buffer.status != MTLCommandBufferStatusError) continue;
+        auto error = command_buffer_failed("PrefillLane", command_buffer);
+        // The chain commits them all, also after an error: let it end before the next chunk. Not
+        // waitUntilCompleted alone: on a buffer not committed yet it asserts under API validation (without
+        // validation it waits for the commit; g15 checked both).
+        id<MTLCommandBuffer> last_buffer = gpu_command_buffers.back();
+        while (last_buffer.status < MTLCommandBufferStatusCommitted) std::this_thread::yield();
+        [last_buffer waitUntilCompleted];
+        // a failed last buffer may skip its signal: mark the chunk done, as DecodeLane::poll does
+        event.signaledValue = std::max(event.signaledValue, chunks_committed);
+        gpu_command_buffers.clear(), in_flight.clear();
+        throw error;
+    }
+}
+
+DecodeLane::DecodeLane(GpuOps& ops, Memory& mem, int max_batch, int max_context)
+    : queue(new_lane_queue(mem)), event([mem.device newSharedEvent]), fence([mem.device newFence]), ops(ops), mem(mem),
+      workspaces{ops.workspace(1, max_batch, max_context), ops.workspace(1, max_batch, max_context)},
+      step_tables(mem.step_tables(max_batch, max_context)) {}
 
 void DecodeLane::submit(DecodeWork work) {
     @autoreleasepool {
@@ -264,84 +318,96 @@ void DecodeLane::submit(DecodeWork work) {
             fail_next = false;
             throw std::runtime_error("DecodeLane: injected failure");
         }
-        Workspace& ws = this->ws[work.step % 2];
-        const int B = (int)work.rows.size();
-        assert(can_submit() && B > 0 && B <= ws.max_rows && (q.empty() || q.back().w.step + 1 == work.step));
-        ws.request_count = B, ws.tokens_per_request = 1;
-        std::vector<StepTables::Row> rows;
-        std::vector<int> src(B, -1);  // fed rows: their row in the step in flight
-        bool fed = false;
-        for (int b = 0; b < B; b++) {
-            const DecodeRow& r = work.rows[b];
-            if (r.token < 0) {
-                assert(!q.empty());
-                const auto& prev = q.back().w.rows;
-                auto it = std::find_if(prev.begin(), prev.end(), [&](const DecodeRow& p) { return p.req_id == r.req_id; });
-                assert(it != prev.end() && it->pos + 1 == r.pos);
-                src[b] = (int)(it - prev.begin()), fed = true;
-            }
-            ((int32_t*)ws.token_ids.contents)[b] = r.token;
-            rows.push_back({r.pos, 1, r.pages, r.state_slots});
-        }
-        ws.step_table = tables.begin(work.step + 1, event.signaledValue);
-        tables.write(ws.step_table, rows);
-        id<MTLCommandBuffer> cb = [queue commandBuffer];
-        ws.encoder = [cb computeCommandEncoderWithDispatchType:MTLDispatchTypeConcurrent];
-        // Defensive today: a row in both step N and N + 1 is fed, and feeding reads N's ids, a tracked buffer, so
-        // Metal already orders the two encoders (and with them the untracked arena's K/V and state). Needed if
-        // workspace buffers become untracked. A fence, not encodeWaitForEvent: that cost B = 1 ~3.5% (297 vs 287).
-        [ws.encoder waitForFence:fence];
-        if (fed) ops.feed_previous_tokens(ws, this->ws[(work.step + 1) % 2].next_token_ids, src);
-        const int L = mem.spec.n_layers();
-        layers(ops, ws, L);
-        ops.apply_weights(L, ws);
-        std::vector<SampleParams> params;
-        for (const DecodeRow& r : work.rows) params.push_back(r.sampler);
-        ops.pick_next_tokens(ws, params);
-        [ws.encoder updateFence:fence];
-        [ws.encoder endEncoding];
-        ws.encoder = nil;
-        [cb encodeSignalEvent:event value:work.step + 1];
-        [cb commit];
+        Workspace& workspace = workspaces[work.step % 2];
+        const int row_count = (int)work.rows.size();
+        assert(can_submit() && row_count > 0 && row_count <= workspace.max_rows &&
+               (in_flight.empty() || in_flight.back().work.step + 1 == work.step));
+        std::vector<int> source_rows(row_count, -1);  // fed rows: their row in the step in flight
+        const bool any_fed = write_step_inputs(work, workspace, source_rows);
+        id<MTLCommandBuffer> command_buffer = [queue commandBuffer];
+        workspace.encoder = [command_buffer computeCommandEncoderWithDispatchType:MTLDispatchTypeConcurrent];
+        // Defensive today: a row in both step N and N + 1 is fed, and feeding reads N's next_token_ids, a tracked
+        // buffer, so Metal already orders the two encoders (and with them the untracked arena's K/V and state).
+        // Needed if workspace buffers become untracked. A fence, not encodeWaitForEvent: that cost a decode of one
+        // request ~3.5% (297 vs 287 tok/s).
+        [workspace.encoder waitForFence:fence];
+        if (any_fed)
+            ops.feed_previous_tokens(workspace, workspaces[(work.step + 1) % 2].next_token_ids, source_rows);
+        const int layer_count = mem.spec.n_layers();
+        encode_layers(ops, workspace, layer_count);
+        ops.apply_weights(layer_count, workspace);
+        std::vector<SampleParams> sampler_params;
+        for (const DecodeRow& row : work.rows) sampler_params.push_back(row.sampler);
+        ops.pick_next_tokens(workspace, sampler_params);
+        [workspace.encoder updateFence:fence];
+        [workspace.encoder endEncoding];
+        workspace.encoder = nil;
+        [command_buffer encodeSignalEvent:event value:work.step + 1];
+        [command_buffer commit];
         mem.arena.committed = work.step + 1;  // units released from now on wait for this step
-        q.push_back({cb, std::move(work)});
+        in_flight.push_back({command_buffer, std::move(work)});
     }
+}
+
+// Writes the step's shape, token ids and step table into the workspace. A row whose token is -1 takes its token from
+// the step in flight on the GPU: source_rows gets its row there. True if any row does.
+bool DecodeLane::write_step_inputs(const DecodeWork& work, Workspace& workspace, std::vector<int>& source_rows) {
+    const int row_count = (int)work.rows.size();
+    workspace.request_count = row_count, workspace.tokens_per_request = 1;
+    std::vector<StepTables::Row> table_rows;
+    bool any_fed = false;
+    for (int b = 0; b < row_count; b++) {
+        const DecodeRow& row = work.rows[b];
+        if (row.token < 0) {
+            assert(!in_flight.empty());
+            const auto& previous_rows = in_flight.back().work.rows;
+            auto previous = std::find_if(previous_rows.begin(), previous_rows.end(),
+                                         [&](const DecodeRow& earlier) { return earlier.req_id == row.req_id; });
+            assert(previous != previous_rows.end() && previous->pos + 1 == row.pos);
+            source_rows[b] = (int)(previous - previous_rows.begin()), any_fed = true;
+        }
+        ((int32_t*)workspace.token_ids.contents)[b] = row.token;
+        table_rows.push_back({row.pos, 1, row.pages, row.state_slots});
+    }
+    workspace.step_table = step_tables.begin(work.step + 1, event.signaledValue);
+    step_tables.write(workspace.step_table, table_rows);
+    return any_fed;
 }
 
 std::vector<std::pair<int, int>> DecodeLane::poll() {
     @autoreleasepool {
-        if (q.empty()) return {};
-        for (const InFlight& f : q)
-            if (f.cb.status == MTLCommandBufferStatusError) {
-                auto e = failed("DecodeLane", f.cb);
-                wait();
-                // a failed command buffer may skip its signal: units released at its step would stay pending for
-                // good. Everything committed has completed now, so mark it done (one queue, in order).
-                event.signaledValue = std::max(event.signaledValue, q.back().w.step + 1);
-                q.clear();
-                throw e;
-            }
-        const DecodeWork& w = q.front().w;
-        if (event.signaledValue < w.step + 1) return {};
-        std::vector<int> ids = ops.next_tokens(ws[w.step % 2]);
-        std::vector<std::pair<int, int>> done;
-        for (size_t b = 0; b < ids.size(); b++) done.emplace_back(w.rows[b].req_id, ids[b]);
-        q.pop_front();
-        return done;
+        if (in_flight.empty()) return {};
+        for (const InFlightStep& step : in_flight) {
+            if (step.command_buffer.status != MTLCommandBufferStatusError) continue;
+            auto error = command_buffer_failed("DecodeLane", step.command_buffer);
+            wait();
+            // a failed command buffer may skip its signal: units released at its step would stay pending for
+            // good. Everything committed has completed now, so mark it done (one queue, in order).
+            event.signaledValue = std::max(event.signaledValue, in_flight.back().work.step + 1);
+            in_flight.clear();
+            throw error;
+        }
+        const DecodeWork& oldest = in_flight.front().work;
+        if (event.signaledValue < oldest.step + 1) return {};
+        std::vector<int> tokens = ops.next_tokens(workspaces[oldest.step % 2]);
+        std::vector<std::pair<int, int>> finished;
+        for (size_t b = 0; b < tokens.size(); b++) finished.emplace_back(oldest.rows[b].req_id, tokens[b]);
+        in_flight.pop_front();
+        return finished;
     }
 }
 
 // The event's value of the oldest work in flight, not signaledValue + 1: that may already have passed since the poll.
 void PrefillLane::wait_oldest() const {
-    if (busy()) [event waitUntilSignaledValue:n - q.size() + 1 timeoutMS:1000];
+    if (busy()) [event waitUntilSignaledValue:chunks_committed - in_flight.size() + 1 timeoutMS:1000];
 }
 
 void DecodeLane::wait_oldest() const {
-    if (!q.empty()) [event waitUntilSignaledValue:q.front().w.step + 1 timeoutMS:1000];
+    if (!in_flight.empty()) [event waitUntilSignaledValue:in_flight.front().work.step + 1 timeoutMS:1000];
 }
 
 void DecodeLane::wait() {
-    if (!q.empty()) [q.back().cb waitUntilCompleted];
+    if (!in_flight.empty()) [in_flight.back().command_buffer waitUntilCompleted];
 }
 
 }  // namespace mllm
