@@ -67,7 +67,7 @@ int main() {
                 if (decode) ops.lm_head(ws);
             });
         }
-        return decode ? ops.sample(ws, std::vector<mllm::SampleParams>(ws.B)) : std::vector<int>{};
+        return decode ? ops.ids(ws) : std::vector<int>{};
     };
 
     int decodes = 0;

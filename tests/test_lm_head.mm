@@ -1,8 +1,9 @@
 // lm_head + sampling. (1) golden decode0..2: ws.x after dense(L) -> logits and greedy ids equal decodeN/logits,
 // decodeN/argmax. (2) lm_head.safetensors: the quantized matmul at N = vocab for M = 1..16 (MLX switches kernels by
 // M) bit-exact at M 1..6 and 13..16, by tolerance at 7..12 (qmm_t_decode), rows past M untouched, argmax = the
-// lowest index of the row's max. (3) argmax ties and edges. (4) make_sampler semantics:
+// lowest index of the row's max. (3) argmax ties and edges. (4) make_sampler semantics, drawn on the GPU:
 // 5k seeded draws match the expected distribution (chi-square), top_p drops exactly the tail apply_top_p drops.
+// (5) a batch mixing greedy and sampled rows: each row as if alone.
 #include <cassert>
 #include <fstream>
 #include <map>
@@ -20,6 +21,17 @@ struct mllm::GpuOpsTest {
             ops.use(ws);
             ops.argmax({x}, {out}, rows, V);
         });
+    }
+    static std::vector<int> sample(GpuOps& ops, id<MTLCommandQueue> q, Workspace& ws,
+                                   const std::vector<SampleParams>& params) {
+        ws.B = (int)params.size();
+        @autoreleasepool {
+            mllm::encode_and_wait(q, ws, [&] {
+                ops.use(ws);
+                ops.sample({ws.logits}, {ws.ids}, ops.spec.vocab, params);
+            });
+        }
+        return ops.ids(ws);
     }
 };
 
@@ -69,7 +81,7 @@ int main() {
                 ops.lm_head(ws);
             });
         }
-        return ops.sample(ws, std::vector<mllm::SampleParams>(B));  // greedy
+        return ops.ids(ws);  // greedy
     };
 
     // (1) golden decode steps
@@ -128,13 +140,14 @@ int main() {
         int kept;
     };
     // chi-square over the kept tokens, 99.9% quantile per degree of freedom (1..3)
+    auto draw = [&](mllm::SampleParams p) { return mllm::GpuOpsTest::sample(ops, q, ws, {p})[0]; };
     const int draws = 5000;
     const double chi2_max[] = {0, 10.83, 13.82, 16.27};
     for (Case k : {Case{1, 0, 4}, Case{0.7f, 0.7f, 2}, Case{0.7f, 0.8f, 3}, Case{1.5f, 0.95f, 4}}) {
         std::mt19937_64 rng(42);
         mllm::SampleParams p{k.temp, k.top_p, &rng};
         std::map<int, int> n;
-        for (int i = 0; i < draws; i++) n[ops.sample(ws, {p})[0]]++;
+        for (int i = 0; i < draws; i++) n[draw(p)]++;
         double z = 0, chi2 = 0;
         for (int j = 0; j < k.kept; j++) z += std::exp(from_bf16(L[live[j].first]) / k.temp);
         for (int j = 0; j < 4; j++) {
@@ -148,19 +161,52 @@ int main() {
         assert((int)std::count_if(n.begin(), n.end(), [](auto& e) { return e.second > 0; }) == k.kept);
         std::mt19937_64 r1(7), r2(7);  // seeded: the same draws
         for (int i = 0; i < 100; i++)
-            assert(ops.sample(ws, {{k.temp, k.top_p, &r1}})[0] == ops.sample(ws, {{k.temp, k.top_p, &r2}})[0]);
+            assert(draw({k.temp, k.top_p, &r1}) == draw({k.temp, k.top_p, &r2}));
     }
-    // after those rows (the reused counts must be clean): -inf tokens never drawn; an all -inf row gives 0
+    // -inf tokens never drawn; an all -inf row gives 0
     std::fill(L, L + V, ninf);
     L[123] = to_bf16(1);
     std::mt19937_64 r3(3);
-    for (int i = 0; i < 200; i++) assert(ops.sample(ws, {{1, 0.5f, &r3}})[0] == 123);
+    for (int i = 0; i < 200; i++) assert(draw({1, 0.5f, &r3}) == 123);
     L[123] = ninf;
-    assert(ops.sample(ws, {{1, 0, &r3}})[0] == 0);
+    assert(draw({1, 0, &r3}) == 0);
+
+    // top_p with many candidates: token 7 at 5, `mid` tokens at 0, the rest at -10; top_p 0.5 keeps token 7 and the
+    // mid tokens (the -10s hold ~0.2% of the mass). mid = 4000 fits the kernel's candidate buffer (4096); 5000 takes
+    // the whole-row path. Both: no -10 token drawn, token 7 at its odds (chi-square, 1 df)
+    for (int mid : {4000, 5000}) {
+        for (int i = 0; i < V; i++) L[i] = to_bf16(i < 100 + mid && i >= 100 ? 0.0f : -10.0f);
+        L[7] = to_bf16(5);
+        const double z = std::exp(5.0) + mid, p7 = std::exp(5.0) / z;
+        std::mt19937_64 rng(5);
+        int n7 = 0;
+        const int N = 3000;
+        for (int i = 0; i < N; i++) {
+            const int t = draw({1, 0.5f, &rng});
+            assert(t == 7 || (t >= 100 && t < 100 + mid));
+            n7 += t == 7;
+        }
+        const double e7 = N * p7, chi2 = (n7 - e7) * (n7 - e7) / e7 + (n7 - e7) * (n7 - e7) / (N - e7);
+        printf("  %d candidates: token 7 drawn %d of %d (expected %.0f), chi2 %.2f\n", mid + 1, n7, N, e7, chi2);
+        assert(chi2 < chi2_max[1]);
+    }
+
+    // (5) rows 0..3 (the case-(4) row in each): greedy, sampled, greedy, sampled. Each row's token as if alone: the
+    // argmax for greedy rows, and for sampled rows the same draw as the same seed gives alone (on row 0)
+    for (int i = 0; i < V; i++) L[i] = to_bf16(-60 - (i % 32) * 0.5f);  // the edge cases above overwrote row 0
+    for (auto [i, v] : live) L[i] = to_bf16(v);
+    for (int r = 1; r < 4; r++) std::copy(L, L + V, L + (size_t)r * V);
+    std::mt19937_64 a1(11), a2(11), b1(12), b2(12);
+    for (int i = 0; i < 50; i++) {
+        const std::vector<int> got = mllm::GpuOpsTest::sample(ops, q, ws, {{}, {0.7f, 0.7f, &a1}, {}, {1.5f, 0.95f, &b1}});
+        assert(got[0] == 5 && got[2] == 5 && (got[1] == 5 || got[1] == 77));
+        assert(got[1] == draw({0.7f, 0.7f, &a2}) && got[3] == draw({1.5f, 0.95f, &b2}));
+    }
     printf("decode steps: %d, logits and greedy ids bit-exact; lm_head M = 1..6, 13..16 bit-exact, 7..12 within "
            "tolerance, rows M.. untouched; "
            "argmax ties ok;\n"
-           "sampling: 4 cases x %d draws match make_sampler's distribution (chi-square, p 0.001), top_p tails dropped\nPASS\n",
+           "sampling (GPU): 4 cases x %d draws match make_sampler's distribution (chi-square, p 0.001), top_p tails dropped;\n"
+           "mixed greedy + sampled rows ok\nPASS\n",
            steps, draws);
     assert(steps == 3);
 }

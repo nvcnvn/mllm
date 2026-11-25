@@ -57,6 +57,16 @@ Expected shape (*estimates* from the 0.8B numbers, replaced by measurements as i
 **Also untested:** what the server does when macOS evicts its weights mid-session. Measure TTFT and decode-step times after a pressure event.
 
 ## 5. ANE prefill at 27B (architecture.md "Open questions")
+- [ ] **One weight copy** (2026-11-25, `tools/ane_dynamic_weights.py`): the ANE keeps a private wired copy of baked-in
+  weights, so LUT4 for it means ~15 GB next to the GPU's 15 GB. Instead the GPU could dequantize its 4-bit weights a
+  layer at a time into scratch the ANE takes as a matmul *input*. Measured (Python, fp16, M4 Pro): input weights run on
+  the ANE and are correct, but 1.3-2.4x slower than baked ones; the extra time is a steady ~5.6 GB/s weight intake
+  (Core ML copying the input). At 27B that is ~150 ms per layer per 512-token chunk just to take the weights in,
+  against the GPU's ~61 ms for the whole layer: slower than GPU prefill. Breaks even only if the intake is zero-copy at
+  ~30 GB/s or more. **Check:** the same matmul from Swift with an IOSurface-backed input; still ~6 GB/s closes this
+  route (and with it ANE prefill at 27B unless the ~15 GB copy is accepted).
+- LUT4 as the *GPU's* format too (one format, not one copy: the ANE still compiles its own): ruled out 2026-11-25, ~10%
+  less to read per decode step isn't worth the precision and losing bit-exactness with mlx-lm.
 - [ ] Weight format: LUT4 built from the **bf16 original** weights (LUT4 from the 4-bit MLX weights failed on 0.8B, cos 0.93). **Check:** per-block cos against fp32 reference; whole-model greedy tokens against GPU prefill; total weights (GPU 4-bit + ANE) next to a 12 GiB arena and ~16 GB for macOS fit in 64 GB.
 - [ ] Build and compile the 64 dense blocks. **Check:** build time and `.mlmodelc` size, recorded; all blocks load.
 - [ ] Speed alone and next to decode. **Check:** ANE prefill tok/s against GPU prefill at 27B. Then decides the default `--prefill` for 27B: ANE only if it beats the GPU, or keeps decode faster under load.

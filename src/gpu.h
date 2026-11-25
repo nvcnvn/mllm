@@ -1,4 +1,4 @@
-// GpuOps: dense(i), attn(i), lm_head on Metal, sample on the CPU (py/mllm/gpu.py). Kernels are MLX's (src/vendor/mlx),
+// GpuOps: dense(i), attn(i), lm_head and sampling on Metal (py/mllm/gpu.py; Python samples on the CPU). Kernels are MLX's (src/vendor/mlx),
 // dispatched the way MLX v0.32.4 dispatches them, so results match mlx-lm bit for bit.
 #pragma once
 #import <Metal/Metal.h>
@@ -50,11 +50,14 @@ public:
     // Rows may differ in pos and pages; B > 1 needs S == 1 (decode).
     void attn(int i, Workspace& ws);
 
-    // gpu.py lm_head and sample, split at the GPU/CPU boundary. lm_head: logits of ws.x's B rows (decode, S == 1:
-    // prefill never samples) -> ws.logits [B, vocab] bf16, and their argmax. sample, after that command buffer
-    // completed: one id per row, greedy rows from the GPU argmax, the rest drawn on the CPU from ws.logits.
-    void lm_head(Workspace& ws);
-    std::vector<int> sample(const Workspace& ws, const std::vector<SampleParams>& params) const;
+    // gpu.py lm_head and sample. lm_head: logits of ws.x's B rows (decode, S == 1: prefill never samples) ->
+    // ws.logits [B, vocab] bf16, then each row's token -> ws.ids: params[b] (empty: all greedy) as sample() below.
+    // ids, after that command buffer completed: ws.ids' B tokens.
+    void lm_head(Workspace& ws, const std::vector<SampleParams>& params = {});
+    std::vector<int> ids(const Workspace& ws) const;
+    // bf16 logits [rows = params.size(), V] -> int32 token per row (sample.metal): temp 0 = argmax; else top_p, then a
+    // draw seeded from the row's rng (one 64-bit draw per call, so a request's tokens follow its seed).
+    void sample(Buf x, Buf out, int V, const std::vector<SampleParams>& params);
 
     // Decode only, no Python counterpart (Python never runs ahead): ws.tokens[b] = prev_ids[src[b]] for src[b] >= 0,
     // so a greedy row's next step is encoded before the CPU has seen its token. Encode it before dense(0).
@@ -75,7 +78,7 @@ private:
     void linear(const QLinear& l, Buf x, Buf y, int M);
     void add(Buf x, Buf y, Buf out, size_t n);
     void swiglu(Buf gate, Buf x, Buf out, size_t n);
-    void argmax(Buf x, Buf out, int rows, int V);  // bf16 [rows, V] -> int32 [rows]
+    void argmax(Buf x, Buf out, int rows, int V) { sample(x, out, V, std::vector<SampleParams>(rows)); }
 
     struct Layer {
         bool is_linear;
@@ -125,7 +128,7 @@ private:
     id<MTLComputePipelineState> embed_ps, rms_ps, rms_looped_ps, add_ps, swiglu_ps, precise_swiglu_ps, split_q_gate_ps;
     id<MTLComputePipelineState> rope_ps, write_kv_ps, sdpa_ps, sdpa_2pass_1[2], sdpa_2pass_2, sigmoid_gate_ps;
     id<MTLComputePipelineState> gather_kv_ps, causal_mask_ps, scale_ps, softmax_ps[2];
-    id<MTLComputePipelineState> conv1d_silu_ps, conv_norm_qk_ps, scale_qk_ps, gdn_gates_ps, gdn_gates_bf16_ps, gated_delta_ps, argmax_ps, feed_ps;
+    id<MTLComputePipelineState> conv1d_silu_ps, conv_norm_qk_ps, scale_qk_ps, gdn_gates_ps, gdn_gates_bf16_ps, gated_delta_ps, sample_ps, feed_ps;
     // the fallback's matmul variants: gemv_wide [nv 4/5][k_lanes 16/32]; steel [nt/nn][align M][align N][align K]
     id<MTLComputePipelineState> gemv_wide_ps[3][2], steel_ps[2][2][2][2];
     id<MTLComputePipelineState> pipeline(NSString* name, std::initializer_list<std::pair<int, bool>> constants);

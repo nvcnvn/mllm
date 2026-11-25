@@ -295,7 +295,9 @@ void DecodeLane::submit(DecodeWork work) {
         const int L = mem.spec.n_layers();
         layers(ops, ws, L);
         ops.dense(L, ws);
-        ops.lm_head(ws);
+        std::vector<SampleParams> params;
+        for (const DecodeRow& r : work.rows) params.push_back(r.sampler);
+        ops.lm_head(ws, params);
         [ws.enc updateFence:fence];
         [ws.enc endEncoding];
         ws.enc = nil;
@@ -321,9 +323,7 @@ std::vector<std::pair<int, int>> DecodeLane::poll() {
             }
         const DecodeWork& w = q.front().w;
         if (event.signaledValue < w.step + 1) return {};
-        std::vector<SampleParams> params;
-        for (const DecodeRow& r : w.rows) params.push_back(r.sampler);
-        std::vector<int> ids = ops.sample(ws[w.step % 2], params);
+        std::vector<int> ids = ops.ids(ws[w.step % 2]);
         std::vector<std::pair<int, int>> done;
         for (size_t b = 0; b < ids.size(); b++) done.emplace_back(w.rows[b].req_id, ids[b]);
         q.pop_front();

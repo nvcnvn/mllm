@@ -114,7 +114,7 @@ GpuOps::GpuOps(Memory& mem, const Weights& weights) : spec(mem.spec), mem(mem), 
     gdn_gates_ps = pipeline(@"gdn_gates_float");
     gdn_gates_bf16_ps = pipeline(@"gdn_gates_bfloat16");
     gated_delta_ps = pipeline([NSString stringWithFormat:@"gated_delta_paged_bfloat16_128_128_16_%d", spec.lin_v_heads]);
-    argmax_ps = pipeline(@"argmax_bf16");
+    sample_ps = pipeline(@"sample_bf16");
     feed_ps = pipeline(@"feed_tokens");
     gather_kv_ps = pipeline(@"gather_kv_bfloat16_256");
     causal_mask_ps = pipeline(@"causal_mask");
@@ -630,12 +630,18 @@ void GpuOps::full_attn(const Layer& l, Workspace& ws) {
 
 namespace mllm {
 
-void GpuOps::lm_head(Workspace& ws) {
+void GpuOps::lm_head(Workspace& ws, const std::vector<SampleParams>& params) {
     use(ws);
     const int B = ws.B, V = lm.N;
     assert(ws.S == 1 && B <= ws.rows && ws.logits.length >= (size_t)B * V * ELEM);
+    assert(params.empty() || (int)params.size() == B);
     linear(lm, {ws.x}, {ws.logits}, B);
-    argmax({ws.logits}, {ws.ids}, B, V);
+    sample({ws.logits}, {ws.ids}, V, params.empty() ? std::vector<SampleParams>(B) : params);
+}
+
+std::vector<int> GpuOps::ids(const Workspace& ws) const {
+    const int32_t* p = (const int32_t*)ws.ids.contents;
+    return std::vector<int>(p, p + ws.B);
 }
 
 void GpuOps::feed_tokens(Workspace& ws, id<MTLBuffer> prev_ids, const std::vector<int>& src) {
@@ -647,84 +653,20 @@ void GpuOps::feed_tokens(Workspace& ws, id<MTLBuffer> prev_ids, const std::vecto
     pre(), [enc dispatchThreads:MTLSizeMake(src.size(), 1, 1) threadsPerThreadgroup:MTLSizeMake(src.size(), 1, 1)];
 }
 
-void GpuOps::argmax(Buf x, Buf out, int rows, int V) {
-    [enc setComputePipelineState:argmax_ps];
-    set(enc, x, 0), set(enc, out, 1), set_bytes(enc, V, 2);
-    pre(), [enc dispatchThreadgroups:MTLSizeMake(rows, 1, 1) threadsPerThreadgroup:MTLSizeMake(1024, 1, 1)];
-}
-
-// make_sampler(temp, top_p) on one logits row: apply_top_p on the temperature-1 probabilities (keep every token
-// >= the smallest value whose strictly larger tokens hold < top_p of the mass), then categorical(logits / temp).
-// Python feeds it logprobs (logits - logsumexp, in bf16) and draws with Gumbel-max; this draws the same
-// distribution from the logits (shift-invariant) by inverse CDF, in double.
-// bf16 has 65536 values: count each one (keys ordered by value), then walk the keys from the top, so the cost is
-// one counting pass over the row (~0.1 ms at vocab 248k) instead of an exp and a sort per token.
-// ponytail: CPU; sample on the GPU when it shows up in the decode profile.
-static int sample_row(const uint16_t* row, int V, const SampleParams& p) {
-    auto key = [](uint16_t b) { return b & 0x8000 ? (int)(uint16_t)~b : (int)(b | 0x8000); };
-    auto value = [](int k) {
-        uint32_t u = (uint32_t)(k & 0x8000 ? k & 0x7FFF : ~k & 0xFFFF) << 16;
-        float f;
-        memcpy(&f, &u, 4);
-        return (double)f;
+void GpuOps::sample(Buf x, Buf out, int V, const std::vector<SampleParams>& params) {
+    struct SampleRow {  // sample.metal SampleRow
+        float temp, top_p;
+        uint64_t seed;
     };
-    static thread_local std::vector<uint32_t> count(65536);  // all zero between calls: re-zeroed over [kmin, kmax]
-    for (int i = 0; i < V; i++) count[key(row[i])]++;
-    int kmin = 0, kmax = 65535;  // the touched range (cheaper to find here than per token)
-    while (!count[kmin]) kmin++;
-    while (!count[kmax]) kmax--;
-    const int bottom = std::max(kmin, key(0xFF80));  // +inf .. -inf: NaNs never drawn
-    int top = std::min(kmax, key(0x7F80));
-    while (top > bottom && !count[top]) top--;
-    int k = -1;      // the drawn value's key
-    uint32_t j = 0;  // which of its tokens (equal values are equally likely)
-    if (top >= bottom && count[top] && std::isfinite(value(top))) {
-        const double m = value(top);
-        int thr = bottom;
-        if (p.top_p > 0 && p.top_p < 1) {
-            double total = 0, above = 0;
-            for (int i = top; i >= bottom; i--)
-                if (count[i]) total += count[i] * std::exp(value(i) - m);
-            for (int i = top; i >= bottom && above < p.top_p * total; i--)
-                if (count[i]) thr = i, above += count[i] * std::exp(value(i) - m);
-        }
-        auto weight = [&](int i) { return std::exp((value(i) - m) / p.temp); };
-        double sum = 0;
-        for (int i = top; i >= thr; i--)
-            if (count[i]) sum += count[i] * weight(i);
-        double u = std::uniform_real_distribution<double>(0, sum)(*p.rng);
-        // weights fall with the key: past a zero weight (-inf, underflow) nothing has mass. A rounding edge that
-        // walks off the end keeps the last bucket with weight.
-        for (int i = top; i >= thr; i--) {
-            if (!count[i]) continue;
-            const double w = weight(i);
-            if (w == 0) break;
-            k = i, j = count[i] - 1;
-            if (u < count[i] * w) {
-                j = std::min(j, (uint32_t)(u / w));
-                break;
-            }
-            u -= count[i] * w;
-        }
-    }
-    std::fill(count.begin() + kmin, count.begin() + kmax + 1, 0);
-    if (k < 0) return 0;  // no finite logit: garbage in (argmax answers 0 too)
-    for (int i = 0; i < V; i++)
-        if (key(row[i]) == k && !j--) return i;
-    return 0;  // unreachable
-}
-
-std::vector<int> GpuOps::sample(const Workspace& ws, const std::vector<SampleParams>& params) const {
-    const int V = lm.N;
-    assert((int)params.size() == ws.B);
-    std::vector<int> out(ws.B);
-    for (int b = 0; b < ws.B; b++) {
-        const SampleParams& p = params[b];
+    std::vector<SampleRow> rows;
+    for (const SampleParams& p : params) {
         assert(p.temp >= 0 && (p.temp == 0 || p.rng));
-        out[b] = p.temp == 0 ? ((const int32_t*)ws.ids.contents)[b]
-                             : sample_row((const uint16_t*)ws.logits.contents + (size_t)b * V, V, p);
+        rows.push_back({p.temp, p.top_p, p.temp > 0 ? (*p.rng)() : 0});
     }
-    return out;
+    [enc setComputePipelineState:sample_ps];
+    set(enc, x, 0), set(enc, out, 1), set_bytes(enc, V, 2);
+    [enc setBytes:rows.data() length:rows.size() * sizeof(SampleRow) atIndex:3];
+    pre(), [enc dispatchThreadgroups:MTLSizeMake(rows.size(), 1, 1) threadsPerThreadgroup:MTLSizeMake(1024, 1, 1)];
 }
 
 }  // namespace mllm

@@ -34,7 +34,7 @@ struct PrefillWork {
 };
 
 struct DecodeRow {
-    int req_id, token, pos;  // token -1: the request's row in the step in flight, its argmax fed on the GPU
+    int req_id, token, pos;  // token -1: the request's row in the step in flight, its token fed on the GPU
     std::vector<uint32_t> slots, state_slots;
     SampleParams sampler;
 };
@@ -109,8 +109,9 @@ private:
 class DecodeLane {
 public:
     DecodeLane(GpuOps& ops, Memory& mem, int max_batch, int max_ctx);
-    // At most one step ahead: step N + 1 is encoded and committed while N runs. Its greedy rows can take N's argmax
-    // on the GPU (DecodeRow::token -1), so B = 1 decode never waits for the CPU's encode and commit.
+    // At most one step ahead: step N + 1 is encoded and committed while N runs. Its rows can take N's token on the
+    // GPU (DecodeRow::token -1; greedy or sampled, both chosen there), so B = 1 decode never waits for the CPU's
+    // encode and commit.
     bool can_submit() const { return q.size() < 2; }
     void submit(DecodeWork work);  // sets mem.arena.committed = work.step + 1
     // The oldest step's (req_id, token) once its event passed; throws if a step failed (every step in flight is

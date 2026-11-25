@@ -169,21 +169,15 @@ std::vector<Event> Engine::step() {
             r.sent = end;
         }
 
-        // A greedy request still in the step in flight joins the next one too: its token is fed on the GPU. Unless
-        // that step makes its last token; an EOS there leaves one wasted row (its result is dropped at poll).
-        // Not while a sampled row decodes: it waits for the CPU each step, so feeding greedy rows ahead would split
-        // the rows into alternating steps and halve its rate; all rows step together then, one step in flight.
-        // ponytail: sampling on the GPU lets sampled rows be fed too.
-        const bool sampled = std::any_of(reqs.begin(), reqs.end(), [](auto& kv) {
-            return kv.second.state == State::DECODE && !kv.second.cancelled && kv.second.sampler.temp > 0;
-        });
+        // A request still in the step in flight joins the next one too: its token (greedy or sampled, both chosen
+        // on the GPU) is fed there. Unless that step makes its last token; an EOS there leaves one wasted row (its
+        // result is dropped at poll).
         std::vector<Request*> batch;
         for (auto& [_, r] : reqs)
             if (r.state == State::DECODE && !r.cancelled && (int)batch.size() < max_batch &&
-                (!r.in_flight ||
-                 (!sampled && r.in_flight == 1 && r.sampler.temp == 0 && (int)r.out.size() + 1 < r.max_tokens)))
+                (!r.in_flight || (r.in_flight == 1 && (int)r.out.size() + 1 < r.max_tokens)))
                 batch.push_back(&r);
-        if (!batch.empty() && decode.can_submit() && !(sampled && decode.busy())) {
+        if (!batch.empty() && decode.can_submit()) {
             progress = true;
             DecodeWork w{step_no, {}};
             for (Request* r : batch) {

@@ -209,7 +209,7 @@ void GpuOpsTest::bench_ops(const std::string& model) {
 
     // a whole decode step at 512 keys: dense(0 .. L) with attn of both kinds, lm_head; one command buffer
     printf("\nwhole decode step (embed .. lm_head + argmax in one command buffer), 512 keys per row; "
-           "CPU sampling at temp 0.7, top_p 0.9; median of 10 steps\n");
+           "GPU sampling at temp 0.7, top_p 0.9 timed alone; median of 10 steps\n");
     // mlx-lm tok/s at B = 1 / 4 / 8 / 16 by model (reports/mlx-lm baseline.md; 27B: B = 1 from two quiet holds,
     // B = 4 / 8 from one busy run); 0: not measured, no ratio
     const bool is08 = s.path.find("Qwen3.5-0.8B-4bit") != std::string::npos;
@@ -245,22 +245,17 @@ void GpuOpsTest::bench_ops(const std::string& model) {
             }
         std::sort(ts.begin(), ts.end()), std::sort(walls.begin(), walls.end());
         const double step = ts[ts.size() / 2], wall = walls[walls.size() / 2];
+        // the sampling kernel alone on this step's logits (greedy: its argmax pass only, already in the step)
         std::mt19937_64 rng(1);
         const std::vector<SampleParams> params(B, SampleParams{0.7f, 0.9f, &rng});
-        const int draws = 5;
-        const auto t0 = std::chrono::steady_clock::now();
-        for (int k = 0; k < draws; k++) ops.sample(ws, params);
-        const double samp = std::chrono::duration<double>(std::chrono::steady_clock::now() - t0).count() / draws;
-        // mlx-lm's figure is end to end, so the ratio uses wall time (greedy: the GPU argmax, no CPU sampling)
+        const double samp = time([&](int) { ops.sample({ws.logits}, {ws.ids}, s.vocab, params); });
+        // mlx-lm's figure is end to end, so the ratio uses wall time (greedy)
         printf("  B = %2d: %zu dispatches; GPU %6.2f ms (%5.1f tok/s); wall %6.2f ms (%5.1f tok/s)", B, per_step, step * 1e3,
                B / step, wall * 1e3, B / wall);
         if (baseline[bi]) printf(" vs mlx-lm %5.1f: %.2fx", baseline[bi], B / wall / baseline[bi]);
-        printf("; CPU sampling %.2f ms/row = %4.2f ms/step -> %5.0f tok/s\n", samp / B * 1e3, samp * 1e3, B / (wall + samp));
+        printf("; GPU sampling (temp 0.7, top_p 0.9) %.3f ms/step\n", samp * 1e3);
         bi++;
     }
-    // ponytail: sampling stays on the CPU (GpuOps::sample, ~B x per-row ms per step). Move it to the GPU once the
-    // lanes (g5) can't hide it behind the next step's GPU work, i.e. when a step's sampling time exceeds ~10% of
-    // the GPU step at the served batch.
 }
 
 }  // namespace mllm
