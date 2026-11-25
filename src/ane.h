@@ -74,6 +74,11 @@ public:
 private:
     id<MTLComputePipelineState> from_rows_ps, to_rows_ps, dequant_ps;
     std::vector<std::string> kind_of;  // layer i's block kind
+
+    Surface* surface(Memory& mem, int set, const std::string& key, int rows, int cols);  // made on first use
+    Block load(Memory& mem, const std::string& dir, int Sk, MLModelConfiguration* cfg);
+    std::vector<Param> layer_params(int i, const ModelSpec& sp);
+    void to_rows(Workspace& ws, Buf src, const Surface& dst, uint32_t n, int rows);
 };
 
 }  // namespace mllm
