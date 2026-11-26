@@ -17,16 +17,6 @@ namespace mllm {
 // no rope fields yet; add them when a model differs.
 constexpr int ROTATED_DIMS = 64;        // the first 64 numbers of each head rotate by position
 constexpr float ROTATION_BASE = 1e7f;  // RoPE's theta
-// MLX's 'medium' (applegpu_g*s) attention rules: the two-pass kernel from 1024 keys
-constexpr int TWO_PASS_FROM_KEYS = 1024;
-
-// How many blocks the two-pass attention splits the keys into on an 's' GPU (scaled_dot_product_attention.cpp
-// sdpa_vector_2pass). simdgroups: query heads per key_value head x queries.
-static int two_pass_blocks(int keys, int simdgroups) {
-    if (keys > 1024 && simdgroups > 4) return keys <= 8192 ? 128 : keys <= 32768 ? 256 : keys <= 65536 ? 512 : 1024;
-    return 64;
-}
-
 // MLX's has_fused_kernel: the fused attention kernel (sdpa_vector) only while queries <= 8 and
 // queries x heads_per_key_value <= 32 (27B, 6 query heads per key_value head: queries <= 5), else the unfused fallback
 static bool fused_attention_fits(int queries, int heads_per_key_value) {
@@ -108,12 +98,13 @@ static QuantizedWeights merged_weights(std::initializer_list<QuantizedWeights*> 
 }
 
 GpuOps::GpuOps(Memory& mem, const Weights& weights) : spec(mem.spec), mem(mem), device(mem.device) {
-    // MLX picks kernels and tile sizes by GPU generation. Only the M4 family's branch (gen 15/16, not a 'd' Max/Ultra
-    // die) is copied below. ponytail: port the other branches of quantized.cpp when another GPU shows up.
-    NSString* architecture = device.architecture.name;
-    if (!([architecture hasPrefix:@"applegpu_g15"] || [architecture hasPrefix:@"applegpu_g16"]) ||
-        [architecture hasSuffix:@"d"])
-        throw error(std::string("GpuOps: dispatch rules not ported for ") + architecture.UTF8String, nil);
+    // MLX picks kernels and tile sizes by GPU generation and size (gpu_rules.h); $MLX_METAL_GPU_ARCH overrides the
+    // name as in MLX, so both engines can be run with another chip's rules on this one.
+    const char* arch_override = getenv("MLX_METAL_GPU_ARCH");
+    const std::string arch = arch_override && *arch_override ? arch_override : device.architecture.name.UTF8String;
+    if (std::string why = gpu_unsupported(arch); !why.empty()) throw std::runtime_error("GpuOps: " + why);
+    gpu = gpu_class(arch);
+    two_pass_from = two_pass_from_keys(gpu, spec.key_value_heads < spec.query_heads);
 
     NSError* err = nil;
     unsigned long embedded_size = 0;  // build/mllm carries the metallib in a section (Makefile); other binaries load the file
@@ -186,9 +177,9 @@ void GpuOps::load_kernels() {
     // linear attention: kernel names fix the conv kernel and head shapes
     if (!spec.linear_layers().empty() &&
         (spec.conv_kernel != 4 || spec.linear_key_heads != 16 ||
-         (spec.linear_value_heads != 16 && spec.linear_value_heads != 48) || spec.linear_key_dim != 128 ||
+         (spec.linear_value_heads != 16 && spec.linear_value_heads != 32 && spec.linear_value_heads != 48) || spec.linear_key_dim != 128 ||
          spec.linear_value_dim != 128))
-        throw std::runtime_error("GpuOps: linear attention kernels instantiated for Qwen3.5-0.8B's and 27B's shapes only");
+        throw std::runtime_error("GpuOps: linear attention kernels instantiated for Qwen3.5-0.8B / 4B / 9B's and 27B's shapes only");
     conv_kernel = pipeline(@"conv1d_silu_4");
     conv_and_normalize_kernel = pipeline(@"conv_norm_qk_4");
     scale_query_key_kernel = pipeline(@"scale_qk");
@@ -207,16 +198,6 @@ void GpuOps::load_kernels() {
         for (int wide = 0; wide < 2; wide++)  // has_batch, do_axpby
             multiply_few_rows_bf16[rows][wide] = pipeline(
                 [NSString stringWithFormat:@"gemv_wide_bfloat16_nv%d_kl%d", 3 + rows, 16 << wide], {{0, true}, {1, false}});
-    // the 16 tile variants: bit 3 = not transposed (nn), bits 2..0 = rows, columns, inner size aligned
-    for (int variant = 0; variant < 16; variant++) {
-        const bool not_transposed = variant & 8, rows_aligned = variant & 4, columns_aligned = variant & 2,
-                   inner_aligned = variant & 1;
-        // has_batch, use_out_source, do_axpby, align_M, align_N, align_K
-        multiply_tiles_bf16[not_transposed][rows_aligned][columns_aligned][inner_aligned] = pipeline(
-            not_transposed ? @"steel_gemm_fused_nn_bfloat16_bfloat16_bm64_bn64_bk16_wm2_wn2"
-                           : @"steel_gemm_fused_nt_bfloat16_bfloat16_bm64_bn64_bk16_wm2_wn2",
-            {{10, true}, {100, false}, {110, false}, {200, rows_aligned}, {201, columns_aligned}, {202, inner_aligned}});
-    }
 }
 
 // Layer i's weights, each field from its model-file key (docs/glossary.md maps one to the other)
@@ -280,11 +261,12 @@ Workspace GpuOps::workspace(int chunk, int max_batch, int max_ctx) {
     ws.partial_sums = mem.buffer(512 * 32 * 32 * sizeof(float));
     const size_t heads = spec.query_heads, head_dim = spec.head_dim, heads_per_key_value = heads / spec.key_value_heads;
     ws.attention_heads = mem.buffer(row_bytes * heads * head_dim);
-    // two-pass partials at max_ctx keys: decode (max_batch rows of 1 query; more than 4 heads per key_value head takes
-    // up to 1024 blocks) or one prefill row of up to fused_queries queries (the fused path's longest)
+    // two-pass partials at max_ctx keys (blocks grow with keys): decode (max_batch rows of 1 query) or one prefill row
+    // of 1 .. fused_queries queries (the fused path's longest; on a 'd' GPU fewer queries can take more blocks)
     const int fused_queries = std::min({chunk, 8, 32 / (int)heads_per_key_value});
-    size_t partial_rows = std::max(max_batch * heads * two_pass_blocks(max_ctx, heads_per_key_value),
-                                   fused_queries * heads * two_pass_blocks(max_ctx, heads_per_key_value * fused_queries));
+    size_t partial_rows = max_batch * heads * two_pass_blocks(gpu, max_ctx, heads_per_key_value);
+    for (int queries = 1; queries <= fused_queries; queries++)
+        partial_rows = std::max(partial_rows, queries * heads * two_pass_blocks(gpu, max_ctx, heads_per_key_value * queries));
     ws.two_pass_partials = mem.buffer(partial_rows * head_dim * ELEM);
     ws.two_pass_sums = mem.buffer(partial_rows * sizeof(float));
     ws.two_pass_maxes = mem.buffer(partial_rows * sizeof(float));
@@ -356,10 +338,8 @@ void GpuOps::multiply_weights(const QuantizedWeights& weights, Buf input, Buf ou
     // decay / update_rate_projection) and above 16 rows, MLX's kernels are as fast or faster (g12).
     if (is_decode && rows >= 7 && rows <= 16 && out_size >= 1024 && out_size % 32 == 0)
         return multiply_decode_batch(weights, input, output, rows);
-    // get_qmv_batch_limit, gen 15/16, not 'd'
-    const int many_rows_from = in_size <= 2048 && out_size <= 2048 ? 13 : in_size <= 4096 && out_size <= 4096 ? 15 : 13;
-    if (rows >= many_rows_from) return multiply_many_rows(weights, input, output, rows);
-    if (rows >= 2) {  // qmv_wide: rows_per_group rows of input per threadgroup, 8 output rows per threadgroup
+    if (rows >= qmv_batch_limit(gpu, in_size, out_size)) return multiply_many_rows(weights, input, output, rows);
+    if (rows >= 2 && wide_vector_kernels(gpu)) {  // qmv_wide: rows_per_group rows of input per threadgroup, 8 output rows per threadgroup
         const int passes = (rows + 4) / 5, rows_per_group = (rows + passes - 1) / passes;
         assert(rows_per_group >= 2 && rows_per_group <= 5);
         bind_weights(multiply_few_rows[rows_per_group], weights, input);
@@ -369,7 +349,7 @@ void GpuOps::multiply_weights(const QuantizedWeights& weights, Buf input, Buf ou
                                threadsPerThreadgroup:MTLSizeMake(32, 2, 1)];
         return;
     }
-    // qmv_fast, no partial rows (shapes checked at load)
+    // qmv_fast (grid x = rows), no partial rows (shapes checked at load)
     bind_weights(multiply_one_row, weights, input);
     set_buffer(encoder, output, 4), set_value(encoder, in_size, 5), set_value(encoder, out_size, 6);
     before_dispatch(), [encoder dispatchThreadgroups:MTLSizeMake(rows, out_size / 8, 1) threadsPerThreadgroup:MTLSizeMake(32, 2, 1)];
@@ -513,16 +493,17 @@ void GpuOps::start_layer(const Layer& layer, Workspace& ws, int rows) {
 
 // mlx Matmul::eval_gpu for the fallback's two multiplies (matmul.cpp): batch [key_value_heads, heads_per_key_value]
 // never collapses (the repeat stride of keys / values is 0), that many batches rule out split-k, so: gemv_wide when
-// the second is transposed and 2 <= rows <= 15, else steel_matmul_regular_axpby with the 's' tiles
-// (GEMM_TPARAM_MACRO: bm 64, bn 64, bk 16, wm 2, wn 2). Run here one key_value head at a time (batch
-// [1, heads_per_key_value]): every batch is computed alone, so the split is bit-exact.
+// the second is transposed, 2 <= rows <= 15 and gen >= 15, else steel_matmul_regular_axpby with gemm_tiles (MLX
+// sizes them by all query heads' outputs). Run here one key_value head at a time (batch [1, heads_per_key_value]):
+// every batch is computed alone, so the split is bit-exact.
 void GpuOps::multiply_bf16(bool second_transposed, Buf first, Buf second, Buf output, int rows, int columns, int inner,
                            int first_row_stride, int second_row_stride, int output_row_stride,
                            const int64_t first_batch_strides[2], const int64_t second_batch_strides[2],
                            int64_t output_batch_stride) {
     const int batches = spec.query_heads / spec.key_value_heads, batch_shape[2] = {1, batches};
     int passes = (rows + 4) / 5;
-    if (second_transposed && rows >= 2 && passes <= 3 && inner % 4 == 0) {  // gemv_wide_config (gen >= 15, aligned)
+    assert(rows >= 2 && columns >= 2);  // min(M, N) == 1 would be MLX's gemv: the fallback runs from 6 queries
+    if (second_transposed && wide_vector_kernels(gpu) && passes <= 3 && inner % 4 == 0) {  // gemv_wide_config (aligned)
         assert(output_batch_stride == (int64_t)rows * columns);              // gemv_wide writes [batch, rows, columns] densely
         int rows_per_pass = (rows + passes - 1) / passes, inner_lanes = passes == 1 || columns <= 64 ? 32 : 16;
         assert(rows_per_pass >= 3 && rows_per_pass <= 5);  // rows 6..15: the fallback runs above 8 queries, or above 32 / heads_per_key_value
@@ -538,19 +519,26 @@ void GpuOps::multiply_bf16(bool second_transposed, Buf first, Buf second, Buf ou
                                threadsPerThreadgroup:MTLSizeMake(32, inner_lanes / 8, 1)];
         return;
     }
-    const int tile_rows = 64, tile_columns = 64, tile_inner = 16;
-    [encoder setComputePipelineState:multiply_tiles_bf16[!second_transposed][rows % tile_rows == 0]
-                                                        [columns % tile_columns == 0][inner % tile_inner == 0]];
-    const int column_tiles = (columns + tile_columns - 1) / tile_columns, row_tiles = (rows + tile_rows - 1) / tile_rows;
+    const GemmTiles tiles = gemm_tiles(gpu, second_transposed, (int64_t)spec.query_heads * rows * columns, rows, columns, inner);
+    const bool rows_aligned = rows % tiles.bm == 0, columns_aligned = columns % tiles.bn == 0, inner_aligned = inner % tiles.bk == 0;
+    NSString* name = [NSString stringWithFormat:@"steel_gemm_fused_n%c_bfloat16_bfloat16_bm%d_bn%d_bk%d_wm%d_wn%d",
+                                                second_transposed ? 't' : 'n', tiles.bm, tiles.bn, tiles.bk, tiles.wm, tiles.wn];
+    __strong id<MTLComputePipelineState>& kernel =
+        multiply_tiles_bf16[std::string(name.UTF8String) + char('0' + rows_aligned * 4 + columns_aligned * 2 + inner_aligned)];
+    if (!kernel)  // has_batch, use_out_source, do_axpby, align_M, align_N, align_K
+        kernel = pipeline(name, {{10, true}, {100, false}, {110, false}, {200, rows_aligned}, {201, columns_aligned},
+                                 {202, inner_aligned}});
+    [encoder setComputePipelineState:kernel];
+    const int column_tiles = (columns + tiles.bn - 1) / tiles.bn, row_tiles = (rows + tiles.bm - 1) / tiles.bm;
     mlx::steel::GEMMParams params{rows, columns, inner, first_row_stride, second_row_stride, output_row_stride,
                                   column_tiles, row_tiles, first_batch_strides[1], second_batch_strides[1],
-                                  output_batch_stride, 0, inner / tile_inner, 2};
+                                  output_batch_stride, 0, inner / tiles.bk, 2};
     const int64_t strides[4] = {first_batch_strides[0], first_batch_strides[1], second_batch_strides[0], second_batch_strides[1]};
     set_buffer(encoder, first, 0), set_buffer(encoder, second, 1), set_buffer(encoder, output, 3), set_value(encoder, params, 4);
     [encoder setBytes:batch_shape length:sizeof batch_shape atIndex:6];
     [encoder setBytes:strides length:sizeof strides atIndex:7];
     before_dispatch(), [encoder dispatchThreadgroups:MTLSizeMake(column_tiles, row_tiles, batches)
-                           threadsPerThreadgroup:MTLSizeMake(32, 2, 2)];
+                           threadsPerThreadgroup:MTLSizeMake(32, tiles.wn, tiles.wm)];
 }
 
 void GpuOps::apply_attention(int i, Workspace& ws) {
@@ -729,22 +717,22 @@ void GpuOps::write_keys_values(const Layer& layer, Workspace& ws) {
                            threadsPerThreadgroup:MTLSizeMake(head_dim, 1, 1)];
 }
 
-// MLX: sdpa_vector, the two-pass kernel from TWO_PASS_FROM_KEYS keys. Rows pick their path by context length.
+// MLX: sdpa_vector, the two-pass kernel from two_pass_from keys. Rows pick their path by context length.
 void GpuOps::attention_fused(const Layer& layer, const Workspace& ws, int shortest_context, int longest_context) {
     const int requests = ws.request_count, tokens = ws.tokens_per_request, heads = spec.query_heads;
     const int key_value_heads = spec.key_value_heads, heads_per_key_value = heads / key_value_heads;
     const KeyValueLayout layout = key_value_layout(mem, spec, layer.full_index);
     const float scale = attention_scale(spec.head_dim);
     id<MTLBuffer> arena = mem.arena_buffer, table = ws.step_table;
-    if (longest_context >= TWO_PASS_FROM_KEYS) {
-        const int blocks = two_pass_blocks(longest_context, heads_per_key_value * tokens);
+    if (longest_context >= two_pass_from) {
+        const int blocks = two_pass_blocks(gpu, longest_context, heads_per_key_value * tokens);
         assert((size_t)requests * heads * tokens * blocks <= ws.two_pass_sums.length / sizeof(float));
         const bool many_threads =
             32 * heads_per_key_value * tokens > (int)attention_long_context_blocks[0].maxTotalThreadsPerThreadgroup;
         [encoder setComputePipelineState:attention_long_context_blocks[many_threads]];
         set_buffer(encoder, {ws.query}, 0), set_buffer(encoder, {arena}, 1), set_buffer(encoder, {ws.two_pass_partials}, 3);
         set_buffer(encoder, {ws.two_pass_sums}, 4), set_buffer(encoder, {ws.two_pass_maxes}, 5);
-        set_buffer(encoder, {table}, 6), set_value(encoder, layout, 7), set_value(encoder, TWO_PASS_FROM_KEYS, 8);
+        set_buffer(encoder, {table}, 6), set_value(encoder, layout, 7), set_value(encoder, two_pass_from, 8);
         set_value(encoder, INT_MAX, 9), set_value(encoder, blocks, 11), set_value(encoder, scale, 12);
         before_dispatch(), [encoder dispatchThreadgroups:MTLSizeMake(key_value_heads, requests, blocks)
                                threadsPerThreadgroup:MTLSizeMake(32, heads_per_key_value, tokens)];
@@ -755,11 +743,11 @@ void GpuOps::attention_fused(const Layer& layer, const Workspace& ws, int shorte
         before_dispatch(), [encoder dispatchThreadgroups:MTLSizeMake(requests * heads, tokens, 1)
                                threadsPerThreadgroup:MTLSizeMake(1024, 1, 1)];
     }
-    if (shortest_context < TWO_PASS_FROM_KEYS) {
+    if (shortest_context < two_pass_from) {
         [encoder setComputePipelineState:attention_short_context];
         set_buffer(encoder, {ws.query}, 0), set_buffer(encoder, {arena}, 1), set_buffer(encoder, {ws.attention_heads}, 3);
         set_value(encoder, heads_per_key_value, 4), set_buffer(encoder, {table}, 5);
-        set_value(encoder, layout, 6), set_value(encoder, 0, 7), set_value(encoder, TWO_PASS_FROM_KEYS, 8);
+        set_value(encoder, layout, 6), set_value(encoder, 0, 7), set_value(encoder, two_pass_from, 8);
         set_value(encoder, scale, 10);
         before_dispatch(), [encoder dispatchThreadgroups:MTLSizeMake(requests * heads, tokens, 1)
                                threadsPerThreadgroup:MTLSizeMake(1024, 1, 1)];
@@ -830,6 +818,7 @@ void GpuOps::pick_next_tokens(Workspace& ws, const std::vector<SampleParams>& pa
 
 std::vector<int> GpuOps::next_tokens(const Workspace& ws) const {
     const int32_t* tokens = (const int32_t*)ws.next_token_ids.contents;
+    if (on_scores) on_scores((const uint16_t*)ws.next_token_scores.contents, (size_t)ws.request_count * lm.out_size);
     return std::vector<int>(tokens, tokens + ws.request_count);
 }
 

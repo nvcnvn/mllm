@@ -21,7 +21,10 @@ def local(model):
     if Path(model).is_dir():
         return model
     from huggingface_hub import snapshot_download
-    return snapshot_download(model, allow_patterns=ALLOW)
+    try:  # cached: no network, no "Fetching N files" progress line
+        return snapshot_download(model, allow_patterns=ALLOW, local_files_only=True)
+    except Exception:
+        return snapshot_download(model, allow_patterns=ALLOW)
 
 
 def tee(cmd):
@@ -55,6 +58,73 @@ def sh(*cmd):
     return subprocess.run(cmd, capture_output=True, text=True).stdout.strip()
 
 
+# Each takes a path MLX picks per chip (src/gpu_rules.h): 11 prefill rows (12 tokens with the template) fall between
+# chips' qmv / qmm batch limits; ~1.2k keys between their one-pass / two-pass attention thresholds (1024 / 4096).
+PROMPTS = ["Hi!",
+           "Write a Python function that checks whether a number is prime.",
+           "Here are some facts. " + " ".join(f"Fact {i}: {i} times {i} is {i * i}." for i in range(60)) +
+           " Which fact has the largest number?"]
+
+
+def first_difference(tokenizer, ids, text):
+    """The first of mlx-lm's tokens `ids` whose text leaves `text` (ours), or None when the texts are equal."""
+    if tokenizer.decode(ids) == text:
+        return None
+    return next((i for i in range(len(ids)) if not text.startswith(tokenizer.decode(ids[:i + 1]))), len(ids))
+
+
+def correctness(path, n=64):
+    """Greedy n tokens of each prompt (chat template) from both engines. Per prompt: `bit-exact` when every step's
+    logits are equal bit for bit (prefill and B = 1 decode match mlx-lm exactly under the same GPU rules), else the
+    largest |difference| and the first step that differs; then whether the texts agree (a weaker check: argmax
+    survives small differences)."""
+    import tempfile
+    import numpy as np
+    import mlx.core as mx
+    from mlx_lm import load, stream_generate
+    ours = []
+    with tempfile.TemporaryDirectory() as tmp:
+        for k, p in enumerate(PROMPTS):  # stderr: its "mllm: weights ..." line, shown only when it fails
+            out = Path(tmp) / f"{k}.bf16"
+            r = subprocess.run([str(BIN), "generate", path, p, "--max-tokens", str(n), "--logits", str(out),
+                                "--prefix-cache", "off"],  # its snapshot points split chunks where mlx-lm doesn't
+                               capture_output=True, text=True)
+            if r.returncode:
+                sys.exit(r.stderr.strip())
+            bits = np.fromfile(out, dtype=np.uint16).astype(np.uint32) << 16  # bf16 -> float32, exactly
+            ours.append((r.stdout.removesuffix("\n"), bits.view(np.float32)))
+    model, tokenizer = load(path)
+    exact = same = 0
+    for k, (prompt, (text, mine)) in enumerate(zip(PROMPTS, ours), 1):
+        steps = []
+
+        def keep(_, logits):  # sees each step's logits before the (greedy) sampler
+            steps.append(logits)
+            return logits
+        ids = tokenizer.apply_chat_template([{"role": "user", "content": prompt}], add_generation_prompt=True)
+        ids = [r.token for r in stream_generate(model, tokenizer, ids, max_tokens=n, logits_processors=[keep],
+                                                prefill_step_size=512)]  # = our GPU chunk
+        theirs = np.array(mx.concatenate(steps[:len(ids)]).astype(mx.float32))  # it may run a step ahead
+        mine = mine.reshape(-1, theirs.shape[1])
+        m = min(len(mine), len(theirs))
+        diff = np.abs(mine[:m] - theirs[:m]).max(axis=1)
+        exact += not diff.any()
+        verdict = (f"bit-exact ({m} steps)" if not diff.any() else
+                   f"max |diff| {diff.max():.4g}, first differing step {int(np.argmax(diff > 0))} of {m}")
+        ids = [t for t in ids if t not in tokenizer.eos_token_ids]
+        i = first_difference(tokenizer, ids, text)
+        same += i is None
+        print(f"prompt {k}: {verdict}; text " + ("identical" if i is None else f"differs from token {i} of {len(ids)}"))
+        if i is not None:
+            at = len(tokenizer.decode(ids[:i]))
+            print(f"  mmmllm: {text[max(0, at - 40):at + 40]!r}\n  mlx-lm: {tokenizer.decode(ids)[max(0, at - 40):at + 40]!r}")
+    print(f"correctness: {exact}/{len(PROMPTS)} bit-exact (every step's logits), {same}/{len(PROMPTS)} identical text")
+    del model  # mlx-lm's benchmark below loads it again in its own process
+    import gc, mlx.core as mx
+    gc.collect()
+    mx.clear_cache()
+
+
 def compare(args):
     try:
         md.version("mlx-lm")
@@ -64,14 +134,20 @@ def compare(args):
     args = ["-p", "512", "-g", "128", "-b", "1", "-n", "3", *args]  # later flags win in both tools
     path = local(model)
     ver = md.version("mmmllm") if BIN.parent == HERE else "source " + sh("git", "-C", HERE, "describe", "--always", "--dirty")
+    import mlx.core as mx
     print("== machine")
-    print(f"chip:   {sh('sysctl', '-n', 'machdep.cpu.brand_string')}, {int(sh('sysctl', '-n', 'hw.memsize')) >> 30} GB")
+    print(f"chip:   {sh('sysctl', '-n', 'machdep.cpu.brand_string')} ({mx.device_info()['architecture']}), "
+          f"{int(sh('sysctl', '-n', 'hw.memsize')) >> 30} GB")
     print(f"macOS:  {sh('sw_vers', '-productVersion')} ({sh('sw_vers', '-buildVersion')})")
     print(f"mmmllm: {ver}, mlx {md.version('mlx')}, mlx-lm {md.version('mlx-lm')}")
     print("load:   %.2f %.2f %.2f (a busy machine moves the numbers; top CPU users:)" % os.getloadavg())
-    print("\n".join(sh("ps", "-Ao", "pcpu,comm", "-r").splitlines()[1:4]))
+    for line in sh("ps", "-Ao", "pcpu,comm", "-r").splitlines()[1:4]:
+        cpu, comm = line.split(None, 1)
+        print(f"{cpu:>6} {Path(comm).name}")
     print(f"args:   {model} {' '.join(args)}")
-    print("\n== mmmllm")  # first: an unsupported GPU fails here, before the baseline's minutes
+    print("\n== correctness (greedy 64 tokens: each step's logits and the text, mmmllm vs mlx-lm)")  # first: fails fast, as does an unsupported GPU
+    correctness(path)
+    print("\n== mmmllm")
     ours = tee([str(BIN), "bench", path, *args])
     print("\n== mlx-lm")
     base = tee([sys.executable, "-m", "mlx_lm", "benchmark", "--model", path, *args])

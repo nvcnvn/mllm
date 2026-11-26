@@ -3,9 +3,14 @@ my mac mini llm: an LLM serving engine in C++/Metal, built for (and on) an Apple
 Bit-exact with mlx-lm at batch 1, ~1.05x its prefill; numbers in [reports/mlx-lm baseline.md](reports/mlx-lm%20baseline.md)
 and [docs/target-27b.md](docs/target-27b.md).
 
-**Runs on:** macOS 15+, M4 / M4 Pro GPUs (other chips stop with "dispatch rules not ported": the kernel choices are
-copied from MLX for the M4 family only). **Models:** Qwen3.5 / Qwen3.6 in mlx-community 4-bit, e.g.
+**Runs on:** macOS 15+, Apple M1 to M4 GPUs including Pro / Max / Ultra: kernel and tile choices follow MLX's rules
+for each chip (src/gpu_rules.h), so results stay bit-exact with mlx-lm there; tested on an M4 Pro, the others await
+reports (see below). M5 stops with a clear message (MLX's neural-accelerator kernels aren't ported). **Models:** Qwen3.5 / Qwen3.6 in mlx-community 4-bit, e.g.
 `mlx-community/Qwen3.5-0.8B-4bit`, `mlx-community/Qwen3.6-27B-4bit` (32 GB+ Mac).
+**Memory:** the KV cache (arena), max context and serve's max batch shrink to what the GPU may use (Metal's
+recommended working set: ~72% of RAM on 8 / 16 / 24 GB Macs, ~87% at 64 GB) and a model that can't fit stops before loading, with a clear message.
+Which model: the 0.8B (0.4 GB of weights) on any Mac; `mlx-community/Qwen3.5-9B-4bit` (5 GB; bit-exact with mlx-lm)
+on 16 / 24 GB; the 27B (15 GB) on 32 GB+. `MLLM_GPU_BUDGET_GB=11.5` tries a 16 GB Mac's limit.
 
 ## Use
 
@@ -39,16 +44,22 @@ prompts 191 vs 131 tok/s, and decode next to a long prefill keeps 12 tok/s inste
 uvx --python 3.13 --from 'mmmllm[ane]' mmmllm chat mlx-community/Qwen3.6-27B-4bit --prefill ane
 ```
 
-## Verify the benchmark on your Mac
+## Help test on your Mac
+
+Install [uv](https://docs.astral.sh/uv/) (`brew install uv`, or `curl -LsSf https://astral.sh/uv/install.sh | sh`),
+close other apps, then:
 
 ```sh
-uvx --from 'mmmllm[compare]' mmmllm compare                         # 0.8B, -p 512 -g 128 -b 1 -n 3
-uvx --from 'mmmllm[compare]' mmmllm compare MODEL -p 2048 -b 8       # flags go to both tools
+uvx --python 3.12 --from 'mmmllm[compare]==0.4.0rc1' mmmllm compare
 ```
 
-It runs our `bench` and `mlx_lm benchmark` (same fields) with the same settings and prints both and the ratio.
-Absolute tok/s depends on the chip, so compare the ratio, and close other apps first: it prints the load and the top
-CPU users because a busy machine moves the numbers by several percent. Please open an issue with the whole output.
+It runs both engines greedily on 3 fixed prompts and checks every step's logits against mlx-lm's, bit for bit
+(`prompt k: bit-exact`, or the largest difference and the first step that differs; then
+`correctness: k/3 bit-exact`). Then it runs our `bench` and `mlx_lm benchmark` with the same settings (0.8B,
+`-p 512 -g 128 -b 1 -n 3`; add `MODEL` and flags after `compare`, both tools get them) and prints the speed ratio.
+Absolute tok/s depends on the chip, so compare the ratio. It prints the load and the top CPU users because a busy
+machine moves the numbers by several percent. Please paste the whole output into a
+[chip report](https://github.com/nvcnvn/mmmllm/issues/new?template=chip-report.md).
 
 ## From source
 

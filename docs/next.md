@@ -24,8 +24,9 @@ So people can try it with the tools they already have. Every item ends in a **Ch
   `client.completions.create(...)` without `stream`.
 - [x] `stop` sequences (a string or up to 4; the request is cancelled at the match). **Check:** generation ends before the stop string, which isn't returned.
 - [x] Usage text says `mmmllm`, not `mllm`, when run through the package.
-- [ ] More GPUs: port MLX's dispatch rules for M1–M3 and the M4 Max (`GpuOps: dispatch rules not ported`).
-  **Check:** `mmmllm compare` on each, golden test bit-exact. Open: needs those chips (or testers with them).
+- [x] More GPUs: MLX v0.32.4's dispatch rules for M1-M4 incl. Pro / Max / Ultra (src/gpu_rules.h, M5 refused).
+  **Check:** golden tests bit-exact under each rule set by emulation (`MLX_METAL_GPU_ARCH`); `mmmllm compare`
+  checks every step's logits against mlx-lm on testers' chips (chip-report issues).
 - [ ] `/v1/completions` `text` drops the reply's leading space (the Detokenizer strips it on purpose, as mlx-lm does), so
   a client that continues with prompt + text retokenizes differently and misses the prefix cache's tail. Fixing it needs
   a per-request keep-leading-space flag from the server through `Engine::submit`.

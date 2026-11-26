@@ -15,6 +15,8 @@
 
 #include <unistd.h>
 
+#include "budget.h"
+#include "safetensors.h"
 #include "engine.h"
 #include "lanes.h"
 #include "server.h"
@@ -347,21 +349,60 @@ void GpuOpsTest::bench_ops(const std::string& model_name) {
 
 }  // namespace mllm
 
-// ENGINE: --arena-gib (0: the command's default) and --max-ctx, for generate / bench / serve
+// ENGINE: --arena-gib and --max-ctx, for generate / chat / bench / serve (0: not given)
 static double arena_gib = 0;
-static int max_context = 16384;
+static int max_context = 0;
 static const char* program_name = "mllm";  // argv[0]'s name: mmmllm through the package
-static size_t arena_bytes(double default_gib) { return (size_t)((arena_gib ? arena_gib : default_gib) * (1 << 30)); }
 // prefill chunk: ANE blocks run 1024-token chunks (1.5x GPU prefill at 27B vs 1.3x at 512,
 // target-27b.md §5; shorter ones run the 512 block). Fixed at 1024 for this project's M4 Pro (user, 2026-11-25).
 static int prefill_chunk(const std::string& prefill_on) {
     return prefill_on == "ane" ? 1024 : 512;
 }
 
-// mllm generate: the prompt as one user message (chat template), text streamed to stdout
+// The engine's sizes on this Mac (budget.h): the flags given, the rest the defaults shrunk to fit the GPU's working
+// set ($MLLM_GPU_BUDGET_GB in GB overrides it, to try a smaller Mac's). Defaults by unit size: 2 MiB units (27B) get
+// target-27b.md's 12 GiB arena and max_ctx 32k, smaller models the command's arena and 16k. Throws before loading.
+static mllm::EngineSizes fit(const std::string& model, const std::string& prefill_on, double default_gib,
+                             int max_batch, bool batch_given) {
+    const mllm::ModelSpec spec = mllm::spec::load(model);
+    const size_t unit = mllm::Memory::unit_of(spec);
+    const bool big = unit >= (2u << 20);
+    size_t weights = 0;  // what Weights loads (the headers only are read here)
+    for (const auto& [name, tensor] : mllm::Safetensors(spec.path).tensors)
+        if (name.starts_with("language_model.")) weights += tensor.nbytes;
+    id<MTLDevice> device = MTLCreateSystemDefaultDevice();
+    size_t budget = device.recommendedMaxWorkingSetSize;
+    if (const char* budget_gb = getenv("MLLM_GPU_BUDGET_GB")) {
+        char* end;
+        const double gb = strtod(budget_gb, &end);
+        if (end == budget_gb || *end || !(gb > 0 && gb < 1e6))
+            throw std::invalid_argument(std::string("MLLM_GPU_BUDGET_GB: a positive number of GB, not '") + budget_gb + "'");
+        budget = (size_t)(gb * 1e9);
+    }
+    const mllm::MemoryPlan plan = mllm::plan_memory(
+        spec, mllm::gpu_class(device.architecture.name.UTF8String), prefill_chunk(prefill_on), prefill_on == "ane",
+        weights, unit, mllm::Memory::state_units_of(spec), budget,
+        {(size_t)((big ? 12 : default_gib) * (1 << 30)), big ? 32768 : 16384, max_batch},
+        {(size_t)(arena_gib * (1 << 30)), max_context, batch_given ? max_batch : 0});
+    if (!plan.error.empty()) throw std::runtime_error(plan.error);
+    if (!plan.lowered.empty())
+        fprintf(stderr, "%s: %s, to fit this Mac's GPU (%.1f GB usable)\n", program_name, plan.lowered.c_str(),
+                budget / 10 * 9 / 1e9);
+    return plan.sizes;
+}
+
+// mllm generate: the prompt as one user message (chat template), text streamed to stdout. logits_path: each decode
+// step's logits, vocab_size bf16 a step, appended raw (mmmllm compare checks them against mlx-lm's)
 static void generate(const std::string& model, const std::string& prompt, mllm::GenParams params,
-                     const std::string& prefill_on, bool prefix_cache) {
-    mllm::Engine engine(model, arena_bytes(1), prefill_chunk(prefill_on), 32, 16, max_context, prefill_on, prefix_cache);
+                     const std::string& prefill_on, bool prefix_cache, const std::string& logits_path) {
+    const mllm::EngineSizes sizes = fit(model, prefill_on, 1, 16, false);
+    mllm::Engine engine(model, sizes.arena, prefill_chunk(prefill_on), 32, sizes.max_batch, sizes.max_context,
+                        prefill_on, prefix_cache);
+    std::unique_ptr<FILE, int (*)(FILE*)> logits(logits_path.empty() ? nullptr : fopen(logits_path.c_str(), "wb"),
+                                                 fclose);
+    if (!logits_path.empty() && !logits) throw std::runtime_error("can't write " + logits_path);
+    if (logits)
+        engine.gpu.on_scores = [&](const uint16_t* scores, size_t count) { fwrite(scores, 2, count, logits.get()); };
     engine.generate({{"user", prompt}}, params, [](const std::string& text) {
         fputs(text.c_str(), stdout);
         fflush(stdout);
@@ -399,7 +440,9 @@ static Reply stream_reply(mllm::Engine& engine, int request_id) {
 
 static void chat(const std::string& model, mllm::GenParams params, bool default_max_tokens,
                  const std::string& prefill_on, bool prefix_cache) {
-    mllm::Engine engine(model, arena_bytes(1), prefill_chunk(prefill_on), 32, 16, max_context, prefill_on, prefix_cache);
+    const mllm::EngineSizes sizes = fit(model, prefill_on, 1, 16, false);
+    mllm::Engine engine(model, sizes.arena, prefill_chunk(prefill_on), 32, sizes.max_batch, sizes.max_context,
+                        prefill_on, prefix_cache);
     const bool tty = isatty(0);
     if (tty) fprintf(stderr, "%s chat: Ctrl-C stops a reply, Ctrl-D quits\n", program_name);
     std::vector<int> history;  // the last prompt and its reply
@@ -499,7 +542,9 @@ static Trial run_trial(mllm::Engine& engine, const std::vector<std::vector<int>>
 
 static void bench(const std::string& model, int prompt_tokens, int generation_tokens, int batch_size, int trials,
                   const std::string& prefill_on, int stream_tokens, bool prefix_cache) {
-    mllm::Engine engine(model, arena_bytes(1), prefill_chunk(prefill_on), 32, 16, max_context, prefill_on, prefix_cache);
+    const mllm::EngineSizes sizes = fit(model, prefill_on, 1, 16, false);
+    mllm::Engine engine(model, sizes.arena, prefill_chunk(prefill_on), 32, sizes.max_batch, sizes.max_context,
+                        prefill_on, prefix_cache);
     engine.tokenizer.eos.clear();  // as mlx_lm.benchmark: never stop early
     std::mt19937 rng(0);
     std::uniform_int_distribution<int> random_token(0, engine.spec.vocab_size - 1);
@@ -530,8 +575,11 @@ static void bench(const std::string& model, int prompt_tokens, int generation_to
 }
 
 // mllm serve: /v1/completions on 127.0.0.1 until killed. A 2 GiB arena: 32 requests of 512 + 256 tokens need 0.9.
-static int serve(const std::string& model, int port, const std::string& prefill_on, int max_batch, bool prefix_cache) {
-    mllm::Engine engine(model, arena_bytes(2), prefill_chunk(prefill_on), 32, max_batch, max_context, prefill_on,
+static int serve(const std::string& model, int port, const std::string& prefill_on, int max_batch, bool batch_given,
+                 bool prefix_cache) {
+    const mllm::EngineSizes sizes = fit(model, prefill_on, 2, max_batch, batch_given);
+    max_batch = sizes.max_batch;
+    mllm::Engine engine(model, sizes.arena, prefill_chunk(prefill_on), 32, max_batch, sizes.max_context, prefill_on,
                         prefix_cache);
     mllm::Server server(engine, model);
     fprintf(stderr, "%s serve: http://127.0.0.1:%d/v1 (chat/completions, completions; prefill on %s, max batch %d, "
@@ -543,7 +591,8 @@ static int serve(const std::string& model, int port, const std::string& prefill_
 static int usage() {
     fprintf(stderr,
             "usage: %1$s MODEL                                print the model spec\n"
-            "       %1$s generate MODEL PROMPT [--max-tokens N] [--temp T] [--top-p P] [PREFILL]\n"
+            "       %1$s generate MODEL PROMPT [--max-tokens N] [--temp T] [--top-p P] [--logits FILE] [PREFILL]\n"
+            "         --logits FILE: each step's logits (vocab bf16 a step) appended to FILE\n"
             "       %1$s chat MODEL [--max-tokens N] [--temp T] [--top-p P] [PREFILL]   multi-turn chat in the terminal\n"
             "       %1$s bench MODEL [-p 512] [-g 1024] [-b 1] [-n 5] [--stream P] [PREFILL]   mlx_lm.benchmark's\n"
             "         fields; --stream P: a P-token prefill runs alongside throughout, its own tok/s reported\n"
@@ -555,13 +604,14 @@ static int usage() {
             "         layer at a time (Core ML blocks: mmmllm[ane] builds them first), 1024-token chunks\n"
             "         [--prefix-cache on|off]: reuse prompt prefixes across requests (default on; off for bench, whose\n"
             "         trials repeat the same prompts)\n"
-            "ENGINE (generate, bench, serve): [--arena-gib G] (default 1, serve 2; 12 at 2 MiB units, the 27B)\n"
-            "         [--max-ctx N] (default 16384; 32768 at 2 MiB units)\n", program_name);
+            "ENGINE (generate, chat, bench, serve): [--arena-gib G] (default 1, serve 2; 12 at 2 MiB units, the 27B)\n"
+            "         [--max-ctx N] (default 16384; 32768 at 2 MiB units); defaults (and serve's max batch) lowered to\n"
+            "         fit the GPU's working set\n", program_name);
     return 2;
 }
 
 // Runs one command; its flags after the positional arguments, each taken out of flags as it is read
-static int run_command(int argc, char** argv, int positional_count, std::map<std::string, std::string>& flags) {
+static int run_command(int argc, char** argv, std::map<std::string, std::string>& flags) {
     const std::string command = argv[1];
     auto take_flag = [&](const char* name, const char* default_value) {
         auto found = flags.find(name);
@@ -574,20 +624,17 @@ static int run_command(int argc, char** argv, int positional_count, std::map<std
         if (value != "on" && value != "off") throw std::invalid_argument("--prefix-cache: on or off, not " + value);
         return value == "on";
     };
-    // defaults by unit size: 2 MiB units (27B) get target-27b.md's budget, a 12 GiB arena and max_ctx 32k; smaller
-    // models keep 0 (the command's default arena) and 16k
-    const bool big = positional_count >= 3 && command != "bench-ops" &&
-                     mllm::Memory::unit_of(mllm::spec::load(argv[2])) >= (2u << 20);
-    arena_gib = std::stod(take_flag("--arena-gib", big ? "12" : "0"));
-    max_context = std::stoi(take_flag("--max-ctx", big ? "32768" : "16384"));
-    if (arena_gib < 0 || max_context < 1) return usage();
+    arena_gib = std::stod(take_flag("--arena-gib", "0"));
+    max_context = std::stoi(take_flag("--max-ctx", "0"));
+    if (arena_gib < 0 || max_context < 0) return usage();
     if (command == "generate") {
         mllm::GenParams params{std::stoi(take_flag("--max-tokens", "256")), std::stof(take_flag("--temp", "0")),
                                std::stof(take_flag("--top-p", "0"))};
         const std::string prefill_on = take_flag("--prefill", "gpu");
         const bool prefix_cache = take_prefix_cache("on");
+        const std::string logits_path = take_flag("--logits", "");
         if (!flags.empty()) return usage();
-        generate(argv[2], argv[3], params, prefill_on, prefix_cache);
+        generate(argv[2], argv[3], params, prefill_on, prefix_cache, logits_path);
     } else if (command == "chat") {
         const bool default_max_tokens = !flags.count("--max-tokens");
         mllm::GenParams params{std::stoi(take_flag("--max-tokens", "1")), std::stof(take_flag("--temp", "0")),
@@ -607,11 +654,12 @@ static int run_command(int argc, char** argv, int positional_count, std::map<std
             return usage();
         bench(argv[2], prompt_tokens, generation_tokens, batch_size, trials, prefill_on, stream_tokens, prefix_cache);
     } else if (command == "serve") {
+        const bool batch_given = flags.count("--max-batch");
         const int port = std::stoi(take_flag("--port", "8080")), max_batch = std::stoi(take_flag("--max-batch", "32"));
         const std::string prefill_on = take_flag("--prefill", "gpu");
         const bool prefix_cache = take_prefix_cache("on");
         if (!flags.empty() || max_batch < 1) return usage();
-        return serve(argv[2], port, prefill_on, max_batch, prefix_cache);
+        return serve(argv[2], port, prefill_on, max_batch, batch_given, prefix_cache);
     } else if (command == "bench-ops") {
         if (!flags.empty()) return usage();
         mllm::GpuOpsTest::bench_ops(argv[2]);
@@ -636,7 +684,7 @@ int main(int argc, char** argv) {
     if (argc < positional_count || (argc - positional_count) % 2) return usage();
     for (int i = positional_count; i < argc; i += 2) flags[argv[i]] = argv[i + 1];
     try {
-        return run_command(argc, argv, positional_count, flags);
+        return run_command(argc, argv, flags);
     } catch (const std::exception& e) {
         fprintf(stderr, "%s: %s\n", program_name, e.what());
         return 1;

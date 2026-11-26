@@ -5,9 +5,12 @@
 #import <Metal/Metal.h>
 
 #include <cassert>
+#include <functional>
+#include <map>
 #include <random>
 #include <thread>
 
+#include "gpu_rules.h"
 #include "memory.h"
 
 namespace mllm {
@@ -61,6 +64,8 @@ public:
     // next_tokens, after that command buffer completed: ws.next_token_ids' request_count tokens.
     void pick_next_tokens(Workspace& ws, const std::vector<SampleParams>& params = {});
     std::vector<int> next_tokens(const Workspace& ws) const;
+    // set: next_tokens hands it the step's scores too, request_count rows of vocab_size bf16 (generate --logits)
+    std::function<void(const uint16_t* scores, size_t count)> on_scores;
     // bf16 scores [rows = params.size(), vocab_size] -> int32 token per row (sample.metal): temperature 0 = argmax;
     // else top_p, then a draw seeded from the row's rng (one 64-bit draw per call, so a request's tokens follow its seed).
     void sample_tokens(Buf scores, Buf output, int vocab_size, const std::vector<SampleParams>& params);
@@ -174,8 +179,11 @@ private:
     id<MTLComputePipelineState> conv_kernel, conv_and_normalize_kernel, scale_query_key_kernel, decay_and_update_rate_kernel,
         decay_and_update_rate_bf16_kernel, gated_delta_kernel, sample_kernel, feed_tokens_kernel;
     // the fallback's bf16 multiply variants: multiply_few_rows_bf16 [rows per pass 3/4/5][16 / 32 lanes along the
-    // inner size]; multiply_tiles_bf16 [second transposed / not][aligned rows][aligned columns][aligned inner size]
-    id<MTLComputePipelineState> multiply_few_rows_bf16[3][2], multiply_tiles_bf16[2][2][2][2];
+    // inner size]; multiply_tiles_bf16: steel_gemm_fused by name + aligned rows / columns / inner bits, made on first use
+    id<MTLComputePipelineState> multiply_few_rows_bf16[3][2];
+    std::map<std::string, id<MTLComputePipelineState>> multiply_tiles_bf16;
+    GpuClass gpu;       // MLX's device class: picks kernels and tiles (gpu_rules.h)
+    int two_pass_from;  // sdpa_vector_2pass from this many keys
     id<MTLComputePipelineState> pipeline(NSString* name, std::initializer_list<std::pair<int, bool>> constants);
     // MLX's bf16 multiply for the attention fallback over the (key_value head, repeat) batches: steel_gemm_fused
     // (second transposed or not) or gemv_wide (second transposed, rows 2..15). *_batch_strides: over

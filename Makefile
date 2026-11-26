@@ -54,7 +54,7 @@ test: all
 	@for t in $(TESTS); do echo "== $$t"; $$t || exit 1; done
 
 # CI (GitHub-hosted macOS VMs): only tests that need no model, golden data, GPU or ANE
-CI_TESTS := $(B)/tests/test_arena $(B)/tests/test_prefix_cache $(B)/tests/test_memory_fuzz
+CI_TESTS := $(B)/tests/test_gpu_rules $(B)/tests/test_budget $(B)/tests/test_arena $(B)/tests/test_prefix_cache $(B)/tests/test_memory_fuzz
 test-ci: all
 	@for t in $(CI_TESTS); do echo "== $$t"; $$t || exit 1; done
 
