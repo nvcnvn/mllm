@@ -42,6 +42,15 @@
   gate[dst] = qg[src + n.x];
 }
 
+// mx.concatenate([first, second], -1) of two [rows, W] -> out [rows, 2W] (the MTP head's fc input). Grid: (2W, rows).
+[[kernel]] void concat_rows(const device bfloat16_t* first [[buffer(0)]], const device bfloat16_t* second [[buffer(1)]],
+                            device bfloat16_t* out [[buffer(2)]], uint2 i [[thread_position_in_grid]],
+                            uint2 n [[threads_per_grid]]) {
+  const uint width = n.x / 2;
+  const size_t row = size_t(i.y) * width;
+  out[size_t(i.y) * n.x + i.x] = i.x < width ? first[row + i.x] : second[row + i.x - width];
+}
+
 // gpu.py: o.transpose(0, 2, 1, 3).reshape(B, S, H * D) * mx.sigmoid(gate), each op rounded to bf16 as MLX does.
 // ao [B, H, S, D] -> o [B, S, H * D]. Grid (D, H, B * S).
 [[kernel]] void sigmoid_gate(

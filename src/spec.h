@@ -11,6 +11,9 @@ struct ModelSpec {
     int hidden, vocab_size;
     int query_heads, key_value_heads, head_dim;  // full attention
     int linear_key_heads, linear_value_heads, linear_key_dim, linear_value_dim, conv_kernel;  // Gated DeltaNet
+    // tools/spec/mtp.py wrote the MTP draft head's weights into weights_dir/mtp/: one more full-attention layer, its K/V in
+    // every page unit after the model's full layers (docs/speculative.md)
+    bool mtp = false;
 
     int n_layers() const { return (int)kinds.size(); }
     std::vector<int> full_layers() const { return layers_of("full"); }
@@ -29,6 +32,8 @@ ModelSpec load(const std::string& model);
 std::string cache_dir();
 // Mirrors ane.py _model_key (lives here until ane is ported): cache dir name unique to these weights (resolved path + size/mtime of config and weights).
 std::string model_key(const std::string& path);
+// <cache>/weights/<model_key>-v3: the weights as GpuOps reads them (memory.mm aligned_weight_files) and mtp/mtp.safetensors
+std::string weights_dir(const std::string& path);
 }  // namespace spec
 
 }  // namespace mllm

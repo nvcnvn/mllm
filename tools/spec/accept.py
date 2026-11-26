@@ -154,7 +154,7 @@ def mtp_chains(mtp, model, seq, hidden, P, kmax):
                 o = mtp(embed(mx.array([drafts[-1]]))[None], o, ch)
                 drafts.append(head(o[0]).item())
         D[c] = drafts
-    return D
+    return D, o1, (K[..., : S - 1, :], V[..., : S - 1, :])  # tools/spec/mtp.py keeps step 1's outputs and K/V
 
 
 def replay(match, P, S, k):
@@ -190,7 +190,7 @@ def main():
         A = draft_argmax(draft, seq, P)  # A[c - P] predicts seq[c + 1]
         drafts = {"0.8b": lambda c, j: A[c - P + j] == seq[c + 1 + j]}
         for label, mtp in (("mtp-bf16", mtp16), ("mtp-q4", mtp4)):
-            D = mtp_chains(mtp, model, seq, hidden, P, KMAX)
+            D, _, _ = mtp_chains(mtp, model, seq, hidden, P, KMAX)
             drafts[label] = lambda c, j, D=D: j < len(D[c]) and D[c][j] == seq[c + 1 + j]
         for label, match in drafts.items():
             r[label] = {}

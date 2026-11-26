@@ -64,6 +64,7 @@ ModelSpec load(const std::string& model) {
     spec.linear_key_dim = text.at("linear_key_head_dim");
     spec.linear_value_dim = text.at("linear_value_head_dim");
     spec.conv_kernel = text.at("linear_conv_kernel_dim");
+    spec.mtp = fs::exists(weights_dir(path) + "/mtp/mtp.safetensors");
     return spec;
 }
 
@@ -74,6 +75,8 @@ std::string cache_dir() {
     if (!home) throw std::runtime_error("set MLLM_CACHE");
     return std::string(home) + "/Library/Caches/mllm";
 }
+
+std::string weights_dir(const std::string& path) { return cache_dir() + "/weights/" + model_key(path) + "-v3"; }
 
 std::string model_key(const std::string& path) {
     fs::path dir = fs::canonical(path);

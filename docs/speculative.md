@@ -1,4 +1,4 @@
-# Speculative decoding at 27B: measured, not built (g21)
+# Speculative decoding at 27B: measured (g21), being built (g22: the draft head)
 
 **Verdict:** worth building. Use the 27B's own MTP head, quantized to 4 bits, with k = 2 draft tokens. The *estimate*
 is ~30 tok/s greedy at B = 1, about 2.0x today's 15.3. A third draft token only pays once 4-row verify is cheaper.
@@ -108,6 +108,23 @@ tok/s = tokens per verify / (verify(k + 1) + k × draft + k × 0.65 ms state che
    - A multi-row qmv kernel to make 4-row verify cheap, then k = 3.
    - A draft lm_head over the most frequent ~32k tokens (~4 ms to ~1.3 ms per draft step).
    - B > 1: verify rows of several requests in one pass.
+
+## In the engine so far (g22: steps 1-3)
+- **Weights.** `tools/spec/mtp.py weights` writes `<weights cache>/mtp/mtp.safetensors` (31 tensors, 0.239 GB; HF's
+  `mtp.*` names). It's a subdirectory because released versions glob `*.safetensors` in the cache dir. The file equals
+  `accept.py`'s 4-bit head byte for byte, and `test_weights` checks the engine's GPU read-back against its hashes.
+  `ModelSpec::mtp` is set when the file exists; without it (0.8B, other models) nothing changes.
+- **K/V.** The head is one more full layer in the unit, after the model's: 27B unit 2048 -> 2176 KiB (+6.25%), 73 -> 70
+  units per state slot. Prefill now also runs the last layer's rest and the final norm, then the head over every row
+  with the next prompt token (`PrefillWork::next_token`). Prefill at 2048 tokens: 124.0 vs 129.7 tok/s without the head
+  (-4.4%, 3 interleaved pairs; decode 14.88 vs 15.00, noise). The plan's 1.6% left out the last layer's o_proj + FFN.
+- **Drafting.** `GpuOps::draft_tokens` (k = 2, argmax fed on the GPU, one command buffer): 8.4 ms after 2-3 accepted
+  rows, 10.0 ms after 1 (bench-ops "speculative draft").
+- **Checks** (`tests/test_mtp.mm`, 27B, three golden prompts + 128 greedy tokens): the head alone on MLX's hidden states
+  gives K/V bit-exact with MLX; the head's K/V from the engine's own prefill: cos >= 0.99988; drafts equal `accept.py`'s
+  on 723 of 725 (99.72%); step 1's scores within 0.25 at 24 rows. The 27B golden suite stays bit-exact with the head.
+- **Not yet:** plain decode doesn't write the head's K/V for decoded positions (a prefix-cache entry after a
+  non-speculative reply has it for the prompt only).
 
 ## Risks
 - Verify cost past 3 rows is kernel-bound (above). k = 2 is the safe choice until that kernel changes.

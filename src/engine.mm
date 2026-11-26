@@ -32,9 +32,9 @@ Engine::Engine(const std::string& model, size_t arena_bytes, int chunk, int page
     mem.freeze();
     size_t weight_bytes = 0;
     for (id<MTLBuffer> buffer : weights.buffers) weight_bytes += buffer.length;
-    fprintf(stderr, "mllm: weights %.2f GB, arena %.2f GiB (%u units of %zu KiB, %u per state slot), workspace %.1f MiB "
+    fprintf(stderr, "mllm: weights %.2f GB, arena %.2f GiB (%u units of %zu KiB%s, %u per state slot), workspace %.1f MiB "
             "(chunk %d, max batch %d, max_ctx %d)\n", weight_bytes / 1e9, mem.arena_buffer.length / double(1 << 30),
-            mem.arena.n_units, mem.arena.unit_bytes >> 10, mem.state_units,
+            mem.arena.n_units, mem.arena.unit_bytes >> 10, mem.spec.mtp ? " with the MTP head's K/V" : "", mem.state_units,
             (mem.allocated - mem.arena_buffer.length) / double(1 << 20), chunk, max_batch, max_context);
 }
 
@@ -195,7 +195,7 @@ bool Engine::submit_prefill_chunks() {
         r.in_flight++, submitted = true;
         try {
             prefill.submit({r.id, std::vector<int>(r.prompt.begin() + r.sent, r.prompt.begin() + end), r.sent, r.pages,
-                            r.state_slots});
+                            r.state_slots, r.prompt[end]});
         } catch (...) {
             abort_failed_chunk(r);
             throw;

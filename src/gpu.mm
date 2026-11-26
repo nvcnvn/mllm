@@ -120,9 +120,20 @@ GpuOps::GpuOps(Memory& mem, const Weights& weights) : spec(mem.spec), mem(mem), 
     lm = weights.st.tensors.count("language_model.lm_head.weight") ? quantized_weights(weights, "language_model.lm_head")
                                                                    : embed_tokens;
     final_norm = tensor(weights, model + "norm.weight");
-    for (int i = 0, full_layers_so_far = 0; i < spec.n_layers(); i++)
-        layers.push_back(load_layer(weights, i, full_layers_so_far));
-    for (Layer& layer : layers) {
+    for (int i = 0, full_layers_so_far = 0; i < spec.n_layers(); i++) {
+        const bool linear = spec.kinds[i] == "linear";
+        layers.push_back(load_layer(weights, model + "layers." + std::to_string(i) + ".", linear));
+        if (!linear) layers.back().full_index = full_layers_so_far++;
+    }
+    if (spec.mtp) {  // tools/spec/mtp.py's names (HF's): its layer's keys / values after the model's full layers
+        mtp_layer = load_layer(weights, "mtp.layers.0.", false);
+        mtp_layer.full_index = (int)spec.full_layers().size();
+        mtp_fc = quantized_weights(weights, "mtp.fc");
+        mtp_norm_embedding = tensor(weights, "mtp.pre_fc_norm_embedding.weight");
+        mtp_norm_hidden = tensor(weights, "mtp.pre_fc_norm_hidden.weight");
+        mtp_norm = tensor(weights, "mtp.norm.weight");
+    }
+    auto merge = [](Layer& layer) {
         if (layer.is_linear)
             layer.merged_linear_projections =
                 merged_weights({&layer.query_key_value_projection, &layer.output_gate_projection,
@@ -131,7 +142,9 @@ GpuOps::GpuOps(Memory& mem, const Weights& weights) : spec(mem.spec), mem(mem), 
             layer.merged_query_key_value =
                 merged_weights({&layer.query_projection, &layer.key_projection, &layer.value_projection});
         layer.merged_gate_up = merged_weights({&layer.feed_forward_gate, &layer.feed_forward_up});
-    }
+    };
+    for (Layer& layer : layers) merge(layer);
+    if (spec.mtp) merge(mtp_layer);
 
     one_bf16 = mem.buffer(ELEM);
     *(uint16_t*)one_bf16.contents = 0x3F80;  // bf16 1.0
@@ -163,6 +176,7 @@ void GpuOps::load_kernels() {
     activate_gate_kernel = pipeline(@"swiglu");
     activate_gate_precise_kernel = pipeline(@"precise_swiglu");
     split_query_gate_kernel = pipeline(@"split_q_gate");
+    concat_rows_kernel = pipeline(@"concat_rows");
 
     // full attention: kernel names fix head_dim 256 (bf16)
     if (!spec.full_layers().empty() && spec.head_dim != 256)
@@ -200,14 +214,13 @@ void GpuOps::load_kernels() {
                 [NSString stringWithFormat:@"gemv_wide_bfloat16_nv%d_kl%d", 3 + rows, 16 << wide], {{0, true}, {1, false}});
 }
 
-// Layer i's weights, each field from its model-file key (docs/glossary.md maps one to the other)
-GpuOps::Layer GpuOps::load_layer(const Weights& weights, int i, int& full_layers_so_far) {
-    const std::string prefix = "language_model.model.layers." + std::to_string(i) + ".";
+// The weights of the layer at prefix ("language_model.model.layers.<i>."), each field from its model-file key
+// (docs/glossary.md maps one to the other); the caller sets full_index
+GpuOps::Layer GpuOps::load_layer(const Weights& weights, const std::string& prefix, bool is_linear) {
     auto tensor_at = [&](const std::string& name) { return tensor(weights, prefix + name); };
     auto weights_at = [&](const std::string& name) { return quantized_weights(weights, prefix + name); };
     Layer layer{};
-    layer.is_linear = spec.kinds[i] == "linear";
-    if (!layer.is_linear) layer.full_index = full_layers_so_far++;
+    layer.is_linear = is_linear;
     layer.attention_norm = tensor_at("input_layernorm.weight");
     layer.feed_forward_norm = tensor_at("post_attention_layernorm.weight");
     layer.feed_forward_gate = weights_at("mlp.gate_proj");
@@ -247,8 +260,9 @@ Workspace GpuOps::workspace(int chunk, int max_batch, int max_ctx) {
     ws.normalized = mem.buffer(row_bytes * spec.hidden);
     ws.projected = mem.buffer(row_bytes * spec.hidden);
     // merge_projections: the one-row merged outputs land in ws.gate_values, ws.query_and_gate and ws.query_key_value
-    // (max_rows may be 1)
-    ws.gate_values = mem.buffer(std::max(row_bytes * layers[0].feed_forward_gate.out_size, layers[0].merged_gate_up.out_size * ELEM));
+    // (max_rows may be 1); apply_mtp's fc input [rows, 2 * hidden] too
+    ws.gate_values = mem.buffer(std::max({row_bytes * layers[0].feed_forward_gate.out_size, layers[0].merged_gate_up.out_size * ELEM,
+                                          spec.mtp ? row_bytes * 2 * spec.hidden : 0}));
     ws.up_values = mem.buffer(row_bytes * layers[0].feed_forward_gate.out_size);
     size_t merged_query_key_value_size = 0, merged_linear_size = 0;
     for (const Layer& layer : layers) {
@@ -438,6 +452,48 @@ void GpuOps::apply_weights(int i, Workspace& ws) {
         return;
     }
     start_layer(layers[i], ws, rows);
+}
+
+// tools/spec/accept.py MTP: norm(layer(fc(concatenate([pre_fc_norm_embedding(embed(token)), pre_fc_norm_hidden(hidden)]))))
+void GpuOps::apply_mtp(Workspace& ws, Buf hidden, Buf token_ids) {
+    begin(ws);
+    const int rows = ws.request_count * ws.tokens_per_request, width = spec.hidden;
+    assert(spec.mtp && ws.request_count == 1 && rows > 0 && rows <= ws.max_rows);
+    look_up_embeddings(token_ids, {ws.projected}, rows);
+    if (rows == 1) {  // one row is already [first | second]
+        normalize(mtp_norm_embedding, {ws.projected}, {ws.gate_values}, 1, width);
+        normalize(mtp_norm_hidden, hidden, {ws.gate_values, width * ELEM}, 1, width);
+    } else {
+        normalize(mtp_norm_embedding, {ws.projected}, {ws.normalized}, rows, width);
+        independent = true, normalize(mtp_norm_hidden, hidden, {ws.after_attention}, rows, width);
+        [encoder setComputePipelineState:concat_rows_kernel];
+        set_buffer(encoder, {ws.normalized}, 0), set_buffer(encoder, {ws.after_attention}, 1);
+        set_buffer(encoder, {ws.gate_values}, 2);
+        before_dispatch(), [encoder dispatchThreads:MTLSizeMake(2 * width, rows, 1) threadsPerThreadgroup:MTLSizeMake(256, 1, 1)];
+    }
+    multiply_weights(mtp_fc, {ws.gate_values}, {ws.residual}, rows);
+    start_layer(mtp_layer, ws, rows);
+    full_attention(mtp_layer, ws);
+    finish_layer(mtp_layer, ws, rows);
+    normalize(mtp_norm, {ws.residual}, {ws.residual}, rows, width);
+}
+
+void GpuOps::draft_tokens(Workspace& ws, Buf hidden, Buf token_ids, const std::vector<id<MTLBuffer>>& chain_tables) {
+    const int k = 1 + (int)chain_tables.size(), vocab_size = lm.out_size, last = ws.tokens_per_request - 1;
+    const size_t row_bytes = (size_t)spec.hidden * ELEM, scores_bytes = (size_t)vocab_size * ELEM;
+    assert(ws.next_token_scores.length >= k * scores_bytes && ws.next_token_ids.length >= k * sizeof(int32_t));
+    const id<MTLBuffer> table = ws.step_table;
+    const int tokens = ws.tokens_per_request;
+    apply_mtp(ws, hidden, token_ids);
+    for (int j = 0; j < k; j++) {
+        if (j) {  // the head on its own output (ws.residual's row from step j - 1) and draft j - 1, one position on
+            ws.step_table = chain_tables[j - 1], ws.tokens_per_request = 1;
+            apply_mtp(ws, {ws.residual, (j == 1 ? last : 0) * row_bytes}, {ws.next_token_ids, (j - 1) * sizeof(int32_t)});
+        }
+        multiply_weights(lm, {ws.residual, (j ? 0 : last) * row_bytes}, {ws.next_token_scores, j * scores_bytes}, 1);
+        greedy_tokens({ws.next_token_scores, j * scores_bytes}, {ws.next_token_ids, j * sizeof(int32_t)}, 1, vocab_size);
+    }
+    ws.step_table = table, ws.tokens_per_request = tokens;
 }
 
 // after_attention = residual + attention_output(attention_result); residual = after_attention + feed-forward of

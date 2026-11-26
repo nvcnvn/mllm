@@ -101,19 +101,21 @@ static void write_aligned_file(const Safetensors& source, size_t file_index, con
 // weight / scales / biases are written back to back, so a merged multiply is a view of the file, not a copy at load
 // (architecture.md Deferred, "before the 27B target"); (c) only language_model.* tensors (v3: the vision tower,
 // 0.9 GB at 27B, is never read). Tensor bytes and names are unchanged. A chain member in another source file moves
-// to its first member's file.
+// to its first member's file. tools/spec/mtp.py's mtp.safetensors (the MTP head, written aligned the same way) is
+// loaded too when it's there.
 static std::vector<std::string> aligned_weight_files(const std::string& path) {
     const std::vector<std::string> files = files_in(path);
-    const fs::path dir = fs::path(spec::cache_dir()) / "weights" / (spec::model_key(path) + "-v3");
+    const fs::path dir = spec::weights_dir(path);
     std::vector<std::string> out;
     for (const auto& file : files) out.push_back((dir / fs::path(file).filename()).string());
-    if (std::all_of(out.begin(), out.end(), [](const std::string& o) { return fs::exists(o); })) return out;
-
-    const Safetensors source(files);
-    fs::create_directories(dir);
-    remove_stale_partial_copies(dir);
-    for (size_t file_index = 0; file_index < files.size(); file_index++)
-        write_aligned_file(source, file_index, out[file_index]);
+    if (!std::all_of(out.begin(), out.end(), [](const std::string& o) { return fs::exists(o); })) {
+        const Safetensors source(files);
+        fs::create_directories(dir);
+        remove_stale_partial_copies(dir);
+        for (size_t file_index = 0; file_index < files.size(); file_index++)
+            write_aligned_file(source, file_index, out[file_index]);
+    }
+    if (fs::exists(dir / "mtp" / "mtp.safetensors")) out.push_back((dir / "mtp" / "mtp.safetensors").string());
     return out;
 }
 
@@ -237,9 +239,10 @@ void StepTables::write(id<MTLBuffer> table, const std::vector<Row>& rows) const 
     }
 }
 
-// memory.py: a unit is one KV page (page_tokens tokens) of every full layer, rounded up to the OS page.
+// memory.py: a unit is one KV page (page_tokens tokens) of every full layer, rounded up to the OS page. With an MTP
+// head its layer is one more full layer, after the model's (full_layer = full_layers().size()).
 size_t Memory::unit_of(const ModelSpec& model, int page_tokens) {
-    size_t kv = model.full_layers().size() * 2 * model.key_value_heads * page_tokens * model.head_dim * ELEM;
+    size_t kv = (model.full_layers().size() + model.mtp) * 2 * model.key_value_heads * page_tokens * model.head_dim * ELEM;
     return (kv + PAGE - 1) / PAGE * PAGE;
 }
 
@@ -325,7 +328,7 @@ Workspace Memory::workspace(int chunk, int max_batch) {
     size_t query_size = (size_t)s.query_heads * s.head_dim, key_value_size = (size_t)s.key_value_heads * s.head_dim;
     size_t linear_value_size = (size_t)s.linear_value_heads * s.linear_value_dim;
     return {
-        .token_ids = buffer(std::max(chunk, max_batch) * sizeof(int32_t)),
+        .token_ids = buffer((std::max(chunk, max_batch) + 1) * sizeof(int32_t)),  // + the token after a prefill chunk (MTP)
         .residual = buffer(column_bytes * s.hidden),
         .attention_result = buffer(column_bytes * std::max(query_size, linear_value_size)),
         .query = buffer(column_bytes * query_size),

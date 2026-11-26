@@ -32,6 +32,7 @@ struct PrefillWork {
     int start_pos;
     std::vector<uint32_t> pages;        // KV pages covering start_pos + n_valid
     std::vector<uint32_t> state_slots;  // the request's state units
+    int next_token = 0;  // the prompt's token after this chunk (an MTP head's last row reads it)
     int n_valid() const { return (int)tokens.size(); }
 };
 

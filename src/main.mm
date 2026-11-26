@@ -8,6 +8,7 @@
 #include <cstdio>
 #include <cstring>
 #include <exception>
+#include <filesystem>
 #include <iostream>
 #include <map>
 #include <random>
@@ -93,6 +94,7 @@ struct GpuOpsTest {
     double time_decode_step(double& wall_seconds);
     void bench_whole_decode_step(int requests, double mlx_baseline);
     void bench_verify_step(int tokens);
+    void bench_draft_step(int rows);
 };
 
 // Copies of weights over >= ROTATION_BYTES of pool (the weights themselves when they are that big)
@@ -294,6 +296,28 @@ void GpuOpsTest::bench_verify_step(int tokens) {
     printf("  verify %d tokens: GPU %6.2f ms\n", tokens, gpu_times[gpu_times.size() / 2] * 1e3);
 }
 
+// GpuOps::draft_tokens, k = 2: the MTP head over `rows` newly accepted positions ending at 511, then one chained step
+// at 512; median of 10 GPU times (after 3 warm-up steps). Timing only: the hidden rows are whatever ws.residual holds.
+void GpuOpsTest::bench_draft_step(int rows) {
+    units.assign(1, {});
+    for (uint32_t j = 0; j < memory.units_for(513); j++) units[0].push_back(j);
+    tables.write(table_sets[0], {{512 - rows, rows, units[0]}});
+    tables.write(table_sets[1], {{512, 1, units[0]}});
+    memset(ws.token_ids.contents, 0, rows * sizeof(int32_t));
+    std::vector<double> gpu_times;
+    for (int step = 0; step < 13; step++) {
+        @autoreleasepool {
+            ws.step_table = table_sets[0], ws.request_count = 1, ws.tokens_per_request = rows;
+            const double gpu_time = encode_and_wait(queue, ws, [&] {
+                ops.draft_tokens(ws, {ws.residual}, {ws.token_ids}, {table_sets[1]});
+            }, true);
+            if (step >= 3) gpu_times.push_back(gpu_time);
+        }
+    }
+    std::sort(gpu_times.begin(), gpu_times.end());
+    printf("  draft after %d accepted rows: GPU %6.2f ms\n", rows, gpu_times[gpu_times.size() / 2] * 1e3);
+}
+
 void GpuOpsTest::bench_ops(const std::string& model_name) {
     const ModelSpec model = spec::load(model_name);
     id<MTLDevice> device = MTLCreateSystemDefaultDevice();
@@ -377,6 +401,9 @@ void GpuOpsTest::bench_ops(const std::string& model_name) {
 
     printf("\nspeculative verify: one request, k + 1 tokens ending at key 512 (docs/speculative.md)\n");
     for (int tokens = 1; tokens <= 7; tokens++) bench.bench_verify_step(tokens);
+    if (!ops.has_mtp()) return;
+    printf("\nspeculative draft: the MTP head over the newly accepted rows, then 1 chained step (k = 2), to key 513\n");
+    for (int rows = 1; rows <= 3; rows++) bench.bench_draft_step(rows);
 }
 
 }  // namespace mllm
@@ -402,6 +429,7 @@ static mllm::EngineSizes fit(const std::string& model, const std::string& prefil
     size_t weights = 0;  // what Weights loads (the headers only are read here)
     for (const auto& [name, tensor] : mllm::Safetensors(spec.path).tensors)
         if (name.starts_with("language_model.")) weights += tensor.nbytes;
+    if (spec.mtp) weights += std::filesystem::file_size(mllm::spec::weights_dir(spec.path) + "/mtp/mtp.safetensors");
     id<MTLDevice> device = MTLCreateSystemDefaultDevice();
     size_t budget = device.recommendedMaxWorkingSetSize;
     if (const char* budget_gb = getenv("MLLM_GPU_BUDGET_GB")) {

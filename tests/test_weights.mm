@@ -35,10 +35,12 @@ int main() {
     mllm::ModelSpec model = mllm::spec::load(golden::MODEL);
     std::ifstream file(golden::dir(model) + "/weights.json");
     nlohmann::json want = nlohmann::json::parse(file);
+    if (model.mtp)  // tools/spec/mtp.py weights: the MTP head's tensors as MLX quantized them, same format
+        want.update(nlohmann::json::parse(std::ifstream(golden::dir(model) + "/mtp_weights.json")));
     id<MTLDevice> device = MTLCreateSystemDefaultDevice();
     mllm::Weights weights(model.path, device);
     size_t language_model_tensors = 0;  // the weights cache keeps language_model.* only (memory.mm aligned)
-    for (const auto& [name, _] : want.items()) language_model_tensors += name.starts_with("language_model.");
+    for (const auto& [name, _] : want.items()) language_model_tensors += name.starts_with("language_model.") || name.starts_with("mtp.");
     assert(weights.st.tensors.size() == language_model_tensors);
     for (size_t i = 0; i < weights.buffers.size(); i++)
         assert(weights.buffers[i].contents == weights.st.files[i].base);  // no copy
@@ -54,7 +56,7 @@ int main() {
     id<MTLCommandQueue> queue = [device newCommandQueue];
 
     for (const auto& [name, expected] : want.items()) {
-        if (!name.starts_with("language_model.")) continue;
+        if (!name.starts_with("language_model.") && !name.starts_with("mtp.")) continue;
         auto tensor = weights[name];
         assert(tensor.t.dtype == expected["dtype"].get<std::string>() &&
                tensor.t.shape == expected["shape"].get<std::vector<int64_t>>());

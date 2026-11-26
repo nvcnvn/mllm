@@ -84,6 +84,15 @@ static void encode_layers(GpuOps& ops, Workspace& workspace, int first, int end)
     }
 }
 
+// Prefill, after a chunk's last layer, with an MTP head: the rest of the last layer and the final norm (the 27B's
+// hidden states), then the head over every row with the token after it (token_ids[1 .. n], PrefillWork::next_token
+// last) -> the head's K/V for the chunk's positions
+static void encode_mtp(GpuOps& ops, Workspace& workspace, int layer_count) {
+    if (!ops.has_mtp()) return;
+    ops.apply_weights(layer_count, workspace);
+    ops.apply_mtp(workspace, {workspace.residual}, {workspace.token_ids, sizeof(int32_t)});
+}
+
 PrefillLane::PrefillLane(GpuOps& ops, Memory& mem, int chunk_tokens, int max_context, AneOps* ane)
     : queue(new_lane_queue(mem)), event([mem.device newSharedEvent]), ops(ane ? ane->gpu : ops), mem(mem),
       workspaces{ops.workspace(chunk_tokens, 1, max_context), {}}, step_tables(mem.step_tables(1, max_context)),
@@ -194,7 +203,10 @@ bool PrefillLane::take_turn(Chunk& chunk, const std::deque<Chunk>& others) {
         }
         const int first = chunk.layers_committed, end = std::min(first + LAYERS_PER_BUFFER, layer_count);
         chunk.last_command_buffer =
-            encode_and_commit(queue, workspace, [&] { encode_layers(ops, workspace, first, end); }, false, fence);
+            encode_and_commit(queue, workspace, [&] {
+                encode_layers(ops, workspace, first, end);
+                if (end == layer_count) encode_mtp(ops, workspace, layer_count);
+            }, false, fence);
         chunk.layers_committed = end;
         return true;
     }
@@ -216,11 +228,13 @@ bool PrefillLane::take_turn(Chunk& chunk, const std::deque<Chunk>& others) {
     wait_until_completed("PrefillLane", chunk.last_command_buffer);
     if (fail_next.exchange(false)) throw std::runtime_error("PrefillLane: injected failure");
     const int layer = chunk.layers_committed;
-    // K/V and state only: the last layer's attention output projection + feed-forward never run
+    // K/V and state only: the last layer's attention output projection + feed-forward never run (but for the MTP
+    // head, on the GPU)
     chunk.last_command_buffer = encode_and_commit(queue, workspace, [&] {
         ane->apply_weights(layer, workspace, surface_set);
         ops.apply_attention(layer, workspace);
         if (layer + 1 < layer_count) ane->prepare_inputs(layer + 1, workspace, surface_set);
+        else encode_mtp(ops, workspace, layer_count);
     }, false, fence);
     chunk.layers_committed++;
     return true;
@@ -233,6 +247,7 @@ void PrefillLane::submit(PrefillWork work) {
         Workspace& workspace = workspaces[ane ? (chunks_committed + 1) % 2 : 0];
         workspace.request_count = 1, workspace.tokens_per_request = work.n_valid();
         std::copy(work.tokens.begin(), work.tokens.end(), (int32_t*)workspace.token_ids.contents);
+        ((int32_t*)workspace.token_ids.contents)[work.n_valid()] = work.next_token;  // encode_mtp's last row
         workspace.step_table = step_tables.begin(chunks_committed + 1, event.signaledValue);
         step_tables.write(workspace.step_table, {{work.start_pos, work.n_valid(), work.pages, work.state_slots}});
         chunks_committed++;
@@ -253,7 +268,7 @@ void PrefillLane::submit(PrefillWork work) {
 
 // The chunk is encoded now as command buffers of LAYERS_PER_BUFFER layers, each committed from the completion handler
 // of the one before. K/V and state only: the last layer's attention output projection + feed-forward and
-// pick_next_tokens never run.
+// pick_next_tokens never run (but for the MTP head: encode_mtp).
 void PrefillLane::commit_gpu_chunk(Workspace& workspace) {
     const int layer_count = mem.spec.n_layers(), layers_per_buffer = LAYERS_PER_BUFFER;
     for (int first_layer = 0; first_layer < layer_count; first_layer += layers_per_buffer) {
@@ -261,6 +276,7 @@ void PrefillLane::commit_gpu_chunk(Workspace& workspace) {
         gpu_command_buffers.push_back(encode_command_buffer(queue, workspace, [&] {
             for (int layer = first_layer; layer < std::min(first_layer + layers_per_buffer, layer_count); layer++)
                 ops.apply_weights(layer, workspace), ops.apply_attention(layer, workspace);
+            if (last_buffer) encode_mtp(ops, workspace, layer_count);
         }, false, fence, last_buffer ? event : nil, chunks_committed));
     }
     for (size_t j = 0; j + 1 < gpu_command_buffers.size(); j++) {

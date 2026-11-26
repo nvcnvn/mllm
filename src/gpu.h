@@ -75,6 +75,19 @@ public:
     // encoded before the CPU has seen its token. Encode it before apply_weights(0).
     void feed_previous_tokens(Workspace& ws, id<MTLBuffer> previous_token_ids, const std::vector<int>& source_rows);
 
+    // The MTP draft head (spec.mtp; docs/speculative.md), no Python counterpart (tools/spec/accept.py has MLX's).
+    // apply_mtp: one request's ws.tokens_per_request rows at ws.step_table's positions. Row i takes hidden row i (the
+    // 27B's final-normed state at position p + i) and token_ids[i] (the token at p + i + 1) -> the head's keys / values
+    // at p + i (its slot after the model's full layers in each unit), its final-normed output in ws.residual. hidden
+    // may be ws.residual. Prefill runs it over every chunk, so a prompt's head K/V exists before decode.
+    void apply_mtp(Workspace& ws, Buf hidden, Buf token_ids);
+    // Greedy drafting, encoded into one command buffer: apply_mtp over ws's rows (the newly accepted positions), the
+    // last row's argmax is draft 0; then per chain_tables entry (a one-row step table, one position further each) the
+    // head runs on its own output and the draft before it, fed on the GPU -> draft j. Drafts land in
+    // ws.next_token_ids[0 .. k), their scores in ws.next_token_scores rows 0 .. k (k = 1 + chain_tables.size()).
+    void draft_tokens(Workspace& ws, Buf hidden, Buf token_ids, const std::vector<id<MTLBuffer>>& chain_tables);
+    bool has_mtp() const { return spec.mtp; }
+
 
 private:
     friend struct GpuOpsTest;  // tests and bench-ops reach the kernel helpers below (Metal types, rule 1)
@@ -118,7 +131,11 @@ private:
     };
     std::vector<Layer> layers;
     void load_kernels();
-    Layer load_layer(const Weights& weights, int i, int& full_layers_so_far);
+    Layer load_layer(const Weights& weights, const std::string& prefix, bool is_linear);
+    // spec.mtp: the head's full-attention layer, fc (2 * hidden -> hidden) and its three norms
+    Layer mtp_layer;
+    QuantizedWeights mtp_fc;
+    Buf mtp_norm_embedding, mtp_norm_hidden, mtp_norm;
 
     // apply_weights' two halves: the rest of layer i - 1 after its attention, then layer i up to its attention
     void finish_layer(const Layer& previous, Workspace& ws, int rows);
@@ -169,7 +186,7 @@ private:
     // ours, for batched decode: [8 / 16 rows per tile][split-k float partials / bf16 output]
     id<MTLComputePipelineState> multiply_decode_rows[2][2];
     id<MTLComputePipelineState> embed_kernel, normalize_kernel, normalize_wide_kernel, add_kernel, activate_gate_kernel,
-        activate_gate_precise_kernel, split_query_gate_kernel;
+        activate_gate_precise_kernel, split_query_gate_kernel, concat_rows_kernel;
     // full attention: attention_long_context_blocks [threads per group fit / exceed the limit]
     id<MTLComputePipelineState> rotate_positions_kernel, write_keys_values_kernel, attention_short_context,
         attention_long_context_blocks[2], attention_long_context_combine, sigmoid_gate_kernel;

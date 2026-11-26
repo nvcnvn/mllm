@@ -77,21 +77,27 @@ struct ArenaLayoutTest {
     }
 
     // sizes and offsets equal Python's
+    // With an MTP head (memory.py has none) a unit is Python's plus the head's page, after the model's full layers;
+    // everything inside a unit stays at Python's offsets.
     void check_sizes_and_offsets() {
-        assert(unit_bytes == layout["unit_bytes"].get<size_t>() &&
-               memory.arena.n_units == layout["n_units"].get<uint32_t>());
-        assert(memory.state_units == layout["state_units"].get<uint32_t>());
+        const size_t python_unit = layout["unit_bytes"].get<size_t>(),
+                     head_page = model.mtp ? 2 * key_value_heads * page_tokens * head_dim * ELEM : 0;
+        assert(unit_bytes == (python_unit + head_page + 16383) / 16384 * 16384);
+        if (!model.mtp)
+            assert(memory.arena.n_units == layout["n_units"].get<uint32_t>() &&
+                   memory.state_units == layout["state_units"].get<uint32_t>());
         assert(memory.conv_bytes == layout["conv_bytes"].get<size_t>() &&
                memory.delta_bytes == layout["delta_bytes"].get<size_t>());
         assert(memory.arena_buffer.length == (size_t)memory.arena.n_units * unit_bytes);
         kv_strides = layout["kv_strides"].get<std::vector<size_t>>();
-        assert(kv_strides.size() == 6 && kv_strides[0] == unit_bytes && kv_strides[5] == ELEM);
+        assert(kv_strides.size() == 6 && kv_strides[0] == python_unit && kv_strides[5] == ELEM);
+        kv_strides[0] = unit_bytes;  // Python's offsets within a unit, on C++'s units
         for (int full_layer = 0; full_layer < full_layer_count; full_layer++)
             for (int key_or_value = 0; key_or_value < 2; key_or_value++)
                 check_head_offsets(full_layer, key_or_value);
         for (const auto& entry : layout["kv"])
             assert(entry[0].get<size_t>() * unit_bytes + memory.kv_offset(entry[1], entry[2], entry[3], entry[4]) ==
-                   entry[5].get<size_t>());
+                   entry[5].get<size_t>() + entry[0].get<size_t>() * (unit_bytes - python_unit));
         for (const auto& entry : layout["state"])
             assert(memory.state_offset(entry[0]) == entry[1].get<size_t>() &&
                    memory.state_offset(entry[0]) + memory.conv_bytes == entry[2].get<size_t>());
