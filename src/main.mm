@@ -92,6 +92,7 @@ struct GpuOpsTest {
     void bench_attention(int rows, bool decode);
     double time_decode_step(double& wall_seconds);
     void bench_whole_decode_step(int requests, double mlx_baseline);
+    void bench_verify_step(int tokens);
 };
 
 // Copies of weights over >= ROTATION_BYTES of pool (the weights themselves when they are that big)
@@ -265,6 +266,34 @@ void GpuOpsTest::bench_whole_decode_step(int requests, double mlx_baseline) {
     printf("; GPU sampling (temp 0.7, top_p 0.9) %.3f ms/step\n", sampling_time * 1e3);
 }
 
+// A speculative verify (docs/speculative.md): one request, `tokens` rows ending at key 512 through the prefill path,
+// then lm_head + argmax on every row; median of 10 GPU times (after 3 warm-up steps)
+void GpuOpsTest::bench_verify_step(int tokens) {
+    const int layers = model.n_layers();
+    const uint32_t pages = memory.units_for(512);
+    units.assign(1, {});
+    for (uint32_t j = 0; j < pages + memory.state_units; j++) units[0].push_back(j);
+    ws.step_table = table_sets[0];
+    tables.write(ws.step_table, {{512 - tokens, tokens, std::span(units[0]).first(pages), std::span(units[0]).subspan(pages)}});
+    std::vector<double> gpu_times;
+    for (int step = 0; step < 13; step++) {
+        @autoreleasepool {
+            const double gpu_time = encode_and_wait(queue, ws, [&] {
+                ws.request_count = 1, ws.tokens_per_request = tokens;
+                for (int layer = 0; layer <= layers; layer++) {
+                    ops.apply_weights(layer, ws);
+                    if (layer < layers) ops.apply_attention(layer, ws);
+                }
+                ws.request_count = tokens, ws.tokens_per_request = 1;  // lm_head + argmax on every row
+                ops.pick_next_tokens(ws);
+            }, true);
+            if (step >= 3) gpu_times.push_back(gpu_time);
+        }
+    }
+    std::sort(gpu_times.begin(), gpu_times.end());
+    printf("  verify %d tokens: GPU %6.2f ms\n", tokens, gpu_times[gpu_times.size() / 2] * 1e3);
+}
+
 void GpuOpsTest::bench_ops(const std::string& model_name) {
     const ModelSpec model = spec::load(model_name);
     id<MTLDevice> device = MTLCreateSystemDefaultDevice();
@@ -345,6 +374,9 @@ void GpuOpsTest::bench_ops(const std::string& model_name) {
                                    is_0_8b ? 898 : is_27b ? 37.1 : 0, is_0_8b ? 1064.0 : 0};
     const int batch_sizes[] = {1, 4, 8, 16};
     for (int i = 0; i < 4; i++) bench.bench_whole_decode_step(batch_sizes[i], mlx_baseline[i]);
+
+    printf("\nspeculative verify: one request, k + 1 tokens ending at key 512 (docs/speculative.md)\n");
+    for (int tokens = 1; tokens <= 7; tokens++) bench.bench_verify_step(tokens);
 }
 
 }  // namespace mllm

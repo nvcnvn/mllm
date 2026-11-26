@@ -178,6 +178,7 @@ The reference's own perplexity is 30.4.
   - test_concurrent: skips at 2 MiB units, about 400 GB of memcpy at 27B.
   - test_ane: waits on §5.
 - **Batched speed:** engine vs mlx-lm at B = 4/8 hasn't been rerun on a quiet machine. Only bench-ops' GPU step times exist: 91.5 / 115.9 ms.
+- **Speculative decoding (g21: measured, not built):** see [speculative.md](speculative.md). The 27B's own MTP head (4-bit, from the bf16 checkpoint) at k = 2 gives 2.56 tokens per verify on six prompts. Verify of 3 rows costs 72.8 ms against 64.9 for one (bench-ops). *Estimate:* ~30 tok/s greedy at B = 1, 2.0x.
 - **Old weight caches:** they're deleted. Only `-v3` dirs remain under `/Volumes/T5/cache/mllm/weights/`.
 
 ## 9. Close out
