@@ -28,14 +28,14 @@ static const std::map<std::string, id<MTLBuffer> Workspace::*> WORKSPACE_FIELD_B
     {"x", &Workspace::residual},
     {"o", &Workspace::attention_result}};
 
-// The error for a block that isn't built: says how to build every chunk size with Python
+// The error for a block that isn't built: says how to build every chunk size with the package's builder (the mmmllm
+// command runs it itself for 512 and 1024 when its ane extra is installed)
 static std::runtime_error missing_block_error(const std::string& dir, const std::string& model_path,
                                               const std::vector<int>& chunk_sizes) {
     std::string size_list;
     for (int size : chunk_sizes) size_list += (size_list.empty() ? "" : ", ") + std::to_string(size);
-    return std::runtime_error("ANE model missing: " + dir + "\nBuild the blocks with Python (~30 s):\n  HF_HOME=" +
-                              (getenv("HF_HOME") ? getenv("HF_HOME") : "/Volumes/T5/huggingface") +
-                              " .venv/bin/python -c \"import sys; sys.path.insert(0, 'py'); from mllm.ane import build; "
+    return std::runtime_error("ANE model missing: " + dir + "\nBuild the blocks with coremltools (~30 s):\n"
+                              "  uvx --python 3.13 --from 'mmmllm[ane]' python -c \"from mmmllm.ane import build; "
                               "build('" + model_path + "', [" + size_list + "])\"");
 }
 

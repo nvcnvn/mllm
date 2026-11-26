@@ -29,11 +29,15 @@ curl -N localhost:8080/v1/completions -d '{"prompt": "The capital of France is",
 
 `mmmllm` with no arguments lists every command and flag (`--port`, `--max-batch`, `--max-ctx`, `--arena-gib`, ...).
 
-**Neural Engine prefill** (from a checkout: the Core ML blocks are built with coremltools): `--prefill ane` runs
-prefill's matmuls on the Neural Engine, with the GPU feeding it its own 4-bit weights a layer at a time (no second
-copy; ~3 GB more memory at 27B). At 27B on an M4 Pro: 4096-token prompts 191 vs 131 tok/s, and
-decode next to a long prefill keeps 12 tok/s instead of 3 ([target-27b.md](docs/target-27b.md) §5). The first run
-prints the command that builds the blocks (~30 s).
+**Neural Engine prefill**: `--prefill ane` runs prefill's matmuls on the Neural Engine, with the GPU feeding it its
+own 4-bit weights a layer at a time (no second copy; ~3 GB more memory at 27B). At 27B on an M4 Pro: 4096-token
+prompts 191 vs 131 tok/s, and decode next to a long prefill keeps 12 tok/s instead of 3
+([target-27b.md](docs/target-27b.md) §5). Its Core ML blocks are built with coremltools (the `ane` extra, Python
+3.13 at most) on the first run, once per model (~30 s):
+
+```sh
+uvx --python 3.13 --from 'mmmllm[ane]' mmmllm chat mlx-community/Qwen3.6-27B-4bit --prefill ane
+```
 
 ## Verify the benchmark on your Mac
 
@@ -65,5 +69,5 @@ python3 -m venv .venv && .venv/bin/pip install -r requirements.txt
 build/tests/test_engine                                             # C++ engine: 3 prompts x 64 greedy tokens == golden
 ```
 
-`make test` runs every test; some also need `py/dump_batch_ref.py` and the Neural Engine blocks (`py/mllm/ane.py`,
+`make test` runs every test; some also need `py/dump_batch_ref.py` and the Neural Engine blocks (`py/mmmllm/ane.py`,
 for `--prefill ane`); each prints the command it is missing.

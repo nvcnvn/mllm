@@ -16,7 +16,7 @@ import mlx.core as mx
 import numpy as np
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "py"))
-from mllm import spec as spec_mod                    # noqa: E402
+from mmmllm import spec as spec_mod                 # noqa: E402
 from mllm.gpu import GpuOps                         # noqa: E402
 from mllm.lanes import _layers                      # noqa: E402
 from mllm.memory import Memory                      # noqa: E402

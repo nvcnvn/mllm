@@ -136,7 +136,7 @@ step():
 
 ## Files
 ```
-py/mllm/spec.py  tokenizer.py  memory.py  gpu.py  ane.py  lanes.py  engine.py
+py/mllm/tokenizer.py  memory.py  gpu.py  lanes.py  engine.py   py/mmmllm/spec.py  ane.py  (the wheel ships py/mmmllm)
 py/test_engine.py
 src/     spec  safetensors  tokenizer  memory  gpu  ane  lanes  prefix_cache  engine  server   (.h + .cpp/.mm)
 src/main.mm         mllm CLI: generate, bench, bench-ops, serve
@@ -155,7 +155,7 @@ Python reuses mlx-lm wherever it can: `mlx_lm.load` for weights and the GPU dens
 ## Build order
 1. `spec`, `tokenizer`, `engine`, both lanes GPU-only, `attn` over the numpy arena for both layer kinds of the first model: full attention (K/V pages) and Gated DeltaNet (state slot). Pass the mlx-lm match on Qwen3.5-0.8B. **Done (2026-11-22, `py/test_engine.py`): bit-exact with mlx-lm greedy for 3 prompts × 64 tokens, solo and batched, and with requests waiting on a one-request arena. Unit 384 KiB, state slot 50 units (~19.5 MiB per request).** The basic arena bookkeeping from step 2 (`admit` / `alloc` / `release`) is already in, without refcounts or `pending`.
 2. Real arena bookkeeping (`admit` / `alloc` / `release` / `pending`) and several requests through `submit` + `step`.
-3. `AneOps.dense` for prefill: one Core ML model per dense block, built with `tools/hetero_bench.py`'s builder from real weights (replaced 2026-11-25 by blocks that take the GPU's weights as inputs, target-27b.md §5; the baked fp16 / int8 / LUT path and Python's AneOps are gone). Pass the K/V comparison. **Done (2026-11-22, `py/mllm/ane.py`, `py/test_ane.py`), on Qwen3.5-0.8B, S = 128, a 392-token prompt (4 chunks, last one padded):**
+3. `AneOps.dense` for prefill: one Core ML model per dense block, built with `tools/hetero_bench.py`'s builder from real weights (replaced 2026-11-25 by blocks that take the GPU's weights as inputs, target-27b.md §5; the baked fp16 / int8 / LUT path and Python's AneOps are gone). Pass the K/V comparison. **Done (2026-11-22, `py/mllm/ane.py` (now `py/mmmllm/ane.py`), `py/test_ane.py`), on Qwen3.5-0.8B, S = 128, a 392-token prompt (4 chunks, last one padded):**
    - **One model per block** (`o + FFN + norm + next q,k,v`), 24 blocks. Every op lands on the ANE, including RMSNorm (as `layer_norm([x, −x])`, Anemll's trick) and the per-head q/k norms. Embedding is a GPU gather before block 0.
    - **Speed (Python):** `predict()` alone takes 27 ms per chunk, 4,700 tok/s (≈ 4.5 TFLOPS, small shapes). The whole lane, with numpy copies and GPU `attn`, does 1,370 tok/s, against 2,400–3,100 for GPU `dense` in the same Python lane. The ANE time is mostly copies and Python, which C++ removes.
    - **fp16 precision:** the ANE is ~6× further from an fp32 GPU run than bf16 is (median 1−cos 3.2e-4 vs 5e-5). fp16 has more mantissa than bf16, so this comes from the ANE's internal arithmetic, not storage. It is still small: greedy decode after ANE prefill gives mlx-lm's exact 64 tokens.

@@ -19,7 +19,7 @@ from pathlib import Path
 from mlx_lm.utils import load_tokenizer
 
 sys.path.insert(0, str(Path(__file__).parent.parent / "py"))
-from mllm.spec import resolve
+from mmmllm.spec import resolve
 
 
 def stream(url, prompt, g):

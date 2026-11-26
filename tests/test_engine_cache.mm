@@ -1,6 +1,7 @@
 // Engine + prefix cache (g8): greedy tokens with the cache equal those without, cold and on hits; hits land where
 // snapshots were taken (a prompt's last full page, a branch point); after a hit the keys / values and linear state
-// match the cache-off run (bit-exact when the chunk boundaries do); the same on ANE prefill; a small arena forcing
+// match the cache-off run (bit-exact when the chunk boundaries do); a chat's next turn resumes after the reply (a
+// finished request's sequence is cached); the same on ANE prefill; a small arena forcing
 // evictions under 20 mixed requests ends with every unit free or cache-held.
 #include <cassert>
 #include <chrono>
@@ -101,7 +102,7 @@ static RunResult run_alone(mllm::Engine& engine, const Tokens& prompt, int max_t
 static const double MIN_COSINE = getenv("MLLM_MODEL") ? 0.95 : 0.9999;
 
 static void compare_values(const char* what, const std::vector<float>& first, const std::vector<float>& second,
-                           bool exact) {
+                           bool exact, double min_cosine = MIN_COSINE) {
     assert(first.size() == second.size() && !first.empty());
     double dot = 0, first_norm = 0, second_norm = 0, max_difference = 0;
     for (size_t i = 0; i < first.size(); i++)
@@ -112,7 +113,7 @@ static void compare_values(const char* what, const std::vector<float>& first, co
     const double cosine = dot / std::sqrt(first_norm * second_norm);
     const bool same = !memcmp(first.data(), second.data(), first.size() * 4);
     printf("  %-28s max |diff| %.3g, cos %.8f%s\n", what, max_difference, cosine, same ? " (bit-exact)" : "");
-    assert(exact ? same : cosine >= MIN_COSINE);
+    assert(exact ? same : cosine >= min_cosine);
 }
 
 static Tokens first_tokens(const Tokens& tokens, size_t count) {
@@ -383,15 +384,15 @@ static void check_shared_prefix_hits(mllm::Engine& on, const TestPrompts& prompt
 }
 
 // Keys / values and state after a hit vs cache off. long_text_1281 hits the snapshot long_text_1300 left at 1280 and
-// goes straight to decode, its chunks were cache off's: bit-exact. long_text_1300 and grain_question resume
-// mid-prompt (chunk boundaries move).
+// goes straight to decode, its chunks were cache off's: bit-exact. long_text_1300 (at 1281, where long_text_1281's
+// sequence ended: a tail node) and grain_question resume mid-prompt (chunk boundaries move).
 static void check_state_after_hit(mllm::Engine& on, mllm::Engine& off, const TestPrompts& prompts) {
     RunResult hit_1281 = run_alone(on, prompts.long_text_1281, 1), off_1281 = run_alone(off, prompts.long_text_1281, 1);
     assert(hit_1281.cached == 1280 && hit_1281.tokens == off_1281.tokens);
     compare_values("long 1281, K/V", hit_1281.keys_values, off_1281.keys_values, true);
     compare_values("long 1281, state", hit_1281.state, off_1281.state, true);
     RunResult hit_1300 = run_alone(on, prompts.long_text_1300, 1), off_1300 = run_alone(off, prompts.long_text_1300, 1);
-    assert(hit_1300.cached == 1280);
+    assert(hit_1300.cached == 1281);
     compare_values("long 1300, K/V", hit_1300.keys_values, off_1300.keys_values, false);
     compare_values("long 1300, state", hit_1300.state, off_1300.state, false);
     // grain_question: haiku_question's branch point (departure_question left a snapshot at its own end)
@@ -399,6 +400,34 @@ static void check_state_after_hit(mllm::Engine& on, mllm::Engine& off, const Tes
     assert(hit_grain.cached == prompts.branch_point);
     compare_values("grain (branch point), K/V", hit_grain.keys_values, off_grain.keys_values, false);
     compare_values("grain (branch point), state", hit_grain.state, off_grain.state, false);
+}
+
+// A chat's next turn (Tokenizer::continue_chat: prompt + reply + the next message) resumes where the reply's sequence
+// ended, mid-page (a tail node): after the EOS when the reply ended there (the step feeding it ran), before the last
+// token when max_tokens cut it (never fed). Keys / values and state then match cache off, loosely: decode wrote the
+// reply's part, cache off prefills it (0.8B: cos 0.99988 .. 0.99992).
+static void check_chat_turn_resumes_after_reply(mllm::Engine& on, mllm::Engine& off) {
+    const mllm::Tokenizer& tokenizer = on.tokenizer;
+    // the reply already written: greedy ends it at once
+    const Tokens answered = tokenizer.encode("<|im_start|>user\nCapital of France?<|im_end|>\n<|im_start|>assistant\n"
+                                             "<think>\n\n</think>\n\nThe capital of France is Paris.");
+    const Tokens open_question = tokenizer.encode_chat({{"user", "Tell me a long story about a lighthouse."}});
+    for (const bool answered_turn : {true, false}) {
+        const Tokens& turn = answered_turn ? answered : open_question;
+        Tokens sequence = turn;
+        const Tokens reply = run_alone(on, turn, 16).tokens;
+        sequence.insert(sequence.end(), reply.begin(), reply.end());
+        const bool ended_at_eos = tokenizer.eos.count(reply.back());
+        assert(ended_at_eos == answered_turn);
+        const Tokens next_turn = tokenizer.continue_chat(sequence, "And of Italy?");
+        RunResult hit = run_alone(on, next_turn, 1), cold = run_alone(off, next_turn, 1);
+        const int want = (int)sequence.size() - (ended_at_eos ? 0 : 1);
+        printf("  chat: turn %zu + reply %zu (%s), next turn %zu tokens cached %d\n", turn.size(), reply.size(),
+               ended_at_eos ? "EOS" : "max_tokens", next_turn.size(), hit.cached);
+        assert(hit.cached == want && want % 32 && hit.tokens == cold.tokens);
+        compare_values("chat next turn, K/V", hit.keys_values, cold.keys_values, false, std::min(MIN_COSINE, 0.999));
+        compare_values("chat next turn, state", hit.state, cold.state, false, std::min(MIN_COSINE, 0.999));
+    }
 }
 
 // chunk 512, the served configuration
@@ -417,6 +446,7 @@ static void check_gpu_chunk_512(const TestPrompts& prompts, const std::vector<To
     check_repeat_hits_last_full_page(on, prompts, off_tokens);
     check_shared_prefix_hits(on, prompts, off_tokens);
     check_state_after_hit(on, off, prompts);
+    check_chat_turn_resumes_after_reply(on, off);
     check_idle_arena(on);
     printf("gpu chunk 512: cold == off, hits == cold\n");
 }

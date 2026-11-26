@@ -20,6 +20,9 @@ public:
 
     std::vector<int> encode(const std::string& text) const;
     std::vector<int> encode_chat(const std::vector<Message>& messages) const;
+    // A chat's next prompt kept as tokens (mlx_lm.chat's way): past prompt + reply as generated (reasoning kept; an
+    // end-of-sequence token dropped), then what encode_chat renders after an assistant reply for one more user message.
+    std::vector<int> continue_chat(std::vector<int> tokens, const std::string& message) const;
     Detokenizer detokenizer() const;
 
     std::set<int> eos;  // end-of-sequence token ids

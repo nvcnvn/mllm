@@ -1,8 +1,10 @@
-"""mmmllm: downloads the model if needed, then runs the C++ engine (generate, chat, serve, bench, bench-ops).
-`mmmllm compare` runs mlx-lm's benchmark and ours on the same settings and prints the ratio."""
+"""mmmllm: downloads the model if needed (and with `--prefill ane`, builds the Neural Engine blocks), then runs the
+C++ engine (generate, chat, serve, bench, bench-ops). `mmmllm compare` runs mlx-lm's benchmark and ours on the same
+settings and prints the ratio."""
 import importlib.metadata as md
 import os
 import re
+import shlex
 import subprocess
 import sys
 from pathlib import Path
@@ -12,6 +14,7 @@ HERE = Path(__file__).parent
 BIN = next((p for p in (HERE / "mllm", HERE.parents[1] / "build/mllm") if p.exists()), None)
 DEFAULT = "mlx-community/Qwen3.5-0.8B-4bit"
 ALLOW = ["*.json", "model*.safetensors", "tokenizer.model", "*.txt", "*.jinja"]  # what mlx-lm fetches, minus code
+ANE_SIZES = [512, 1024]  # the blocks AneOps loads: 512 and the chunk (src/main.mm prefill_chunk)
 
 
 def local(model):
@@ -32,6 +35,20 @@ def tee(cmd):
         sys.exit(p.returncode)
     m = re.search(r"^Averages: prompt_tps=([\d.]+), generation_tps=([\d.]+)", out, re.M)
     return float(m[1]), float(m[2])
+
+
+def build_ane_blocks(path, args):
+    """The Neural Engine blocks `--prefill ane` loads, built once per model (~30 s at 27B); a no-op when they exist."""
+    from . import ane
+    if not ane.missing(path, ANE_SIZES):
+        return
+    # a child process: no coremltools resource tracker outlives our exec (it warned of leaked semaphores)
+    code = subprocess.run([sys.executable, "-m", "mmmllm.ane", path, *map(str, ANE_SIZES)]).returncode
+    if code == 3:  # coremltools has wheels up to Python 3.13
+        sys.exit("mmmllm: --prefill ane first builds Neural Engine blocks with coremltools: "
+                 f"uvx --python 3.13 --from 'mmmllm[ane]' mmmllm {shlex.join(args)}")
+    if code:
+        sys.exit(code)
 
 
 def sh(*cmd):
@@ -75,7 +92,9 @@ def main():
         a = []
     i = 1 if a[:1] and a[0] in ("generate", "chat", "bench", "serve", "bench-ops") else 0
     if len(a) > i and not a[i].startswith("-"):
-        local(a[i])  # keep the repo id (API responses name the model): the engine finds it in the same cache
+        path = local(a[i])  # keep the repo id (API responses name the model): the engine finds it in the same cache
         from huggingface_hub import constants
         os.environ["HF_HUB_CACHE"] = constants.HF_HUB_CACHE
+        if any(flag == "--prefill" and value == "ane" for flag, value in zip(a, a[1:])):
+            build_ane_blocks(path, a)
     os.execv(BIN, ["mmmllm", *a])  # argv[0]: the name its usage and errors print

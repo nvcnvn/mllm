@@ -21,8 +21,8 @@ from mlx_lm.models.cache import make_prompt_cache
 from mlx_lm.utils import load_model
 
 from dump_golden import CHATS
-from mllm import spec as specmod
-from mllm.ane import CACHE, _model_key
+from mmmllm import spec as specmod
+from mmmllm.ane import CACHE, _model_key
 from mllm.tokenizer import Tokenizer
 
 T, TOP = 128, 64

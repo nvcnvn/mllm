@@ -83,6 +83,17 @@ static double check_long_word_speed(const mllm::Tokenizer& tokenizer) {
     return milliseconds;
 }
 
+// continue_chat: a reply as generated (ending in the model's <|im_end|>, or cut short) plus the next message equals
+// encode_chat of the same turns, when the reply carries no reasoning for the template to drop
+static void check_continue_chat(const mllm::Tokenizer& tokenizer) {
+    const std::vector<int> want =
+        tokenizer.encode_chat({{"user", "Hi there"}, {"assistant", "Hello!"}, {"user", "Bye"}});
+    std::vector<int> reply = tokenizer.encode("<|im_start|>user\nHi there<|im_end|>\n<|im_start|>assistant\nHello!");
+    assert(tokenizer.continue_chat(reply, "Bye") == want);  // cut at max_tokens
+    reply.push_back(tokenizer.encode("<|im_end|>")[0]);
+    assert(tokenizer.eos.count(reply.back()) && tokenizer.continue_chat(reply, "Bye") == want);
+}
+
 int main() {
     mllm::ModelSpec model = mllm::spec::load(golden::MODEL);
     std::string directory = golden::dir(model);
@@ -98,6 +109,7 @@ int main() {
     for (const auto& sequence : want["detok"]) ok &= check_detokenizer_sequence(tokenizer, sequence, sequences++, held);
     assert(ok);
 
+    check_continue_chat(tokenizer);
     double milliseconds = check_long_word_speed(tokenizer);
     mllm::Detokenizer bad = tokenizer.detokenizer();
     assert(bad.push(-5) == "!");  // out-of-range ids (negative too) decode as "!", never read out of bounds

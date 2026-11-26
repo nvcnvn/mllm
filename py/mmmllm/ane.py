@@ -10,16 +10,17 @@ Row-major [S, C] like the GPU's workspace. Each linear is sliced in the graph in
 4x the unsplit speed (tools/ane_layer.py). Inputs: x [S, H], o [S, o_dim] (i > 0), w_<name> [N, K], g_<name> [1, C].
 Outputs as io.json names them: x (i > 0), then qkv / z / b / a (linear) or q / gate / k / v (full), all [S, C].
 
-  .venv/bin/python -c "import sys; sys.path.insert(0, 'py'); from mllm.ane import build; build(MODEL, [512, 1024])"
+`mmmllm ... --prefill ane` builds the missing blocks before it starts (needs the `mmmllm[ane]` extra). By hand:
+  uvx --python 3.13 --from 'mmmllm[ane]' python -c "from mmmllm.ane import build; build(MODEL, [512, 1024])"
+  .venv/bin/python -c "import sys; sys.path.insert(0, 'py'); from mmmllm.ane import build; build(MODEL, [512, 1024])"
 """
 import hashlib
 import json
 import os
 import shutil
+import sys
 import tempfile
 from pathlib import Path
-
-import numpy as np
 
 # keep big files off the internal disk: the T5 drive when mounted, else the user cache dir
 CACHE = Path(os.environ.get("MLLM_CACHE") or
@@ -43,6 +44,7 @@ def _kind(i, kinds):
 
 def _build(spec, inter, kind, S, path):
     import coremltools as ct
+    import numpy as np
     from coremltools.converters.mil import Builder as mb
     from coremltools.converters.mil.mil import Function, Program, types
 
@@ -116,27 +118,46 @@ def _build(spec, inter, kind, S, path):
     shutil.rmtree(tmp, ignore_errors=True)
     tmp.mkdir(parents=True)
     shutil.copytree(m.get_compiled_model_path(), tmp / "model.mlmodelc")
+    shutil.rmtree(m.package_path, ignore_errors=True)  # convert's temporary .mlpackage
     (tmp / "io.json").write_text(json.dumps({"outputs": dict(zip(out_names, outs))}))
     tmp.rename(path)
 
 
+def missing(model, sizes):
+    """(kind, S, dir) of each block not built yet: the engine loads <cache>/ane/<model_key>/shared_S<S>/<kind>/."""
+    from . import spec as spec_mod
+    spec = spec_mod.load(model)
+    kinds = sorted({_kind(i, spec.kinds) for i in range(spec.n_layers)})
+    key = _model_key(spec.path)
+    blocks = [(kind, S, CACHE / "ane" / key / f"shared_S{S}" / kind) for S in sizes for kind in kinds]
+    return [block for block in blocks if not block[2].exists()]
+
+
 def build(model, sizes):
-    """Build the blocks for chunk sizes `sizes` (the engine loads 512 and its chunk, 1024) into <cache>/ane/<model_key>/shared_S<S>/<kind>/."""
+    """Build the blocks for chunk sizes `sizes` (the engine loads 512 and its chunk, 1024) that don't exist yet."""
+    todo = missing(model, sizes)
+    if not todo:
+        return
+    os.environ.setdefault("TQDM_DISABLE", "1")  # coremltools' progress bars, two per block
+    import coremltools.libcoremlpython  # noqa: F401  the compiler; absent when built from source (no wheel: Python 3.14)
     from . import spec as spec_mod
     spec = spec_mod.load(model)
     c = json.loads((spec.path / "config.json").read_text())
     inter = c.get("text_config", c)["intermediate_size"]
-    kinds = sorted({_kind(i, spec.kinds) for i in range(spec.n_layers)})
-    for S in sizes:
-        for kind in kinds:
-            p = CACHE / "ane" / _model_key(spec.path) / f"shared_S{S}" / kind
-            if p.exists():
-                continue
-            print(f"[ane] building block {kind} S={S} -> {p}", flush=True)
-            tmp, old = CACHE / "tmp", tempfile.tempdir
-            tmp.mkdir(parents=True, exist_ok=True)
-            tempfile.tempdir = str(tmp)
-            try:
-                _build(spec, inter, kind, S, p)
-            finally:
-                tempfile.tempdir = old
+    for kind, S, p in todo:
+        print(f"[ane] building block {kind} S={S} -> {p}", flush=True)
+        tmp, old = CACHE / "tmp", tempfile.tempdir
+        tmp.mkdir(parents=True, exist_ok=True)
+        tempfile.tempdir = str(tmp)
+        try:
+            _build(spec, inter, kind, S, p)
+        finally:
+            tempfile.tempdir = old
+
+
+if __name__ == "__main__":  # mmmllm's wrapper: python -m mmmllm.ane MODEL S...; exit 3 = coremltools missing
+    try:
+        build(sys.argv[1], [int(size) for size in sys.argv[2:]])
+    except ImportError as e:
+        print(f"{e.name} missing", file=sys.stderr)
+        sys.exit(3)

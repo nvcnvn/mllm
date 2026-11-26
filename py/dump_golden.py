@@ -41,8 +41,8 @@ sys.path.insert(0, str(Path(__file__).parent))
 import mlx.core as mx
 import numpy as np
 
-from mllm import spec as spec_mod
-from mllm.ane import CACHE, _model_key
+from mmmllm import spec as spec_mod
+from mmmllm.ane import CACHE, _model_key
 from mllm.engine import Engine
 from mllm.gpu import from_bits, to_bits
 from test_engine import CHUNK, N, PROMPTS

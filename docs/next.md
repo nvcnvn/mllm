@@ -11,14 +11,15 @@ So people can try it with the tools they already have. Every item ends in a **Ch
   openai-python passes (chat and completions, streamed and not, `stop`); `usage` adds `ttft_ms` and
   `tokens_per_second`. Open WebUI not tried.
 - [x] `mmmllm chat MODEL`: interactive multi-turn chat in the terminal, engine in-process (like `mlx_lm.chat`,
-  `ollama run`). History re-templated each turn; the prefix cache makes each turn prefill only the new message.
+  `ollama run`). History kept as tokens (`Tokenizer::continue_chat`, mlx_lm.chat's way: the reasoning stays in
+  context) and a finished request's sequence (prompt + reply) goes into the prefix cache, ending mid-page in a tail
+  node with its state, so each turn prefills only the new message.
   **Check:** a second turn's prefill tokens = the new message's, not the whole history; Ctrl-C stops a reply, not
   the session.
-  *Done, with a smaller gain than planned:* the template drops past turns' reasoning, so the last reply re-templated
-  never matches what was generated, and the prefix cache only holds prompt pages. A turn prefills the last reply plus
-  the new message (measured: turn 3, prompt 651 tokens, 320 cached, after a 300-token reply). Prefilling only the new
-  message needs the reply's own pages in the cache and history kept as tokens (mlx_lm.chat's way, which keeps the
-  reasoning in context unlike the template). A stats line per turn goes to stderr; Ctrl-C drops the turn.
+  *Done (g17).* 0.8B: turn 2 prompt 254, cached 236 (= turn 1 + its reply up to the EOS); a reply cut at max_tokens
+  leaves its last token uncached (1231 / 1211). 27B, 300-token replies, turn 3: prompt 662, 639 cached, first token
+  0.49 s; before (re-templated history): prompt 658, 320 cached, 3.50 s (one run each, under the heavy lock).
+  A stats line per turn goes to stderr; Ctrl-C drops the turn.
 - [x] Non-streaming `/v1/completions` (today 400 "only stream: true is supported"). **Check:** openai-python
   `client.completions.create(...)` without `stream`.
 - [x] `stop` sequences (a string or up to 4; the request is cancelled at the match). **Check:** generation ends before the stop string, which isn't returned.

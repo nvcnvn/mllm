@@ -12,7 +12,7 @@ from dataclasses import dataclass, field
 
 from mlx_lm.sample_utils import make_sampler
 
-from . import spec as spec_mod
+from mmmllm import spec as spec_mod
 from .gpu import GpuOps
 from .lanes import DecodeLane, DecodeRow, DecodeWork, PrefillLane, PrefillWork
 from .memory import Memory

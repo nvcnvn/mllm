@@ -1,6 +1,6 @@
 // PrefixCache + Arena (CPU only): insert, match with a branch, snapshots only where taken, a hash collision never
-// matches, LRU leaf eviction freeing exactly the units no request holds, cache_only_units exact after every op, and
-// admit evicting until the request fits.
+// matches, LRU leaf eviction freeing exactly the units no request holds, cache_only_units exact after every op,
+// admit evicting until the request fits, and a tail node mid-page.
 #include <cassert>
 #include <cstdio>
 
@@ -185,6 +185,35 @@ struct PrefixCacheTest {
     }
 };
 
+// A sequence ending mid-page (a finished request: prompt + reply) caches that part page as a tail node holding the
+// state: a prompt extending it resumes right after it, with the tail's unit to copy. A prompt that leaves no token
+// past it for decode, or diverges inside it, doesn't. The tail is a leaf, evicted first.
+static void tail_node_resumes_mid_page() {
+    mllm::Arena arena{16384, ARENA_UNITS};
+    mllm::PrefixCache cache{arena, TOKENS_PER_PAGE};
+    const std::vector<int> sequence = make_prompt({1, 2}, 3);  // 2 pages + 3 tokens
+    const std::vector<uint32_t> pages = allocate_units(arena, 3), state = allocate_units(arena, STATE_UNITS);
+    cache.insert(sequence, 2, pages, state, 3);
+    arena.release(pages), arena.release(state);
+    check_counts(arena);
+    assert(cache.nodes.size() == 3 && arena.cache_only_units == 3 + STATE_UNITS);
+    std::vector<int> next_turn = sequence;
+    next_turn.insert(next_turn.end(), {5, 6});
+    mllm::PrefixCache::Match match = cache.match(next_turn);
+    assert(match.matched_pages == 2 && match.resume_pages == 2 && match.tail_tokens == 3 &&
+           match.tail_unit == pages[2] && match.pages == std::vector<uint32_t>(pages.begin(), pages.begin() + 2) &&
+           match.snapshot == state && match.resume_tokens(TOKENS_PER_PAGE) == 11);
+    match = cache.match(sequence);
+    assert(match.matched_pages == 2 && match.resume_pages == 0 && match.tail_tokens == 0 && match.snapshot.empty());
+    std::vector<int> diverged = next_turn;
+    diverged[9] = 77;
+    match = cache.match(diverged);
+    assert(match.resume_pages == 0 && match.tail_tokens == 0);
+    assert(cache.evict() && cache.nodes.size() == 2 && arena.free_units == ARENA_UNITS - 2);
+    while (cache.evict()) check_counts(arena);
+    assert(arena.free_units == ARENA_UNITS && arena.cache_only_units == 0);
+}
+
 int main() {
     PrefixCacheTest test;
     test.insert_first_request();
@@ -195,5 +224,6 @@ int main() {
     test.hash_collision_is_a_miss();
     test.evict_least_recently_used_leaves();
     test.admit_evicts_until_it_fits();
+    tail_node_resumes_mid_page();
     printf("PASS\n");
 }

@@ -13,6 +13,9 @@ dependencies = ["huggingface_hub>=0.24"]
 
 [project.optional-dependencies]
 compare = ["mlx-lm==0.32.2"]  # `mmmllm compare`: the baseline it measures against
+# `--prefill ane` builds its Core ML blocks with these (py/mmmllm/ane.py); coremltools has wheels up to Python 3.13
+# (3.14 gets a source build without its compiler), so uvx needs `--python 3.13` where 3.14 is the default
+ane = ["coremltools==9.0; python_version < '3.14'", "numpy>=2,<2.6; python_version < '3.14'"]  # tested: 2.5.5
 
 [project.urls]
 Source = "https://github.com/nvcnvn/mmmllm"

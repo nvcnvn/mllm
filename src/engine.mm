@@ -142,6 +142,7 @@ bool Engine::take_decoded_tokens() {
         Request& r = it->second;
         r.in_flight--;
         if (r.cancelled) {
+            if (r.ended) r.position += 1, cache_sequence(r);  // this step fed its last token
             finish(r);
             continue;
         }
@@ -152,7 +153,10 @@ bool Engine::take_decoded_tokens() {
         std::string text = end_of_text ? "" : r.detokenizer.push(token);
         if (done) {
             text += r.detokenizer.flush();
-            finish(r);
+            r.ended = true;
+            // the step in flight feeds this token (it writes the state): cache and finish at its poll
+            if (r.in_flight) r.cancelled = true;
+            else cache_sequence(r), finish(r);
         }
         emit({req_id, token, std::move(text), done, r.cached});
     }
@@ -305,11 +309,12 @@ PrefixCache::Match Engine::match_prefix(const Request& r, std::vector<int>& snap
     if (!cache) return {};
     const int page_tokens = mem.page_tokens, last = (int)r.prompt.size() - 1;  // the last prompt token is fed by decode
     PrefixCache::Match match = cache->match(r.prompt);
+    const int resume = match.resume_tokens(page_tokens);
     // the branch point (the next request with this prefix resumes there: shared system prompts) and the prompt's last
-    // full page (multi-turn: the next turn extends this prompt)
-    if (match.matched_pages > match.resume_pages) snapshot_points.push_back(match.matched_pages * page_tokens);
+    // full page (a request that extends this prompt, not its reply)
+    if (match.matched_pages * page_tokens > resume) snapshot_points.push_back(match.matched_pages * page_tokens);
     if (const int last_page_start = last / page_tokens * page_tokens;
-        last_page_start > match.resume_pages * page_tokens &&
+        last_page_start > resume &&
         (snapshot_points.empty() || last_page_start > snapshot_points[0]))
         snapshot_points.push_back(last_page_start);
     // While admitting, a hit holds its resume_pages pages and its snapshot: units neither free nor cache-only.
@@ -317,7 +322,7 @@ PrefixCache::Match Engine::match_prefix(const Request& r, std::vector<int>& snap
     // always fits: submit checks units_needed), instead of waiting forever
     const auto need = [&] {
         return units_needed(r) - match.resume_pages + snapshot_points.size() * mem.state_units + match.resume_pages +
-               match.snapshot.size();
+               (match.tail_tokens > 0) + match.snapshot.size();
     };
     while (need() > mem.arena.n_units && !snapshot_points.empty()) snapshot_points.erase(snapshot_points.begin());
     if (need() > mem.arena.n_units) match = {};
@@ -330,15 +335,23 @@ bool Engine::admit(Request& r) {
     std::vector<int> snapshot_points;
     const PrefixCache::Match match = match_prefix(r, snapshot_points);
     // hold what the match returned, so admit's evictions can't free it
+    std::vector<uint32_t> tail;  // the tail page's unit, copied below
+    if (match.tail_tokens) tail.push_back(match.tail_unit);
     for (uint32_t unit : match.pages) arena.ref(unit);
     for (uint32_t unit : match.snapshot) arena.ref(unit);
+    for (uint32_t unit : tail) arena.ref(unit);
     const uint32_t count = units_needed(r) - match.resume_pages + (uint32_t)snapshot_points.size() * mem.state_units;
     if (!arena.admit(count, [&] { return cache && cache->evict(); })) {
-        arena.release(match.pages), arena.release(match.snapshot);
+        arena.release(match.pages), arena.release(match.snapshot), arena.release(tail);
         return false;
     }
     r.reserved = count, r.pages = match.pages;
-    r.position = r.sent = r.cached = match.resume_pages * mem.page_tokens;
+    if (!tail.empty()) {  // r writes the rest of that page: its own copy
+        r.pages.push_back(allocate_unit(r));
+        copy_units({r.pages.back()}, tail);
+        arena.release(tail);
+    }
+    r.position = r.sent = r.cached = match.resume_tokens(mem.page_tokens);
     r.snapshot_points = std::move(snapshot_points);
     start_state(r, match);
     r.state = r.position < (int)r.prompt.size() - 1 ? State::PREFILL : State::DECODE;
@@ -348,7 +361,7 @@ bool Engine::admit(Request& r) {
 // r's state units: a copy of the matched snapshot (requests update their state in place), or zeros.
 void Engine::start_state(Request& r, const PrefixCache::Match& match) {
     for (uint32_t j = 0; j < mem.state_units; j++) r.state_slots.push_back(allocate_unit(r));
-    if (match.resume_pages) {
+    if (!match.snapshot.empty()) {
         copy_units(r.state_slots, match.snapshot);
         mem.arena.release(match.snapshot);
         return;
@@ -371,6 +384,17 @@ void Engine::save_snapshot(Request& r) {
     copy_units(snapshot, r.state_slots);
     cache->insert(r.prompt, page_count, r.pages, snapshot);
     mem.arena.release(snapshot);  // the cache's refs keep them
+}
+
+// r ended and no GPU work holds it: its pages and state go into the cache as its sequence (prompt + the tokens fed),
+// ending mid-page in a tail node, so a request extending it (chat's next turn: + the reply + the next message)
+// prefills only the new part. The state units become the snapshot as they are (r is done with them).
+void Engine::cache_sequence(Request& r) {
+    if (!cache) return;
+    std::vector<int> sequence = r.prompt;
+    sequence.insert(sequence.end(), r.generated.begin(), r.generated.end());
+    sequence.resize(r.position);
+    cache->insert(sequence, r.position / mem.page_tokens, r.pages, r.state_slots, r.position % mem.page_tokens);
 }
 
 // CPU copy on the shared arena (~19 MB for Qwen3.5-0.8B's state): no GPU work reads or writes either side now

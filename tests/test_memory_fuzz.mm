@@ -1,8 +1,9 @@
 // Arena + PrefixCache under the engine's protocol, randomized (CPU only, CI). Simulation is a model of Engine::step /
-// admit / save_snapshot / finish / cancel and of the two lanes (decode: one step ahead, greedy rows fed into the next
-// step; prefill: up to 2 chunks in flight on its own queue). It drives random requests: shared prefixes, repeats,
-// multi-turn extensions, early end of sequence, cancels, requests as big as the arena, an arena small enough that
-// admits evict. Every unit carries a shadow content: a hash of the tokens whose keys / values or state it holds.
+// admit / save_snapshot / cache_sequence / finish / cancel and of the two lanes (decode: one step ahead, greedy rows
+// fed into the next step; prefill: up to 2 chunks in flight on its own queue). It drives random requests: shared
+// prefixes, repeats, multi-turn extensions (of a past prompt, or of a past sequence: resuming at its tail), early end
+// of sequence, cancels, requests as big as the arena, an arena small enough that admits evict. Every unit carries a
+// shadow content: a hash of the tokens whose keys / values or state it holds.
 // Checked:
 //   - after every operation: refcounts equal their holders (requests, cache nodes); free_units, cache_only_units and
 //     reserved follow from them; reserved <= free_units; every unreferenced unit is in exactly one of the free bitmap
@@ -37,7 +38,8 @@ static uint64_t content_hash(const std::vector<int>& tokens, size_t count) {
 // how often each scenario happened, over every seed
 struct Stats {
     long hits = 0, evictions = 0, duplicate_snapshots = 0, snapshots = 0, released_in_flight = 0, two_chunks = 0,
-         fed_ahead = 0, alloc_waits = 0, too_big_hits = 0, cancels = 0, early_ends = 0;
+         fed_ahead = 0, alloc_waits = 0, too_big_hits = 0, cancels = 0, early_ends = 0, tail_hits = 0,
+         ended_in_flight = 0;
 };
 
 struct SimRequest {
@@ -53,7 +55,7 @@ struct SimRequest {
     int generated = 0;
     std::deque<uint64_t> decode_steps;    // decode steps it is in
     std::deque<uint64_t> prefill_chunks;  // prefill chunks it is in
-    bool cancelled = false;
+    bool cancelled = false, ended = false;
     int in_flight() const { return (int)(decode_steps.size() + prefill_chunks.size()); }
 };
 
@@ -113,45 +115,54 @@ struct Simulation {
     bool admit(SimRequest& request) {
         const int last_position = (int)request.prompt.size() - 1;
         mllm::PrefixCache::Match match = cache.match(request.prompt);
-        assert((int)match.pages.size() == match.resume_pages &&
-               match.snapshot.size() == (match.resume_pages ? STATE_UNITS : 0u) &&
-               match.resume_pages <= match.matched_pages);
+        int resume = match.resume_tokens(TOKENS_PER_PAGE);
+        assert((int)match.pages.size() == match.resume_pages && match.snapshot.size() == (resume ? STATE_UNITS : 0u) &&
+               match.resume_pages <= match.matched_pages && resume <= last_position);
         std::vector<int> snapshot_points;
-        if (match.matched_pages > match.resume_pages) snapshot_points.push_back(match.matched_pages * TOKENS_PER_PAGE);
+        if (match.matched_pages * TOKENS_PER_PAGE > resume)
+            snapshot_points.push_back(match.matched_pages * TOKENS_PER_PAGE);
         if (const int page_start = last_position / TOKENS_PER_PAGE * TOKENS_PER_PAGE;
-            page_start > match.resume_pages * TOKENS_PER_PAGE &&
+            page_start > resume &&
             (snapshot_points.empty() || page_start > snapshot_points[0]))
             snapshot_points.push_back(page_start);
         const auto units_with_hit = [&] {
             return units_needed(request) - match.resume_pages + snapshot_points.size() * STATE_UNITS +
-                   match.resume_pages + match.snapshot.size();
+                   match.resume_pages + (match.tail_tokens > 0) + match.snapshot.size();
         };
         if (units_with_hit() > arena.n_units) stats.too_big_hits++;
         while (units_with_hit() > arena.n_units && !snapshot_points.empty())
             snapshot_points.erase(snapshot_points.begin());
-        if (units_with_hit() > arena.n_units) match = {};
+        if (units_with_hit() > arena.n_units) match = {}, resume = 0;
+        std::vector<uint32_t> tail;
+        if (match.tail_tokens) tail.push_back(match.tail_unit);
         for (uint32_t unit : match.pages) arena.ref(unit);
         for (uint32_t unit : match.snapshot) arena.ref(unit);
+        for (uint32_t unit : tail) arena.ref(unit);
         check_bookkeeping(false);
         const uint32_t units_to_reserve =
             units_needed(request) - match.resume_pages + (uint32_t)snapshot_points.size() * STATE_UNITS;
         if (!arena.admit(units_to_reserve, [&] { return cache.evict() && ++stats.evictions; })) {
-            arena.release(match.pages), arena.release(match.snapshot);
+            arena.release(match.pages), arena.release(match.snapshot), arena.release(tail);
             return false;
         }
         for (int i = 0; i < match.resume_pages; i++)
             assert(unit_content[match.pages[i]] == content_hash(request.prompt, (i + 1) * TOKENS_PER_PAGE) &&
                    "stale page on a hit");
         for (uint32_t unit : match.snapshot)
-            assert(unit_content[unit] == content_hash(request.prompt, match.resume_pages * TOKENS_PER_PAGE) &&
-                   "stale snapshot on a hit");
-        stats.hits += match.resume_pages > 0;
+            assert(unit_content[unit] == content_hash(request.prompt, resume) && "stale snapshot on a hit");
+        for (uint32_t unit : tail) assert(unit_content[unit] == content_hash(request.prompt, resume) && "stale tail");
+        stats.hits += resume > 0, stats.tail_hits += !tail.empty();
         request.reserved = units_to_reserve, request.pages = match.pages;
-        request.position = request.sent = match.resume_pages * TOKENS_PER_PAGE;
+        if (!tail.empty()) {  // its own copy of the tail page
+            request.pages.push_back(allocate_unit(request));
+            write_unit(request.pages.back(), unit_content[tail[0]]);
+            arena.release(tail);
+        }
+        request.position = request.sent = resume;
         request.snapshot_points = std::move(snapshot_points);
         for (int j = 0; j < STATE_UNITS; j++) request.state_slots.push_back(allocate_unit(request));
         for (uint32_t unit : request.state_slots)
-            write_unit(unit, match.resume_pages ? unit_content[match.snapshot[0]] : content_hash(request.prompt, 0));
+            write_unit(unit, resume ? unit_content[match.snapshot[0]] : content_hash(request.prompt, 0));
         arena.release(match.snapshot);
         request.state = request.position < last_position ? SimRequest::PREFILL : SimRequest::DECODE;
         return true;
@@ -174,6 +185,15 @@ struct Simulation {
         cache.insert(request.prompt, page_count, request.pages, snapshot);
         arena.release(snapshot);
         stats.snapshots++;
+    }
+
+    // Engine::cache_sequence: the tokens fed so far, their pages and the state (as the snapshot)
+    void cache_sequence(SimRequest& request) {
+        assert(unit_content[request.state_slots[0]] == content_hash(request.sequence, request.position) &&
+               "cached state isn't the sequence's");
+        const std::vector<int> fed(request.sequence.begin(), request.sequence.begin() + request.position);
+        cache.insert(fed, request.position / TOKENS_PER_PAGE, request.pages, request.state_slots,
+                     request.position % TOKENS_PER_PAGE);
     }
 
     // Engine::finish; the caller erases the request
@@ -243,13 +263,19 @@ struct Simulation {
             assert(request.decode_steps.front() == step);
             request.decode_steps.pop_front();
             if (request.cancelled) {
+                if (request.ended) request.position++, cache_sequence(request);  // this step fed its last token
                 finish(request), finished.insert(request_id);
                 continue;
             }
             request.position++, request.generated++;
             const bool ends_early = random_engine() % 12 == 0;
             stats.early_ends += ends_early;
-            if (ends_early || request.generated == request.max_tokens) finish(request), finished.insert(request_id);
+            if (ends_early || request.generated == request.max_tokens) {
+                request.ended = true;
+                stats.ended_in_flight += !request.decode_steps.empty();
+                if (!request.decode_steps.empty()) request.cancelled = true;  // cache and finish at that step's poll
+                else cache_sequence(request), finish(request), finished.insert(request_id);
+            }
             check_bookkeeping(false);
         }
     }
@@ -366,11 +392,15 @@ struct Simulation {
     }
 };
 
+static std::vector<int> first_tokens(const std::vector<int>& tokens, size_t count) {
+    return {tokens.begin(), tokens.begin() + count};
+}
+
 // One run's random prompts. Every draw comes from the run's random engine, in a fixed order.
 struct PromptMaker {
     std::mt19937& random_engine;
     uint32_t unit_count;
-    std::vector<std::vector<int>> shared_prompts, past_prompts;
+    std::vector<std::vector<int>> shared_prompts, past_prompts, past_sequences;
     std::vector<int> huge_prompt;  // demand == unit_count: its hit plus copies can't fit next to it
 
     PromptMaker(std::mt19937& random_engine, uint32_t unit_count) : random_engine(random_engine), unit_count(unit_count) {
@@ -392,8 +422,10 @@ struct PromptMaker {
         if (kind == 0) prompt = huge_prompt;
         else if (kind < 8 && !past_prompts.empty())  // repeated
             prompt = past_prompts[random_engine() % past_prompts.size()];
-        else if (kind < 16 && !past_prompts.empty())  // multi-turn: + more below
+        else if (kind < 12 && !past_prompts.empty())  // multi-turn: + more below
             prompt = past_prompts[random_engine() % past_prompts.size()];
+        else if (kind < 16 && !past_sequences.empty())  // a chat's next turn: a past prompt + part of its reply
+            prompt = past_sequences[random_engine() % past_sequences.size()];
         else if (kind < 32)  // shared system prompt
             prompt = shared_prompts[random_engine() % shared_prompts.size()];
         const int extra_tokens = kind < 8 ? 0 : random_engine() % 14 + 1;
@@ -406,6 +438,9 @@ struct PromptMaker {
         if (prompt != huge_prompt) past_prompts.push_back(prompt);
         SimRequest request{.id = request_id, .prompt = prompt, .sequence = prompt, .max_tokens = max_tokens};
         for (int i = 0; i < max_tokens; i++) request.sequence.push_back(random_engine() % 8);
+        if (prompt != huge_prompt)  // up to where it ends: early, at max_tokens (last token not fed), or fed
+            past_sequences.push_back(
+                first_tokens(request.sequence, prompt.size() + random_engine() % (max_tokens + 1)));
         return request;
     }
 };
@@ -455,13 +490,14 @@ int main(int argc, char** argv) {
     Stats stats;
     // 40 units: admits evict constantly; 100: deep cache
     for (int seed = 0; seed < seeds; seed++) run(seed, 40 + seed % 3 * 30, 300, stats);
-    printf("hits %ld, evictions %ld, snapshots %ld (dup %ld), released in flight %ld, 2 chunks %ld, fed ahead %ld, "
-           "alloc waits %ld, too-big hits %ld, cancels %ld, eos %ld\n",
-           stats.hits, stats.evictions, stats.snapshots, stats.duplicate_snapshots, stats.released_in_flight,
-           stats.two_chunks, stats.fed_ahead, stats.alloc_waits, stats.too_big_hits, stats.cancels, stats.early_ends);
-    for (long count : {stats.hits, stats.evictions, stats.snapshots, stats.duplicate_snapshots, stats.released_in_flight,
-                       stats.two_chunks, stats.fed_ahead, stats.alloc_waits, stats.too_big_hits, stats.cancels,
-                       stats.early_ends})
+    printf("hits %ld (tail %ld), evictions %ld, snapshots %ld (dup %ld), released in flight %ld, 2 chunks %ld, fed "
+           "ahead %ld, alloc waits %ld, too-big hits %ld, cancels %ld, eos %ld, ended in flight %ld\n",
+           stats.hits, stats.tail_hits, stats.evictions, stats.snapshots, stats.duplicate_snapshots,
+           stats.released_in_flight, stats.two_chunks, stats.fed_ahead, stats.alloc_waits, stats.too_big_hits,
+           stats.cancels, stats.early_ends, stats.ended_in_flight);
+    for (long count : {stats.hits, stats.tail_hits, stats.evictions, stats.snapshots, stats.duplicate_snapshots,
+                       stats.released_in_flight, stats.two_chunks, stats.fed_ahead, stats.alloc_waits,
+                       stats.too_big_hits, stats.cancels, stats.early_ends, stats.ended_in_flight})
         assert(count > 0 && "a scenario never happened: the test lost its point");
     printf("PASS (%d seeds)\n", seeds);
 }

@@ -3,4 +3,4 @@ mlx==0.32.4
 mlx-lm @ git+https://github.com/ml-explore/mlx-lm.git@1bf8da05a1ef30a3eb2e8a634180be6557fd3ca0
 huggingface_hub>=2.4  # the `hf download` CLI
 numpy
-coremltools==9.0  # only for --prefill ane (py/mllm/ane.py builds the Core ML blocks)
+coremltools==9.0  # only for --prefill ane (py/mmmllm/ane.py builds the Core ML blocks)

@@ -220,6 +220,15 @@ std::vector<int> Tokenizer::encode_chat(const std::vector<Message>& messages) co
     return encode(text + "<|im_start|>assistant\n<think>\n");
 }
 
+// encode_chat's end of an assistant turn, then the user turn and the generation prompt. The template drops past turns'
+// reasoning, so re-templating a chat would never match what the prefix cache holds of the reply.
+std::vector<int> Tokenizer::continue_chat(std::vector<int> tokens, const std::string& message) const {
+    if (!tokens.empty() && eos.count(tokens.back())) tokens.pop_back();
+    for (int token : encode("<|im_end|>\n")) tokens.push_back(token);
+    for (int token : encode_chat({{"user", message}})) tokens.push_back(token);
+    return tokens;
+}
+
 Detokenizer Tokenizer::detokenizer() const { return Detokenizer(*this); }
 
 // bytes -> UTF-8 with each maximal invalid subsequence replaced by U+FFFD, as Python's decode("utf-8", "replace").

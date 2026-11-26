@@ -50,6 +50,7 @@ struct Request {
     std::vector<int> generated;  // the tokens decoded so far
     int in_flight = 0;  // lane work items holding it: up to 2 prefill chunks, or up to 2 decode steps (greedy rows fed)
     bool cancelled = false;  // finish at the next poll (architecture.md: aborts wait for their chunk)
+    bool ended = false;      // its last token is out (EOS or max_tokens): its sequence goes into the prefix cache
 };
 
 class Engine {
@@ -105,6 +106,7 @@ private:
     PrefixCache::Match match_prefix(const Request& r, std::vector<int>& snapshot_points);
     void start_state(Request& r, const PrefixCache::Match& match);
     void save_snapshot(Request& r);
+    void cache_sequence(Request& r);
     void copy_units(const std::vector<uint32_t>& destination, const std::vector<uint32_t>& source);
     void emit(Event event);
     void abort(const std::vector<Request*>& rows);

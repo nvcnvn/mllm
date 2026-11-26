@@ -370,14 +370,14 @@ static void generate(const std::string& model, const std::string& prompt, mllm::
     printf("\n");
 }
 
-// mllm chat: a REPL over one engine. The history is re-templated each turn; the prefix cache supplies the part the
-// last turn already prefilled (up to its last full page before the reply), so a turn prefills about the last reply
-// plus the new message. Ctrl-C stops a reply (the turn is dropped), at the prompt it quits, as does Ctrl-D.
+// mllm chat: a REPL over one engine. The history is kept as tokens (Tokenizer::continue_chat) and a finished reply's
+// pages and state stay in the prefix cache, so a turn prefills only the new message. Ctrl-C stops a reply (the turn
+// is dropped), at the prompt it quits, as does Ctrl-D.
 static std::atomic<bool> interrupted;
 
 struct Reply {
-    std::string text;
-    int tokens = 0, cached_tokens = 0;
+    std::vector<int> tokens;
+    int cached_tokens = 0;
     SteadyClock::time_point first_token_at;
 };
 
@@ -388,9 +388,9 @@ static Reply stream_reply(mllm::Engine& engine, int request_id) {
         for (const mllm::Event& event : engine.step()) {
             if (event.req_id != request_id) continue;
             if (event.token < 0) throw std::runtime_error("request aborted");
-            if (!reply.tokens++) reply.first_token_at = SteadyClock::now();
+            if (reply.tokens.empty()) reply.first_token_at = SteadyClock::now();
+            reply.tokens.push_back(event.token);
             reply.cached_tokens = event.cached, done = event.done;
-            reply.text += event.text;
             fputs(event.text.c_str(), stdout);
             fflush(stdout);
         }
@@ -402,22 +402,29 @@ static void chat(const std::string& model, mllm::GenParams params, bool default_
     mllm::Engine engine(model, arena_bytes(1), prefill_chunk(prefill_on), 32, 16, max_context, prefill_on, prefix_cache);
     const bool tty = isatty(0);
     if (tty) fprintf(stderr, "%s chat: Ctrl-C stops a reply, Ctrl-D quits\n", program_name);
-    std::vector<mllm::Message> history;
+    std::vector<int> history;  // the last prompt and its reply
     for (std::string line;;) {
         if (tty) fputs(">>> ", stdout), fflush(stdout);
         if (!std::getline(std::cin, line)) break;
         if (line.empty()) continue;
-        history.push_back({"user", line});
         const auto start = SteadyClock::now();
-        std::vector<int> tokens = engine.tokenizer.encode_chat(history);
+        std::vector<int> tokens = history.empty() ? engine.tokenizer.encode_chat({{"user", line}})
+                                                  : engine.tokenizer.continue_chat(history, line);
+        // the history (reasoning kept) fills max_ctx in a few long turns: then a new conversation starts with this line
+        const int least_new_tokens = default_max_tokens ? 1 : params.max_tokens;
+        if (!history.empty() && (int)tokens.size() + least_new_tokens > engine.context_limit()) {
+            fprintf(stderr, "%s: context full (%zu tokens): starting a new conversation\n", program_name,
+                    tokens.size());
+            history.clear();
+            tokens = engine.tokenizer.encode_chat({{"user", line}});
+        }
         const int prompt_tokens = tokens.size();
         if (default_max_tokens) params.max_tokens = std::max(1, std::min(4096, engine.context_limit() - prompt_tokens));
         int request_id;
         try {
-            request_id = engine.submit(std::move(tokens), params);
+            request_id = engine.submit(tokens, params);
         } catch (const std::invalid_argument& x) {
             fprintf(stderr, "%s: %s\n", program_name, x.what());
-            history.pop_back();
             continue;
         }
         interrupted = false;
@@ -425,16 +432,19 @@ static void chat(const std::string& model, mllm::GenParams params, bool default_
         const Reply reply = stream_reply(engine, request_id);
         signal(SIGINT, SIG_DFL);
         const auto end = SteadyClock::now();
+        if (interrupted) engine.cancel(request_id);
+        // the step that fed its last token: only after it is the reply in the prefix cache for the next turn
+        while (engine.requests.count(request_id)) engine.step();
         if (interrupted) {
-            engine.cancel(request_id);
-            history.pop_back();
             fprintf(stderr, "\n[stopped]\n");
             continue;
         }
-        history.push_back({"assistant", reply.text});
+        history = tokens;
+        history.insert(history.end(), reply.tokens.begin(), reply.tokens.end());
+        const int count = reply.tokens.size();
         fprintf(stderr, "\n[prompt %d tokens, %d cached, first token %.2f s; %d tokens at %.1f tok/s]\n", prompt_tokens,
-                reply.cached_tokens, seconds(reply.first_token_at - start), reply.tokens,
-                reply.tokens > 1 ? (reply.tokens - 1) / seconds(end - reply.first_token_at) : 0.0);
+                reply.cached_tokens, seconds(reply.first_token_at - start), count,
+                count > 1 ? (count - 1) / seconds(end - reply.first_token_at) : 0.0);
     }
 }
 
@@ -542,7 +552,7 @@ static int usage() {
             "       %1$s bench-ops MODEL                      GPU time per op and per decode step, next to the roofline\n"
             "MODEL: repo id under $HF_HOME, or a local dir\n"
             "PREFILL: [--prefill gpu|ane]: prefill's matmuls on the Neural Engine, the GPU feeding it its own weights a\n"
-            "         layer at a time (Core ML blocks built by py/mllm/ane.py), 1024-token chunks\n"
+            "         layer at a time (Core ML blocks: mmmllm[ane] builds them first), 1024-token chunks\n"
             "         [--prefix-cache on|off]: reuse prompt prefixes across requests (default on; off for bench, whose\n"
             "         trials repeat the same prompts)\n"
             "ENGINE (generate, bench, serve): [--arena-gib G] (default 1, serve 2; 12 at 2 MiB units, the 27B)\n"

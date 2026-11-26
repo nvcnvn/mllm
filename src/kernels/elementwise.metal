@@ -223,7 +223,7 @@ template [[host_name("conv_norm_qk_4")]] [[kernel]] decltype(conv_norm_qk<4>) co
     if (src[b] >= 0) tokens[b] = ids[src[b]];
 }
 
-// AneOps (row-major blocks, py/mllm/ane.py build). Workspace bf16 [n, C] -> fp16 surface [S, row],
+// AneOps (row-major blocks, py/mmmllm/ane.py build). Workspace bf16 [n, C] -> fp16 surface [S, row],
 // zero in rows n .. S. Grid: (C, S). Also a norm's gamma (n = S = 1).
 [[kernel]] void to_rows(const device bfloat16_t* src [[buffer(0)]], device half* dst [[buffer(1)]],
                         constant uint& row [[buffer(2)]], constant uint& n [[buffer(3)]],

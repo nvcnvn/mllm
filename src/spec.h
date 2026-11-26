@@ -1,4 +1,4 @@
-// ModelSpec: the shapes every other component is sized from. Plain data, read from config.json (py/mllm/spec.py).
+// ModelSpec: the shapes every other component is sized from. Plain data, read from config.json (py/mmmllm/spec.py).
 #pragma once
 #include <string>
 #include <vector>

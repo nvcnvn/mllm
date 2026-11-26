@@ -1,4 +1,4 @@
-"""One 27B dense block (py/mllm/ane.py's seam) for the ANE with every weight a runtime input (target-27b.md §5).
+"""One 27B dense block (py/mmmllm/ane.py's seam) for the ANE with every weight a runtime input (target-27b.md §5).
 
 Block i, row-major [S, C] (the GPU's layout): x, o -> o/out_proj(i-1) + residual -> norm, FFN(i-1) + residual -> norm
 -> projections of layer i (`kind`: linear or full attention). Norm gammas are baked (tiny); every linear's weight is
@@ -48,7 +48,7 @@ def build(S, kind, split):
     else:
         specs += [(f"w_{m}", mats[m]) for m in mats]
 
-    def rms(x, n):  # RMSNorm on the last axis as layer_norm over [x, -x] (py/mllm/ane.py)
+    def rms(x, n):  # RMSNorm on the last axis as layer_norm over [x, -x] (py/mmmllm/ane.py)
         d = mb.layer_norm(x=mb.concat(values=[x, mb.mul(x=x, y=np.float16(-1))], axis=-1), axes=[-1], epsilon=1e-6)
         r = len(x.shape)
         return mb.mul(x=mb.slice_by_size(x=d, begin=[0] * r, size=list(x.shape[:-1]) + [n]), y=gamma(n))
