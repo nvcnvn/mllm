@@ -1,4 +1,0 @@
-version: 1
-edge_hints:
-  release: {from_side: left, to_side: left}
-  retire: {from_side: right, to_side: right, label_pos: 0.30}
