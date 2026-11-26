@@ -292,7 +292,7 @@ Workspace GpuOps::workspace(int chunk, int max_batch, int max_ctx) {
     const size_t gathered_rows = fused_attention_fits(chunk, (int)heads_per_key_value) ? 1 : ws.max_context;
     ws.gathered_keys = mem.buffer(spec.key_value_heads * gathered_rows * head_dim * ELEM);
     ws.gathered_values = mem.buffer(spec.key_value_heads * gathered_rows * head_dim * ELEM);
-    ws.attention_scores = mem.buffer((size_t)std::max(chunk, 1) * ELEM * heads * gathered_rows);
+    ws.attention_scores = mem.buffer((size_t)std::max(chunk, 1) * ELEM * heads_per_key_value * gathered_rows);
     ws.normalized_query_key = mem.buffer(row_bytes * spec.conv_dim());
     ws.decay = mem.buffer((size_t)ws.max_rows * spec.linear_value_heads * sizeof(float));
     ws.update_rate = mem.buffer(row_bytes * spec.linear_value_heads);
@@ -514,12 +514,13 @@ void GpuOps::start_layer(const Layer& layer, Workspace& ws, int rows) {
 // mlx Matmul::eval_gpu for the fallback's two multiplies (matmul.cpp): batch [key_value_heads, heads_per_key_value]
 // never collapses (the repeat stride of keys / values is 0), that many batches rule out split-k, so: gemv_wide when
 // the second is transposed and 2 <= rows <= 15, else steel_matmul_regular_axpby with the 's' tiles
-// (GEMM_TPARAM_MACRO: bm 64, bn 64, bk 16, wm 2, wn 2).
+// (GEMM_TPARAM_MACRO: bm 64, bn 64, bk 16, wm 2, wn 2). Run here one key_value head at a time (batch
+// [1, heads_per_key_value]): every batch is computed alone, so the split is bit-exact.
 void GpuOps::multiply_bf16(bool second_transposed, Buf first, Buf second, Buf output, int rows, int columns, int inner,
                            int first_row_stride, int second_row_stride, int output_row_stride,
                            const int64_t first_batch_strides[2], const int64_t second_batch_strides[2],
                            int64_t output_batch_stride) {
-    const int batch_shape[2] = {spec.key_value_heads, spec.query_heads / spec.key_value_heads}, batches = spec.query_heads;
+    const int batches = spec.query_heads / spec.key_value_heads, batch_shape[2] = {1, batches};
     int passes = (rows + 4) / 5;
     if (second_transposed && rows >= 2 && passes <= 3 && inner % 4 == 0) {  // gemv_wide_config (gen >= 15, aligned)
         assert(output_batch_stride == (int64_t)rows * columns);              // gemv_wide writes [batch, rows, columns] densely
@@ -774,7 +775,7 @@ void GpuOps::attention_unfused(const Layer& layer, const Workspace& ws, int long
     // ponytail: MLX v0.32.4 runs fused steel attention for queries >= 2048 == keys (no prefix); not ported (chunks are
     // <= 512). Port it if a lane sends such a chunk.
     assert(!(queries >= 2048 && keys == queries));
-    assert((size_t)queries * heads * keys * ELEM <= ws.attention_scores.length &&
+    assert((size_t)queries * heads_per_key_value * keys * ELEM <= ws.attention_scores.length &&
            (size_t)key_value_heads * keys * head_dim * ELEM <= ws.gathered_keys.length);
     id<MTLBuffer> table = ws.step_table;
     [encoder setComputePipelineState:gather_keys_values_kernel];
@@ -787,29 +788,33 @@ void GpuOps::attention_unfused(const Layer& layer, const Workspace& ws, int long
     set_buffer(encoder, {ws.query}, 0), set_value(encoder, attention_scale(head_dim), 1);
     before_dispatch(), [encoder dispatchThreads:MTLSizeMake((size_t)queries * heads * head_dim, 1, 1)
                            threadsPerThreadgroup:MTLSizeMake(256, 1, 1)];
-    // scores [heads, queries, keys] = query keyᵀ; query is our [queries, heads, head_dim],
-    // (key_value head, repeat) -> head key_value_head * heads_per_key_value + repeat
-    const int64_t query_batch_strides[2] = {(int64_t)heads_per_key_value * head_dim, head_dim},
-                  key_value_batch_strides[2] = {(int64_t)keys * head_dim, 0};
-    multiply_bf16(true, {ws.query}, {ws.gathered_keys}, {ws.attention_scores}, queries, keys, head_dim, heads * head_dim,
-                  head_dim, keys, query_batch_strides, key_value_batch_strides, (int64_t)queries * keys);
-    [encoder setComputePipelineState:causal_mask_kernel];
-    set_buffer(encoder, {ws.attention_scores}, 0), set_buffer(encoder, {table}, 1);
-    before_dispatch(), [encoder dispatchThreads:MTLSizeMake(keys, queries, heads)
-                           threadsPerThreadgroup:MTLSizeMake(std::min(keys, 256), 1, 1)];
-    // softmax(precise=True), in place (softmax.cpp)
-    const bool looped = keys > 4096;
+    // per key_value head g: scores [heads_per_key_value, queries, keys] = query keyᵀ, so scores holds one head group
+    // (MLX's [heads, queries, keys] split by g; bit-exact, every row is computed alone). query is our
+    // [queries, heads, head_dim]; repeat r -> head g * heads_per_key_value + r
+    const int64_t query_batch_strides[2] = {0, head_dim}, key_value_batch_strides[2] = {0, 0},
+                  score_batch_strides[2] = {0, (int64_t)queries * keys};
+    const bool looped = keys > 4096;  // softmax(precise=True), in place (softmax.cpp)
     id<MTLComputePipelineState> softmax = softmax_kernel[looped];
     size_t threads_per_group = looped ? softmax.maxTotalThreadsPerThreadgroup : 32 * (((keys + 3) / 4 + 31) / 32);
     assert(threads_per_group <= softmax.maxTotalThreadsPerThreadgroup);
-    [encoder setComputePipelineState:softmax];
-    set_buffer(encoder, {ws.attention_scores}, 0), set_buffer(encoder, {ws.attention_scores}, 1), set_value(encoder, keys, 2);
-    before_dispatch(), [encoder dispatchThreads:MTLSizeMake((size_t)heads * queries * threads_per_group, 1, 1)
-                           threadsPerThreadgroup:MTLSizeMake(threads_per_group, 1, 1)];
-    // attention_heads [heads, queries, head_dim] = scores value
-    const int64_t score_batch_strides[2] = {(int64_t)heads_per_key_value * queries * keys, (int64_t)queries * keys};
-    multiply_bf16(false, {ws.attention_scores}, {ws.gathered_values}, {ws.attention_heads}, queries, head_dim, keys, keys,
-                  head_dim, head_dim, score_batch_strides, key_value_batch_strides, (int64_t)queries * head_dim);
+    for (int g = 0; g < key_value_heads; g++) {
+        const size_t key_value_offset = (size_t)g * keys * head_dim * ELEM;
+        multiply_bf16(true, {ws.query, (size_t)g * heads_per_key_value * head_dim * ELEM}, {ws.gathered_keys, key_value_offset},
+                      {ws.attention_scores}, queries, keys, head_dim, heads * head_dim, head_dim, keys, query_batch_strides,
+                      key_value_batch_strides, (int64_t)queries * keys);
+        [encoder setComputePipelineState:causal_mask_kernel];
+        set_buffer(encoder, {ws.attention_scores}, 0), set_buffer(encoder, {table}, 1);
+        before_dispatch(), [encoder dispatchThreads:MTLSizeMake(keys, queries, heads_per_key_value)
+                               threadsPerThreadgroup:MTLSizeMake(std::min(keys, 256), 1, 1)];
+        [encoder setComputePipelineState:softmax];
+        set_buffer(encoder, {ws.attention_scores}, 0), set_buffer(encoder, {ws.attention_scores}, 1), set_value(encoder, keys, 2);
+        before_dispatch(), [encoder dispatchThreads:MTLSizeMake((size_t)heads_per_key_value * queries * threads_per_group, 1, 1)
+                               threadsPerThreadgroup:MTLSizeMake(threads_per_group, 1, 1)];
+        // attention_heads [heads, queries, head_dim] = scores value
+        multiply_bf16(false, {ws.attention_scores}, {ws.gathered_values, key_value_offset},
+                      {ws.attention_heads, (size_t)g * heads_per_key_value * queries * head_dim * ELEM}, queries, head_dim,
+                      keys, keys, head_dim, head_dim, score_batch_strides, key_value_batch_strides, (int64_t)queries * head_dim);
+    }
 }
 
 void GpuOps::pick_next_tokens(Workspace& ws, const std::vector<SampleParams>& params) {

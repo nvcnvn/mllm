@@ -25,8 +25,8 @@ static double footprint_gb() {
 int main(int argc, char** argv) {
     if (argc < 4) return fprintf(stderr, "usage: long_ctx MODEL MAX_CTX P [P ...]\n"), 2;
     const int max_ctx = atoi(argv[2]), G = 128;
-    mllm::Engine e(argv[1], (size_t)12 << 30, 512, 32, 16, max_ctx, "gpu", "fp16", false);
-    e.tok.eos.clear();
+    mllm::Engine e(argv[1], (size_t)12 << 30, 512, 32, 16, max_ctx, "gpu", false);
+    e.tokenizer.eos.clear();
     printf("footprint after load %.2f GB\n", footprint_gb());
 
     // the copy a snapshot (or a hit's admit) makes, and a cold admit's memset, on idle arena units
@@ -54,11 +54,11 @@ int main(int argc, char** argv) {
         int mark = 4096, last_pos = 0;
         double last_t = 0, t_first = 0, prev = 0, worst = 0;
         int n = 0;
-        while (e.reqs.count(id)) {
+        while (e.requests.count(id)) {
             const auto ev = e.step();
-            auto it = e.reqs.find(id);
-            if (it != e.reqs.end() && it->second.state != mllm::State::WAITING && it->second.pos >= mark && !n) {
-                const int pos = it->second.pos;
+            auto it = e.requests.find(id);
+            if (it != e.requests.end() && it->second.state != mllm::State::WAITING && it->second.position >= mark && !n) {
+                const int pos = it->second.position;
                 const double t = since(t0);
                 printf("  P %d: pos %6d at %7.1f s (%.1f tok/s since pos %d)\n", P, pos, t, (pos - last_pos) / (t - last_t),
                        last_pos);

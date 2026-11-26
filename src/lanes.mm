@@ -68,9 +68,17 @@ static id<MTLCommandQueue> new_lane_queue(Memory& mem) {
     return queue;
 }
 
-// lanes.py _layers: apply_weights(i) then apply_attention(i) for every layer, into workspace.encoder
-static void encode_layers(GpuOps& ops, Workspace& workspace, int layer_count) {
-    for (int layer = 0; layer < layer_count; layer++) {
+// The GPU runs both lanes' command buffers in commit order: a decode step committed after a whole prefill chunk waits
+// for all of it (27B: ~4 s for 512 tokens). So a prefill chunk's GPU layers go in command buffers of this many layers,
+// each committed once the one before completes: a decode step waits for one at most. 8 at 27B (~0.5 s each): a
+// 2048-token prefill next to a decode of one request keeps 107 tok/s (131 alone) and the decode's longest step is
+// 0.54 s (3.9 s committed whole); 4: 85 tok/s, 0.31 s (report, g15). A lone prefill loses nothing to the chain: 4096
+// tokens at 128.1-128.2 tok/s chained, 127.7-129.2 as one buffer per chunk (g18).
+static constexpr int LAYERS_PER_BUFFER = 8;
+
+// lanes.py _layers: apply_weights(i) then apply_attention(i) for layers first .. end - 1, into workspace.encoder
+static void encode_layers(GpuOps& ops, Workspace& workspace, int first, int end) {
+    for (int layer = first; layer < end; layer++) {
         ops.apply_weights(layer, workspace);
         ops.apply_attention(layer, workspace);
     }
@@ -170,18 +178,24 @@ void PrefillLane::drop_started_chunks(std::deque<Chunk>& started, std::exception
 bool PrefillLane::take_turn(Chunk& chunk, const std::deque<Chunk>& others) {
     const int layer_count = mem.spec.n_layers(), surface_set = (int)(chunk.number % 2);
     Workspace& workspace = workspaces[surface_set];
-    // ponytail: a GPU chunk is one command buffer of all 24 layers (~10-50 ms); the other chunk's per-layer buffers
-    // queue behind it, so the ANE idles that long. Commit it per layer (or a few) to interleave if tails show in TTFT.
-    if (chunk.layers_committed < 0 && chunk.all_on_gpu) {
-        const bool earlier_chunk_of_request_running = std::any_of(others.begin(), others.end(), [&](const Chunk& other) {
-            return other.number < chunk.number && other.request_id == chunk.request_id &&
-                   other.layers_committed < layer_count;
-        });
-        if (earlier_chunk_of_request_running) return true;
-        // as the GPU lane: no attention output projection / feed-forward of the last layer
+    // A GPU chunk, as the GPU lane: LAYERS_PER_BUFFER layers per turn, each after the one before completes (whole, a
+    // 255-token tail held a decode step ~2 s at 27B); no attention output projection / feed-forward of the last layer
+    if (chunk.all_on_gpu && chunk.layers_committed < layer_count) {
+        if (chunk.layers_committed < 0) {
+            const bool earlier_chunk_of_request_running =
+                std::any_of(others.begin(), others.end(), [&](const Chunk& other) {
+                    return other.number < chunk.number && other.request_id == chunk.request_id &&
+                           other.layers_committed < layer_count;
+                });
+            if (earlier_chunk_of_request_running) return true;
+            chunk.layers_committed = 0;
+        } else {
+            wait_until_completed("PrefillLane", chunk.last_command_buffer);
+        }
+        const int first = chunk.layers_committed, end = std::min(first + LAYERS_PER_BUFFER, layer_count);
         chunk.last_command_buffer =
-            encode_and_commit(queue, workspace, [&] { encode_layers(ops, workspace, layer_count); }, false, fence);
-        chunk.layers_committed = layer_count;
+            encode_and_commit(queue, workspace, [&] { encode_layers(ops, workspace, first, end); }, false, fence);
+        chunk.layers_committed = end;
         return true;
     }
     if (chunk.layers_committed < 0) {
@@ -237,15 +251,11 @@ void PrefillLane::submit(PrefillWork work) {
     }
 }
 
-// The GPU runs both lanes' command buffers in commit order: a decode step committed after a whole chunk waited for
-// all of it (27B: ~4 s for 512 tokens). So the chunk is encoded now as command buffers of a few layers each, and each
-// is committed when the one before completes: a decode step waits for one at most. K/V and state only: the last
-// layer's attention output projection + feed-forward and pick_next_tokens never run.
+// The chunk is encoded now as command buffers of LAYERS_PER_BUFFER layers, each committed from the completion handler
+// of the one before. K/V and state only: the last layer's attention output projection + feed-forward and
+// pick_next_tokens never run.
 void PrefillLane::commit_gpu_chunk(Workspace& workspace) {
-    const int layer_count = mem.spec.n_layers();
-    // 8 at 27B (~0.5 s each): a 2048-token prefill next to a decode of one request keeps 107 tok/s (131 alone) and
-    // the decode's longest step is 0.54 s (3.9 s committed whole); 4: 85 tok/s, 0.31 s (report, g15)
-    constexpr int layers_per_buffer = 8;
+    const int layer_count = mem.spec.n_layers(), layers_per_buffer = LAYERS_PER_BUFFER;
     for (int first_layer = 0; first_layer < layer_count; first_layer += layers_per_buffer) {
         const bool last_buffer = first_layer + layers_per_buffer >= layer_count;
         gpu_command_buffers.push_back(encode_command_buffer(queue, workspace, [&] {
@@ -334,7 +344,7 @@ void DecodeLane::submit(DecodeWork work) {
         if (any_fed)
             ops.feed_previous_tokens(workspace, workspaces[(work.step + 1) % 2].next_token_ids, source_rows);
         const int layer_count = mem.spec.n_layers();
-        encode_layers(ops, workspace, layer_count);
+        encode_layers(ops, workspace, 0, layer_count);
         ops.apply_weights(layer_count, workspace);
         std::vector<SampleParams> sampler_params;
         for (const DecodeRow& row : work.rows) sampler_params.push_back(row.sampler);

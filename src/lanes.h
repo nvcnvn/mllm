@@ -97,7 +97,7 @@ private:
     struct Chunk {
         uint64_t number;  // k: its place in submit order, from 1
         int request_id;
-        bool all_on_gpu;            // all layers on the GPU, in one command buffer
+        bool all_on_gpu;            // all layers on the GPU, LAYERS_PER_BUFFER per turn (lanes.mm)
         int layers_committed = -1;  // layers whose attention is committed (-1: not started)
         id<MTLCommandBuffer> last_command_buffer;  // the last one committed
     };

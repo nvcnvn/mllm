@@ -531,6 +531,23 @@ build/mllm serve mlx-community/Qwen3.6-27B-4bit --port 18015 [--prefix-cache off
 - A new conversation on the same system prompt hit 4224 tokens (turn 1's last full page lay inside the shared part):
   TTFT 0.42 and 0.38 s.
 
+## 27B: g18 (scores workspace, prefill chain, B = 4 kernel)
+
+Measured 2026-11-26 under the heavy lock, interleaved; logs and scripts in `/Volumes/T5/cache/mllm/g18/`. Builds:
+main b8af2c9 (base), item 4 alone (i4), items 3 + 4 (i3, i3b).
+- **Workspace** (`--max-ctx 131072 --arena-gib 12`): 4182.7 → 1878.7 MiB; at 32k 1156.1 → 580.1. The unfused fallback
+  runs per KV head group; test_attn bit-exact. `tools/long_ctx.mm` 32640 tokens (base / i4, two holds, order swapped):
+  prefill + first token 293.4, 275.5 / 290.1, 283.0 s; decode 12.34, 12.80 / 12.81, 12.95 tok/s.
+- **Lone prefill and the chain** (`bench -p 4096 -g 16 -n 2`): base (chain) 128.1, 128.2; i4 128.0, 130.2; i3 (one
+  buffer per chunk when nothing decodes) 127.7, 129.2 tok/s. No cost to remove, so the chain stays always on.
+  `tools/overlap.mm ... 2048` (decode alongside): base gap max 548-575 ms, B 102-107 tok/s; i3 538-559 ms, 104-108.
+- **ANE lane short GPU chunk** (`tools/overlap.mm MODEL 200 ane`, one 200-token chunk on the GPU path while A decodes):
+  base (one buffer) gap max 1860-2064 ms, B 2.14-2.37 s; i3b (8-layer turns) 316-328 ms, B 3.25-3.31 s.
+- **B = 4** (bench-ops step at 512 keys): base 92.8-94.2 ms, qmv_decode VPT 8 89.5 ms, VPT 16 127.1 ms (first try,
+  not unrolled: 210.8 ms). `bench -p 512 -g 256 -b 4 -n 3`, engine before qmv_decode vs mlx-lm: 35.62 / 38.68,
+  37.69 / 38.96 tok/s. qmv_decode was reverted: test_engine_cache's small-arena check wants batched outputs equal to
+  solo ones and got 19 / 20 (the kernel is in branch g18's commit 8c2cda1).
+
 ## Raw output (final run)
 ```
 p=512 g=256

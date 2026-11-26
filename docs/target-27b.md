@@ -20,7 +20,7 @@ Expected shape (*estimates* from the 0.8B numbers, replaced by measurements as i
 
 ## 3. GPU path, fast
 - [ ] Decode at B = 1 ≥ mlx-lm: 0.97-0.99x in two interleaved holds (g14; see the report). **Check:** ≥ 1.00 in an interleaved hold. The GPU step (64.4 ms, bench-ops) already equals mlx-lm's per-token time; ~1-2 ms is outside it, and the dispatch floor (948 dispatches, ~2-4 ms, *estimate*) is the lever.
-- [ ] Decode at B = 4 per-row cost: a B = 4 step costs 1.42x the B = 1 step (91.5 vs 64.4 ms GPU, bench-ops; qmv_wide at 164-177 GB/s; qmm_t_decode at M = 4 is slower). **Check:** B = 4 ≥ mlx-lm (35.1; engine 32.7, one run on a busy machine) and closer to free.
+- [ ] Decode at B = 4 per-row cost (g18: tried, not kept): a qmv_fast over 2..6 rows (one weight pass, 8 values per thread) took the B = 4 GPU step 92.8 → 89.5 ms (bench-ops; matmuls 163-177 → 171-183 GB/s), but test_engine_cache's small-arena check (batched outputs equal cache-off solo runs, 20 / 20) got 19 / 20, so it was reverted; that test's exact-equality assumption has to change first (batched decode is checked by tolerance). On a quiet machine mlx-lm gives 38.7-39.0 tok/s at B = 4 and the engine (before qmv_decode) 35.6-37.7: the bench's staggered starts (each prompt prefills alone, so the batch ramps up and tails off at B < 4) cost more than the kernel gains. **Check:** B = 4 ≥ mlx-lm in bench, interleaved.
 - [ ] Prefill chunk 512 vs 1024 (>= 2048 needs steel attention, not ported; *estimate* < 3%). **Check:** interleaved A/B recorded; chunk 1024 the 27B default if it wins.
 
 ## 4. Memory, under real conditions (g15: budget and long context done, see the report)
@@ -166,8 +166,8 @@ The reference's own perplexity is 30.4.
   - If none passes, the next step is calibrated quantization (DWQ/AWQ-style).
 
 ## 8. Other gaps found on the way (2026-11-23/24)
-- **Prefill vs decode trade-off (g15):** an 8-layer command-buffer chain keeps decode gaps under 1 s but raised the mixed session's mean TTFT from 35.8 to 49.8 s. Untried: splitting only while a decode lane is active, so a lone prefill runs whole.
-- **Workspace at 128k:** 4.2 GiB, of which 3 GiB is `scores` from MLX's unfused attention fallback. A bit-exact fix loops the fallback over KV heads (`scores` 4× smaller).
+- **Prefill vs decode trade-off (g15, g18: closed):** the 8-layer chain costs a lone prefill nothing (4096 tokens: 128.1-128.2 tok/s chained, 127.7-129.2 as one buffer), so the mixed session's TTFT rise is the GPU time decode takes, not the chain; splitting only while a request decodes was dropped. The ANE lane's short all-GPU chunks now use the same chain: a 200-token prompt next to a decode held a step 1.86-2.06 s, now 0.32 s (see the report, g18).
+- **Workspace at 128k (g18: done):** 4183 → 1879 MiB (32k: 1156 → 580). The unfused fallback runs one KV head group at a time, so `scores` is 4× smaller; bit-exact.
 - **Long-context decode against mlx-lm:** not compared. The engine gives 12.95 tok/s at 32k and 8.49 at 128k, at 86% of a bound that reads K/V as fast as the weights.
 - **Unmeasured:**
   - Cold load with an empty page cache (needs `sudo purge`). The weights-cache rewrite (~2 min) and the warm start (~4 s) are measured.

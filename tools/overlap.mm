@@ -1,15 +1,17 @@
 // A decodes (B = 1, 64 random tokens) while B prefills P random tokens: A's token gaps alone and during B's prefill, and B's
 // prefill time (target-27b.md §4: no decode step > 1 s). Built like tools/long_ctx.mm:
-//   clang++ ... tools/overlap.mm build/libmllm.a ... -o build/overlap; build/overlap MODEL P
+//   clang++ ... tools/overlap.mm build/libmllm.a ... -o build/overlap; build/overlap MODEL P [gpu|ane]
+//   (ane: 1024-token chunks; a P below 256 runs as one short chunk on the GPU path, in the ANE lane)
 #include <chrono>
 #include <random>
 #include "engine.h"
 using clk = std::chrono::steady_clock;
 int main(int argc, char** argv) {
-    if (argc < 3) return fprintf(stderr, "usage: overlap MODEL P\n"), 2;
+    if (argc < 3) return fprintf(stderr, "usage: overlap MODEL P [gpu|ane]\n"), 2;
     const int P = atoi(argv[2]);
-    mllm::Engine e(argv[1], (size_t)12 << 30, 512, 32, 16, 32768, "gpu", "fp16", false);
-    e.tok.eos.clear();
+    const std::string prefill_on = argc > 3 ? argv[3] : "gpu";
+    mllm::Engine e(argv[1], (size_t)12 << 30, prefill_on == "ane" ? 1024 : 512, 32, 16, 32768, prefill_on, false);
+    e.tokenizer.eos.clear();
     std::mt19937 rng(1);
     std::uniform_int_distribution<int> tok(1000, 100000);
     auto ids = [&](int n) { std::vector<int> v(n); for (int& t : v) t = tok(rng); return v; };
@@ -36,7 +38,7 @@ int main(int argc, char** argv) {
             if (b >= 0 && b_time > 0) break;
         }
         e.cancel(a);
-        while (!e.reqs.empty()) e.step();
+        while (!e.requests.empty()) e.step();
         auto mean = [](auto& v) { double s = 0; for (double x : v) s += x; return s / v.size(); };
         printf("rep %d: solo gap mean %.1f ms max %.1f; during B (%d tok, %.2f s, %.1f tok/s): %zu tokens, gap mean %.1f "
                "max %.1f ms\n", rep,

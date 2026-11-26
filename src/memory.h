@@ -91,7 +91,8 @@ struct Workspace {
     // partial_sums: the fp32 partial sums of the split multiplies (MLX qmm_t_splitk and qmm_t_decode).
     // Attention: attention_heads (attention's output, MLX's [requests, heads, tokens, head_dim]); two_pass_partials /
     // two_pass_sums / two_pass_maxes (MLX sdpa 2-pass); gathered_keys / gathered_values (prefill: the row's keys and
-    // values gathered, [key_value_heads, max_context, head_dim]); attention_scores [heads, rows, max_context].
+    // values gathered, [key_value_heads, max_context, head_dim]); attention_scores [heads_per_key_value, rows,
+    // max_context] (one key_value head group at a time).
     // Linear attention: normalized_query_key (normalized query / key, [rows, conv_dim]), decay (fp32) / update_rate
     // [rows, linear_value_heads].
     // next_token_ids: the highest-scoring token per row (int32), read by sample_tokens after the command buffer

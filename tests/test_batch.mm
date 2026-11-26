@@ -1,6 +1,6 @@
 // Batched decode by tolerance (architecture.md): teacher-forced decode of batch_ref's 8 sequences
 // (py/dump_batch_ref.py), every position as one token per request from position 0, through GpuOps on a concurrent
-// encoder (as the decode lane). 1 request: the reference's top-64 next-token scores byte for byte. 8 and 16 requests
+// encoder (as the decode lane). 1 request: the reference's top-64 next-token scores byte for byte. 2..6, 8 and 16 requests
 // (each sequence on 1 or 2 rows, rows at different positions): mean KL(reference || ours) over the reference's top-64
 // plus a rest bucket <= KL_MAX, and our highest-scoring token within one bf16 ulp of the reference's top score at >= 99%
 // of positions.
@@ -209,6 +209,6 @@ int main() {
 
     BatchTest test{model, reference, memory, ops, workspace, tables, table, queue, pages_per_row, units_per_row, units, {}};
     test.check_one_request();
-    for (int request_count : {8, 16}) test.check_requests(request_count);
+    for (int request_count : {2, 3, 4, 5, 6, 8, 16}) test.check_requests(request_count);
     printf("PASS\n");
 }
