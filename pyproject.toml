@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "mmmllm"
-version = "0.2.0"
+version = "0.3.0rc1"
 description = "my mac mini llm: a C++/Metal LLM serving engine for Apple M4 Macs"
 readme = "README.md"
 license = "Apache-2.0"
