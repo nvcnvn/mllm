@@ -76,16 +76,18 @@ public:
     void feed_previous_tokens(Workspace& ws, id<MTLBuffer> previous_token_ids, const std::vector<int>& source_rows);
 
     // The MTP draft head (spec.mtp; docs/speculative.md), no Python counterpart (tools/spec/accept.py has MLX's).
-    // apply_mtp: one request's ws.tokens_per_request rows at ws.step_table's positions. Row i takes hidden row i (the
-    // 27B's final-normed state at position p + i) and token_ids[i] (the token at p + i + 1) -> the head's keys / values
-    // at p + i (its slot after the model's full layers in each unit), its final-normed output in ws.residual. hidden
-    // may be ws.residual. Prefill runs it over every chunk, so a prompt's head K/V exists before decode.
+    // apply_mtp: ws's rows at ws.step_table's positions, one request's tokens_per_request rows or decode rows (one
+    // token each). Row i takes hidden row i (the 27B's final-normed state at its position p) and token_ids[i] (the
+    // token at p + 1) -> the head's keys / values at p (its slot after the model's full layers in each unit), its
+    // final-normed output in ws.residual. hidden may be ws.residual. Every 27B pass runs it over its rows (prefill
+    // with the next prompt token, decode and verify with the tokens they chose), so the head's K/V is always there.
     void apply_mtp(Workspace& ws, Buf hidden, Buf token_ids);
-    // Greedy drafting, encoded into one command buffer: apply_mtp over ws's rows (the newly accepted positions), the
-    // last row's argmax is draft 0; then per chain_tables entry (a one-row step table, one position further each) the
-    // head runs on its own output and the draft before it, fed on the GPU -> draft j. Drafts land in
-    // ws.next_token_ids[0 .. k), their scores in ws.next_token_scores rows 0 .. k (k = 1 + chain_tables.size()).
-    void draft_tokens(Workspace& ws, Buf hidden, Buf token_ids, const std::vector<id<MTLBuffer>>& chain_tables);
+    // Greedy drafting, k = 1 + chain_tables.size(), encoded into one command buffer: draft 0 is the argmax of the
+    // head's output row head_output (apply_mtp's, at the position before the last accepted token); then per
+    // chain_tables entry (a one-row step table, one position further each) the head runs on its own output and the
+    // draft before it, fed on the GPU -> draft j. Drafts land in ws.next_token_ids[0 .. k), their scores in
+    // ws.next_token_scores rows 0 .. k; ws.residual is overwritten.
+    void draft_tokens(Workspace& ws, Buf head_output, const std::vector<id<MTLBuffer>>& chain_tables);
     bool has_mtp() const { return spec.mtp; }
 
 
@@ -150,6 +152,7 @@ private:
     void linear_attention(int i, const Layer& layer, Workspace& ws);
     void conv_and_normalize(const Layer& layer, Workspace& ws, uint64_t conv_offset);
     void update_state(Buf decay_input, Buf update_rate_input, const Layer& layer, Workspace& ws, uint64_t delta_offset);
+    uint64_t checkpoint_stride(const Workspace& ws) const;
 
     QuantizedWeights embed_tokens;
     QuantizedWeights lm;  // language_model.lm_head, or embed_tokens when tied (Qwen3.5 <= 9B: embed_tokens.as_linear)

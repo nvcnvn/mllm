@@ -82,6 +82,9 @@ struct Workspace {
     // token_ids' shape this step (the lane sets it): apply_weights works on request_count * tokens_per_request rows
     int request_count = 0, tokens_per_request = 0;
     id<MTLBuffer> step_table;  // this step's StepTables copy, row b = workspace row b (the lane sets it)
+    // speculative verify (one request, n tokens): linear layers read the row's first state set and write the state
+    // after token t into set 1 + t, so a rollback picks a set (the row lists 1 + n sets of state units)
+    bool checkpoint_states = false;
     id<MTLComputeCommandEncoder> encoder;  // GpuOps encodes into it (the lane sets it)
     int max_rows = 0, max_context = 0;     // capacity: rows <= max_rows, position + tokens <= max_context
 

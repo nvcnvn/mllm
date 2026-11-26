@@ -24,6 +24,7 @@ template <typename InT, typename StT, int Dk, int Dv, int Hk, int Hv>
     const constant ulong& unit [[buffer(10)]],
     const constant int& n_state [[buffer(11)]],
     const constant ulong& delta_off [[buffer(12)]],
+    const constant ulong& checkpoint [[buffer(13)]],  // 0, or conv1d_silu's: the state after token t at x + (1 + t) * checkpoint
     uint3 thread_position_in_grid [[thread_position_in_grid]],
     uint thread_index_in_simdgroup [[thread_index_in_simdgroup]]) {
   constexpr int lanes_per_row = 4;
@@ -119,8 +120,15 @@ template <typename InT, typename StT, int Dk, int Dv, int Hk, int Hv>
     y += Hv * Dv;
     g_ += Hv;
     beta_ += Hv;
+    if (checkpoint) {
+      auto t_state = (device StT*)(arena + tb.state_byte(b_idx, n_state, unit, x + (1 + t) * checkpoint));
+      for (int i = 0; i < values_per_lane; ++i) {
+        t_state[i] = static_cast<StT>(state[i]);
+      }
+    }
   }
 
+  if (checkpoint) return;
   for (int i = 0; i < values_per_lane; ++i) {
     o_state[i] = static_cast<StT>(state[i]);
   }

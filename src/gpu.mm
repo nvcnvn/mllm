@@ -458,7 +458,7 @@ void GpuOps::apply_weights(int i, Workspace& ws) {
 void GpuOps::apply_mtp(Workspace& ws, Buf hidden, Buf token_ids) {
     begin(ws);
     const int rows = ws.request_count * ws.tokens_per_request, width = spec.hidden;
-    assert(spec.mtp && ws.request_count == 1 && rows > 0 && rows <= ws.max_rows);
+    assert(spec.mtp && (ws.request_count == 1 || ws.tokens_per_request == 1) && rows > 0 && rows <= ws.max_rows);
     look_up_embeddings(token_ids, {ws.projected}, rows);
     if (rows == 1) {  // one row is already [first | second]
         normalize(mtp_norm_embedding, {ws.projected}, {ws.gate_values}, 1, width);
@@ -478,22 +478,23 @@ void GpuOps::apply_mtp(Workspace& ws, Buf hidden, Buf token_ids) {
     normalize(mtp_norm, {ws.residual}, {ws.residual}, rows, width);
 }
 
-void GpuOps::draft_tokens(Workspace& ws, Buf hidden, Buf token_ids, const std::vector<id<MTLBuffer>>& chain_tables) {
-    const int k = 1 + (int)chain_tables.size(), vocab_size = lm.out_size, last = ws.tokens_per_request - 1;
-    const size_t row_bytes = (size_t)spec.hidden * ELEM, scores_bytes = (size_t)vocab_size * ELEM;
+void GpuOps::draft_tokens(Workspace& ws, Buf head_output, const std::vector<id<MTLBuffer>>& chain_tables) {
+    begin(ws);
+    const int k = 1 + (int)chain_tables.size(), vocab_size = lm.out_size;
+    const size_t scores_bytes = (size_t)vocab_size * ELEM;
     assert(ws.next_token_scores.length >= k * scores_bytes && ws.next_token_ids.length >= k * sizeof(int32_t));
     const id<MTLBuffer> table = ws.step_table;
-    const int tokens = ws.tokens_per_request;
-    apply_mtp(ws, hidden, token_ids);
+    const int requests = ws.request_count, tokens = ws.tokens_per_request;
+    ws.request_count = 1, ws.tokens_per_request = 1;
     for (int j = 0; j < k; j++) {
-        if (j) {  // the head on its own output (ws.residual's row from step j - 1) and draft j - 1, one position on
-            ws.step_table = chain_tables[j - 1], ws.tokens_per_request = 1;
-            apply_mtp(ws, {ws.residual, (j == 1 ? last : 0) * row_bytes}, {ws.next_token_ids, (j - 1) * sizeof(int32_t)});
+        if (j) {  // the head on its own output and draft j - 1, one position on
+            ws.step_table = chain_tables[j - 1];
+            apply_mtp(ws, j == 1 ? head_output : Buf{ws.residual}, {ws.next_token_ids, (j - 1) * sizeof(int32_t)});
         }
-        multiply_weights(lm, {ws.residual, (j ? 0 : last) * row_bytes}, {ws.next_token_scores, j * scores_bytes}, 1);
+        multiply_weights(lm, j ? Buf{ws.residual} : head_output, {ws.next_token_scores, j * scores_bytes}, 1);
         greedy_tokens({ws.next_token_scores, j * scores_bytes}, {ws.next_token_ids, j * sizeof(int32_t)}, 1, vocab_size);
     }
-    ws.step_table = table, ws.tokens_per_request = tokens;
+    ws.step_table = table, ws.request_count = requests, ws.tokens_per_request = tokens;
 }
 
 // after_attention = residual + attention_output(attention_result); residual = after_attention + feed-forward of
@@ -614,8 +615,10 @@ void GpuOps::linear_attention(int i, const Layer& layer, Workspace& ws) {
     const int conv_dim = spec.conv_dim(), value_heads = spec.linear_value_heads;
     const uint32_t* table_words = (const uint32_t*)ws.step_table.contents;
     // the table must carry every row's state span: the kernels index it with state_units = mem.state_units
-    assert((int)table_words[0] == requests && table_words[1] == mem.state_units && rows <= ws.max_rows &&
-           (requests == 1 || tokens == 1));
+    // checkpoint_states: the row lists the state set read, then one set per token (written after that token)
+    const uint32_t state_sets = ws.checkpoint_states ? 1 + tokens : 1;
+    assert((int)table_words[0] == requests && table_words[1] == mem.state_units * state_sets && rows <= ws.max_rows &&
+           (requests == 1 || tokens == 1) && (!ws.checkpoint_states || (requests == 1 && tokens > 1)));
     for (int b = 0; b < requests; b++)
         assert(requests == 1 ? (int)table_words[2 + requests + b] == tokens : (int)table_words[2 + requests + b] <= tokens);
     const uint64_t conv_offset = mem.state_offset(i), delta_offset = conv_offset + mem.conv_bytes;
@@ -662,7 +665,7 @@ void GpuOps::conv_and_normalize(const Layer& layer, Workspace& ws, uint64_t conv
     set_buffer(encoder, {ws.query_key_value}, 0), set_buffer(encoder, layer.conv_weights, 1);
     set_buffer(encoder, {arena}, 2), set_buffer(encoder, {table}, 3);
     set_value(encoder, unit_bytes, 4), set_value(encoder, state_units, 5), set_value(encoder, conv_offset, 6);
-    set_value(encoder, tokens, 7);
+    set_value(encoder, tokens, 7), set_value(encoder, checkpoint_stride(ws), 8);
     before_dispatch(), [encoder dispatchThreads:MTLSizeMake(conv_dim, requests, 1) threadsPerThreadgroup:MTLSizeMake(256, 1, 1)];
 
     // normalize_qk: rms_norm without weight (eps scaled to the mean), then the scales. Rows of 128 over the whole
@@ -698,9 +701,14 @@ void GpuOps::update_state(Buf decay_input, Buf update_rate_input, const Layer& l
     set_buffer(encoder, {ws.decay}, 3), set_buffer(encoder, {ws.update_rate}, 4), set_buffer(encoder, {arena}, 5);
     set_buffer(encoder, {ws.attention_result}, 6), set_buffer(encoder, {table}, 7);
     set_value(encoder, tokens, 8), set_value(encoder, conv_dim, 9), set_value(encoder, unit_bytes, 10);
-    set_value(encoder, state_units, 11), set_value(encoder, delta_offset, 12);
+    set_value(encoder, state_units, 11), set_value(encoder, delta_offset, 12), set_value(encoder, checkpoint_stride(ws), 13);
     before_dispatch(), [encoder dispatchThreads:MTLSizeMake(32, spec.linear_value_dim / 8, requests * value_heads)
                            threadsPerThreadgroup:MTLSizeMake(32, 2, 1)];
+}
+
+// the kernels' checkpoint: one state set's bytes in the row's span when ws.checkpoint_states, else 0
+uint64_t GpuOps::checkpoint_stride(const Workspace& ws) const {
+    return ws.checkpoint_states ? (uint64_t)mem.state_units * mem.arena.unit_bytes : 0;
 }
 
 static KeyValueLayout key_value_layout(const Memory& mem, const ModelSpec& spec, int full_layer) {

@@ -41,7 +41,8 @@ inline size_t workspace_estimate(const ModelSpec& s, GpuClass gpu, int chunk, in
     };
     // a layer's weights: the larger attention kind's projections, then the MLP
     const size_t layer = (size_t)s.hidden * (std::max(3 * q + 2 * kv, conv + 2 * lv + 2 * lvh) + 3 * ff);
-    return one(chunk, 1) + 2 * one(1, max_batch) + (ane ? 2 * (2 * layer + chunk * row_bytes) : 0);
+    // with a draft head, the decode lane's verify runs DecodeLane::DRAFTS + 1 queries
+    return one(chunk, 1) + 2 * one(s.mtp ? 3 : 1, max_batch) + (ane ? 2 * (2 * layer + chunk * row_bytes) : 0);
 }
 
 struct EngineSizes {

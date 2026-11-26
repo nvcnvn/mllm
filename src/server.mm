@@ -86,7 +86,7 @@ struct Server::Stream {
     std::mutex mutex;  // guards the rest
     std::condition_variable changed;
     bool started = false;  // submitted (prompt_tokens set) or rejected (error set)
-    int prompt_tokens = 0, completion_tokens = 0, cached_tokens = 0;
+    int prompt_tokens = 0, completion_tokens = 0, cached_tokens = 0, rounds = 0, round_tokens = 0;
     std::string error;
     std::deque<Splitter::Piece> pieces;
     std::string finish_reason;  // set last: stop | length | error
@@ -167,10 +167,11 @@ static std::string parse_request(json& body, Server::Stream& stream, bool& strea
     return "";
 }
 
-// OpenAI's fields, plus ttft_ms (arrival to first token) and tokens_per_second (after the first token)
+// OpenAI's fields, plus ttft_ms (arrival to first token), tokens_per_second (after the first token) and, when it
+// decoded speculatively, speculative: {rounds, tokens_per_round}
 static json usage_json(const Server::Stream& stream) {
     const int tokens = stream.completion_tokens;
-    return json{{"prompt_tokens", stream.prompt_tokens},
+    json out{{"prompt_tokens", stream.prompt_tokens},
                 {"completion_tokens", tokens},
                 {"total_tokens", stream.prompt_tokens + tokens},
                 {"prompt_tokens_details", {{"cached_tokens", stream.cached_tokens}}},
@@ -178,6 +179,9 @@ static json usage_json(const Server::Stream& stream) {
                 {"tokens_per_second",
                  tokens > 1 ? std::round((tokens - 1) / seconds(stream.last_token_at - stream.first_token_at) * 10) / 10
                             : 0.0}};
+    if (stream.rounds) out["speculative"] = {{"rounds", stream.rounds}, {"tokens_per_round", std::round(
+                                                 (double)stream.round_tokens / stream.rounds * 100) / 100}};
+    return out;
 }
 
 // One streamed choice: text (completions) or a content / reasoning_content delta (chat)
@@ -408,10 +412,14 @@ static void log_finished(Server::Stream& stream, const std::string& finish_reaso
     std::lock_guard lock(stream.mutex);  // handler threads only read these
     const int tokens = stream.completion_tokens;
     fprintf(stderr, "mllm serve: request %d: prompt %d tokens, %d cached, first token %.3f s; %d tokens at "
-            "%.1f tok/s, %s\n", stream.request_id, stream.prompt_tokens, stream.cached_tokens,
+            "%.1f tok/s, %s", stream.request_id, stream.prompt_tokens, stream.cached_tokens,
             tokens ? seconds(stream.first_token_at - stream.arrived) : 0.0, tokens,
             tokens > 1 ? (tokens - 1) / seconds(stream.last_token_at - stream.first_token_at) : 0.0,
             finish_reason.c_str());
+    if (stream.rounds)
+        fprintf(stderr, "; %d speculative rounds, %.2f tokens each", stream.rounds,
+                (double)stream.round_tokens / stream.rounds);
+    fprintf(stderr, "\n");
 }
 
 void Server::deliver(const Event& event) {
@@ -428,7 +436,7 @@ void Server::deliver(const Event& event) {
     stream.update([&] {
         if (event.token >= 0 && !stream.completion_tokens++) stream.first_token_at = now;
         stream.last_token_at = now;
-        stream.cached_tokens = event.cached;
+        stream.cached_tokens = event.cached, stream.rounds = event.rounds, stream.round_tokens = event.round_tokens;
         for (auto& piece : pieces) stream.pieces.push_back(std::move(piece));
         stream.finish_reason = finish_reason;
     });

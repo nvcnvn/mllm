@@ -78,6 +78,8 @@
 // out = silu(depthwise conv1d(conv_in)): MLX's depthwise_conv_1d (float acc over the taps in order) then the compiled
 // nn.silu (x * sigmoid(x), bf16). In place: qkv row t becomes out row t. The conv state sits in the row's state
 // span at conv_off. One thread per (channel, row), grid (C, B).
+// checkpoint (bytes, 0 = off; speculative verify, one row): the state after token t goes to span byte
+// x + (1 + t) * checkpoint instead (the row's span lists the state set read, then one set per token).
 template <int K>
 [[kernel]] void conv1d_silu(
     device bfloat16_t* qkv [[buffer(0)]],
@@ -88,6 +90,7 @@ template <int K>
     const constant int& n_state [[buffer(5)]],
     const constant ulong& conv_off [[buffer(6)]],
     const constant int& S [[buffer(7)]],
+    const constant ulong& checkpoint [[buffer(8)]],
     uint2 i [[thread_position_in_grid]],
     uint2 grid [[threads_per_grid]]) {
   Table tb{table};
@@ -108,8 +111,13 @@ template <int K>
     bfloat16_t y = static_cast<bfloat16_t>(acc);
     *x = Multiply{}(y, Sigmoid{}(y));
     for (int k = 0; k < K - 1; k++) win[k] = win[k + 1];
+    if (checkpoint)
+      for (int r = 0; r < K - 1; r++)
+        *(device bfloat16_t*)(arena + tb.state_byte(b, n_state, unit,
+                                                    conv_off + (ulong(r) * C + i.x) * 2 + (1 + t) * checkpoint)) = win[r];
   }
-  for (int r = 0; r < K - 1; r++) *st[r] = win[r];
+  if (!checkpoint)
+    for (int r = 0; r < K - 1; r++) *st[r] = win[r];
 }
 template [[host_name("conv1d_silu_4")]] [[kernel]] decltype(conv1d_silu<4>) conv1d_silu<4>;
 

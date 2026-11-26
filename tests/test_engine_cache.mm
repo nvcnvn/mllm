@@ -434,7 +434,9 @@ static void check_chat_turn_resumes_after_reply(mllm::Engine& on, mllm::Engine& 
 static void check_gpu_chunk_512(const TestPrompts& prompts, const std::vector<Tokens>& golden_ids) {
     TokensByPrompt off_tokens;  // greedy 64, cache off
     mllm::Engine off(golden::MODEL, ARENA_BYTES, CHUNK_TOKENS, 32, 16, 16384, "gpu", false);
+    off.speculate = false;  // golden: plain decode is bit-exact, speculative is not
     mllm::Engine on(golden::MODEL, ARENA_BYTES, CHUNK_TOKENS, 32, 16, 16384, "gpu", true);
+    on.speculate = false;  // golden: plain decode is bit-exact, speculative is not
     assert(!off.cache && on.cache);
     for (const auto& prompt : prompts.all) {
         RunResult off_run = run_alone(off, prompt);
@@ -456,7 +458,9 @@ static void check_gpu_chunk_512(const TestPrompts& prompts, const std::vector<To
 static TokensByPrompt check_gpu_chunk_32(const TestPrompts& prompts) {
     TokensByPrompt off_tokens;
     mllm::Engine off(golden::MODEL, ARENA_BYTES, 32, 32, 16, 16384, "gpu", false);
+    off.speculate = false;  // golden: plain decode is bit-exact, speculative is not
     mllm::Engine on(golden::MODEL, ARENA_BYTES, 32, 32, 16, 16384, "gpu", true);
+    on.speculate = false;  // golden: plain decode is bit-exact, speculative is not
     for (const auto& prompt : prompts.all) off_tokens[prompt] = run_alone(off, prompt).tokens;
     for (const std::vector<int>* each : {&prompts.long_question, &prompts.haiku_question, &prompts.departure_question,
                                          &prompts.grain_question, &prompts.long_question}) {
@@ -476,7 +480,9 @@ static TokensByPrompt check_gpu_chunk_32(const TestPrompts& prompts) {
 // ANE prefill: the same hits; long_text_1300's tokens equal ANE's cache-off run (the others as at chunk 512)
 static void check_ane_prefill(const TestPrompts& prompts) {
     mllm::Engine off(golden::MODEL, ARENA_BYTES, CHUNK_TOKENS, 32, 16, 16384, "ane", false);
+    off.speculate = false;  // golden: plain decode is bit-exact, speculative is not
     mllm::Engine on(golden::MODEL, ARENA_BYTES, CHUNK_TOKENS, 32, 16, 16384, "ane", true);
+    on.speculate = false;  // golden: plain decode is bit-exact, speculative is not
     for (const std::vector<int>* each : {&prompts.long_text_1300, &prompts.long_question, &prompts.haiku_question,
                                          &prompts.departure_question, &prompts.timber_question}) {
         const std::vector<int>& prompt = *each;  // by address, so the checks below can tell which prompt this is
@@ -577,6 +583,7 @@ int main(int argc, char** argv) {
     }
     {
         mllm::Engine on(golden::MODEL, SMALL_ARENA_BYTES, 32, 32, 16, 16384, "gpu", true);
+        on.speculate = false;  // golden: plain decode is bit-exact, speculative is not
         check_small_arena_evictions(on, prompts, off_tokens_chunk_32);
         check_oversized_hit_admitted(on, prompts);
     }

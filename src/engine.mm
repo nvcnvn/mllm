@@ -53,6 +53,8 @@ int Engine::submit(std::vector<int> prompt, GenParams params) {
     if (units_needed(r) > mem.arena.n_units)
         throw std::invalid_argument("request needs " + std::to_string(units_needed(r)) + " units, arena has " +
                                     std::to_string(mem.arena.n_units));
+    r.speculative = speculate && gpu.has_mtp() && !gpu.on_scores && params.temperature == 0 &&
+                    max_batch >= DecodeLane::DRAFTS + 1;
     Request& stored = requests.emplace(r.id, std::move(r)).first->second;
     stored.sampler.rng = &stored.random_engine;
     return next_request_id++;
@@ -136,16 +138,39 @@ bool Engine::take_decoded_tokens() {
         abort(requests_in_lane(State::DECODE));
         throw;
     }
-    for (auto [req_id, token] : tokens) {
+    for (size_t i = 0, end; i < tokens.size(); i = end) {  // a speculative round gives its request several in a row
+        const int req_id = tokens[i].first;
+        std::vector<int> chosen;
+        for (end = i; end < tokens.size() && tokens[end].first == req_id; end++) chosen.push_back(tokens[end].second);
         auto it = requests.find(req_id);
         if (it == requests.end() || it->second.state == State::DONE) continue;  // ran one step past its end (fed)
-        Request& r = it->second;
-        r.in_flight--;
-        if (r.cancelled) {
-            if (r.ended) r.position += 1, cache_sequence(r);  // this step fed its last token
-            finish(r);
-            continue;
-        }
+        take_tokens(it->second, chosen);
+    }
+    return !tokens.empty();
+}
+
+// r's tokens from one decode step: one, or a speculative round's 1 + accepted drafts. Position, generated tokens and
+// state only ever count tokens kept, so the prefix cache gets exactly them: a round cut short by EOS or max_tokens
+// takes the state set after its last kept row.
+void Engine::take_tokens(Request& r, const std::vector<int>& chosen) {
+    r.in_flight--;
+    const bool round = std::exchange(r.speculating, false);
+    if (r.cancelled) {
+        if (r.ended) r.position += 1, cache_sequence(r);  // this step fed its last token
+        finish(r);
+        return;
+    }
+    size_t kept = 0;
+    while (kept < chosen.size() && (int)(r.generated.size() + kept) < r.max_tokens)
+        if (tokenizer.eos.count(chosen[kept++])) break;
+    if (round) {  // the verify wrote the state after row j into set j: make the last kept row's the request's
+        const size_t units = r.state_slots.size(), set = kept - 1;
+        if (set) std::swap_ranges(r.state_slots.begin(), r.state_slots.end(), r.spare_state.begin() + (set - 1) * units);
+        r.last_row = (int)set;  // the head's output to draft from next
+        rounds++, round_tokens += kept, r.rounds++, r.round_tokens += kept;
+    }
+    for (size_t j = 0; j < kept; j++) {
+        const int token = chosen[j];
         r.position += 1;
         r.generated.push_back(token);
         const bool end_of_text = tokenizer.eos.count(token);
@@ -158,9 +183,8 @@ bool Engine::take_decoded_tokens() {
             if (r.in_flight) r.cancelled = true;
             else cache_sequence(r), finish(r);
         }
-        emit({req_id, token, std::move(text), done, r.cached});
+        emit({r.id, token, std::move(text), done, r.cached, r.rounds, r.round_tokens});
     }
-    return !tokens.empty();
 }
 
 bool Engine::admit_waiting_requests() {
@@ -218,10 +242,10 @@ void Engine::abort_failed_chunk(Request& r) {
 
 // A request still in the step in flight joins the next one too: its token (greedy or sampled, both chosen on the GPU)
 // is fed there. Unless that step makes its last token; an EOS there leaves one wasted row (its result is dropped at
-// poll).
+// poll). Or it is a speculative round: how many tokens it keeps is known only at poll.
 static bool ready_to_decode(const Request& r) {
     return r.state == State::DECODE && !r.cancelled &&
-           (!r.in_flight || (r.in_flight == 1 && (int)r.generated.size() + 1 < r.max_tokens));
+           (!r.in_flight || (r.in_flight == 1 && !r.speculating && (int)r.generated.size() + 1 < r.max_tokens));
 }
 
 bool Engine::submit_decode_step() {
@@ -230,12 +254,34 @@ bool Engine::submit_decode_step() {
         if ((int)batch.size() < max_batch && ready_to_decode(r)) batch.push_back(&r);
     if (batch.empty() || !decode.can_submit()) return false;
     DecodeWork work{decode_steps, {}};
+    if (batch.size() == 1 && batch[0]->speculative) {  // alone: speculate, from the step just before
+        Request& r = *batch[0];
+        if (r.in_flight) return false;  // its next round drafts from that step's head output
+        // a round can take DRAFTS + 1 tokens and writes K/V that far: with one token left, a plain step
+        if (!r.generated.empty() && r.last_step + 1 == decode_steps && r.max_tokens - (int)r.generated.size() >= 2 &&
+            take_spares(r)) {
+            ensure_pages(r, r.position + DecodeLane::DRAFTS + 1);
+            work.rows.push_back({r.id, r.generated.back(), r.position, r.pages, r.state_slots, r.sampler, r.last_row,
+                                 r.spare_state});
+            r.in_flight++, r.speculating = true, r.last_step = decode_steps;
+            try {
+                decode.submit(std::move(work));
+            } catch (...) {
+                abort(batch);
+                throw;
+            }
+            decode_steps++;
+            return true;
+        }
+    }
     for (Request* r : batch) {
+        if (batch.size() > 1) release_spares(*r);
         const int position = r->position + r->in_flight;
         ensure_pages(*r, position + 1);
         // -1: the GPU feeds the token the step in flight chooses
         const int fed_token = r->in_flight ? -1 : r->generated.empty() ? r->prompt.back() : r->generated.back();
-        work.rows.push_back({r->id, fed_token, position, r->pages, r->state_slots, r->sampler});
+        r->last_step = decode_steps, r->last_row = (int)work.rows.size();
+        work.rows.push_back({r->id, fed_token, position, r->pages, r->state_slots, r->sampler, -1, {}});
         r->in_flight++;
     }
     try {
@@ -284,9 +330,29 @@ void Engine::generate(const std::vector<Message>& chat, GenParams params,
     cleanup();
 }
 
-// Units for the whole request up front. ponytail: no generation top-up yet (memory-design `admit`).
+// Units for the whole request up front (not a speculative one's spare state sets: take_spares). ponytail: no
+// generation top-up yet (memory-design `admit`).
 uint32_t Engine::units_needed(const Request& r) const {
     return mem.units_for(r.prompt.size() + r.max_tokens) + mem.state_units;
+}
+
+// A request about to run rounds alone gets its spare state sets, if the arena has them now (evicting cached entries,
+// as an admit would) and no request waits for admission; else it decodes plainly. Held only while alone, so greedy
+// requests in a batch take no more units than sampled ones.
+bool Engine::take_spares(Request& r) {
+    if (!r.spare_state.empty()) return true;
+    const uint32_t count = DecodeLane::DRAFTS * mem.state_units;
+    if (std::any_of(requests.begin(), requests.end(), [](auto& entry) { return entry.second.state == State::WAITING; }) ||
+        !mem.arena.admit(count, [&] { return cache && cache->evict(); }))
+        return false;
+    r.reserved += count;
+    for (uint32_t j = 0; j < count; j++) r.spare_state.push_back(allocate_unit(r));  // a verify writes them first
+    return true;
+}
+
+void Engine::release_spares(Request& r) {
+    mem.arena.release(r.spare_state);  // pending until the steps committed so far are done
+    r.spare_state.clear();
 }
 
 uint32_t Engine::allocate_unit(Request& r) {
@@ -432,8 +498,9 @@ void Engine::finish(Request& r) {
     arena.unreserve(r.reserved);
     std::vector<uint32_t> units = r.pages;
     units.insert(units.end(), r.state_slots.begin(), r.state_slots.end());
+    units.insert(units.end(), r.spare_state.begin(), r.spare_state.end());
     arena.release(units);
-    r.pages.clear(), r.state_slots.clear(), r.reserved = 0, r.state = State::DONE;
+    r.pages.clear(), r.state_slots.clear(), r.spare_state.clear(), r.reserved = 0, r.state = State::DONE;
 }
 
 }  // namespace mllm

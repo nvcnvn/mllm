@@ -29,6 +29,7 @@ struct Event {
     std::string text;
     bool done;
     int cached = 0;  // prompt tokens the prefix cache supplied (Request::cached)
+    int rounds = 0, round_tokens = 0;  // its speculative rounds so far and the tokens they kept
 };
 
 enum class State { WAITING, PREFILL, DECODE, DONE };
@@ -46,6 +47,15 @@ struct Request {
     int cached = 0;    // prompt tokens taken from the prefix cache (its first position)
     std::vector<int> snapshot_points;  // prefix cache: positions still ahead where the state is copied into the cache
     std::vector<uint32_t> pages, state_slots;
+    // Speculative decoding (greedy, a model with an MTP head: docs/speculative.md): DecodeLane::DRAFTS more state sets
+    // for the verify's checkpoints, held only while it decodes alone (take_spares); the step it last decoded in and
+    // its row there (the head's output to draft from); its step in flight is a speculative round
+    bool speculative = false;
+    std::vector<uint32_t> spare_state;
+    int rounds = 0, round_tokens = 0;
+    uint64_t last_step = UINT64_MAX;
+    int last_row = 0;
+    bool speculating = false;
     uint32_t reserved = 0;  // units promised to this request, not yet allocated
     std::vector<int> generated;  // the tokens decoded so far
     int in_flight = 0;  // lane work items holding it: up to 2 prefill chunks, or up to 2 decode steps (greedy rows fed)
@@ -85,6 +95,11 @@ public:
     DecodeLane decode;
     std::map<int, Request> requests;  // live requests by id = arrival order
     std::unique_ptr<PrefixCache> cache;  // nullptr = off
+    // Greedy requests decode speculatively when the model has an MTP head, alone in the decode lane (others join as
+    // plain rows). Read at submit. Off: plain decode, bit-exact with mlx-lm (golden tests); gpu.on_scores turns it off
+    // too (one row of scores per token).
+    bool speculate = true;
+    uint64_t rounds = 0, round_tokens = 0;  // speculative rounds so far and the tokens they kept
 
 private:
     // step()'s parts, in order; each but the first returns whether it polled, admitted or submitted anything
@@ -101,6 +116,8 @@ private:
     void abort_failed_chunk(Request& r);
     uint32_t units_needed(const Request& r) const;
     uint32_t allocate_unit(Request& r);
+    bool take_spares(Request& r);
+    void release_spares(Request& r);
     void ensure_pages(Request& r, int tokens);
     bool admit(Request& r);
     PrefixCache::Match match_prefix(const Request& r, std::vector<int>& snapshot_points);
@@ -109,6 +126,7 @@ private:
     void cache_sequence(Request& r);
     void copy_units(const std::vector<uint32_t>& destination, const std::vector<uint32_t>& source);
     void emit(Event event);
+    void take_tokens(Request& r, const std::vector<int>& chosen);
     void abort(const std::vector<Request*>& rows);
     void finish(Request& r);
 

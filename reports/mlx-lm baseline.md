@@ -575,3 +575,10 @@ p=2048 g=128
   8     2   4.022   4.022          95.8        167.9   2147    112
   8     3   4.011   4.012          94.3        191.1   2143    128
 ```
+
+## 27B: speculative decoding (g23b)
+B = 1 greedy, 256 tokens on tools/spec/accept.py's six prompts (`build/tests/test_speculative bench`, interleaved,
+quiet machine): speculative 25.6 tok/s mean (22.5-31.0, 2.29-2.77 tokens per round) vs plain 14.0 (1.83x). The mlx-lm
+B = 1 decode is 15.3-15.5 (g14 above), so speculative is ~1.65x mlx-lm. `mllm bench` stays plain (random prompts). The
+MTP head in every plain step, `mllm bench -p 512 -g 128 -n 3`, 3 pairs vs main 561525f: B = 1 14.81 -> 14.57 (-1.6%),
+B = 4 35.19 -> 34.55 (-1.8%).

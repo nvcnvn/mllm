@@ -78,7 +78,7 @@ static uint64_t run_golden_trace(const nlohmann::json& golden_spec, const mllm::
             const auto& row = call["rows"][row_index];
             int request_id = row["req"];
             work.rows.push_back({request_id, fed ? -1 : tokens[row_index], row["pos"], requests[request_id].pages,
-                                 requests[request_id].state_units, {}});
+                                 requests[request_id].state_units, {}, -1, {}});
         }
         assert(decode.can_submit());
         decode.submit(work);
@@ -104,7 +104,7 @@ static void check_pending_reclaim(id<MTLDevice> device, mllm::DecodeLane& decode
     assert(arena.admit(1));
     const uint32_t released_unit = arena.alloc();
     assert(decode.can_submit() && decode.signaled() == step);
-    decode.submit({step, {{0, 0, 0, request.pages, request.state_units, {}}}});
+    decode.submit({step, {{0, 0, 0, request.pages, request.state_units, {}, -1, {}}}});
     arena.release({released_unit});  // its last reference drops while the step may still read it
     usleep(50000);
     assert(decode.poll().empty() && decode.signaled() == step);

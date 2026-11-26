@@ -296,7 +296,8 @@ void GpuOpsTest::bench_verify_step(int tokens) {
     printf("  verify %d tokens: GPU %6.2f ms\n", tokens, gpu_times[gpu_times.size() / 2] * 1e3);
 }
 
-// GpuOps::draft_tokens, k = 2: the MTP head over `rows` newly accepted positions ending at 511, then one chained step
+// A speculative round's head work (k = 2): the MTP head over the verify's `rows` rows ending at 511 (as every round
+// runs it, whatever it accepts), then GpuOps::draft_tokens: lm_head, one chained step
 // at 512; median of 10 GPU times (after 3 warm-up steps). Timing only: the hidden rows are whatever ws.residual holds.
 void GpuOpsTest::bench_draft_step(int rows) {
     units.assign(1, {});
@@ -309,13 +310,14 @@ void GpuOpsTest::bench_draft_step(int rows) {
         @autoreleasepool {
             ws.step_table = table_sets[0], ws.request_count = 1, ws.tokens_per_request = rows;
             const double gpu_time = encode_and_wait(queue, ws, [&] {
-                ops.draft_tokens(ws, {ws.residual}, {ws.token_ids}, {table_sets[1]});
+                ops.apply_mtp(ws, {ws.residual}, {ws.token_ids});  // a verify's last part, then the next round's draft
+                ops.draft_tokens(ws, {ws.residual, (size_t)(rows - 1) * model.hidden * ELEM}, {table_sets[1]});
             }, true);
             if (step >= 3) gpu_times.push_back(gpu_time);
         }
     }
     std::sort(gpu_times.begin(), gpu_times.end());
-    printf("  draft after %d accepted rows: GPU %6.2f ms\n", rows, gpu_times[gpu_times.size() / 2] * 1e3);
+    printf("  head over %d rows + draft: GPU %6.2f ms\n", rows, gpu_times[gpu_times.size() / 2] * 1e3);
 }
 
 void GpuOpsTest::bench_ops(const std::string& model_name) {
@@ -402,8 +404,8 @@ void GpuOpsTest::bench_ops(const std::string& model_name) {
     printf("\nspeculative verify: one request, k + 1 tokens ending at key 512 (docs/speculative.md)\n");
     for (int tokens = 1; tokens <= 7; tokens++) bench.bench_verify_step(tokens);
     if (!ops.has_mtp()) return;
-    printf("\nspeculative draft: the MTP head over the newly accepted rows, then 1 chained step (k = 2), to key 513\n");
-    for (int rows = 1; rows <= 3; rows++) bench.bench_draft_step(rows);
+    printf("\nspeculative draft: the MTP head over a verify's 3 rows, then the drafts (k = 2), to key 513\n");
+    bench.bench_draft_step(3);
 }
 
 }  // namespace mllm
@@ -469,6 +471,9 @@ static void generate(const std::string& model, const std::string& prompt, mllm::
         return true;
     });
     printf("\n");
+    if (engine.rounds)
+        fprintf(stderr, "[%llu speculative rounds, %.2f tokens each]\n", engine.rounds,
+                (double)engine.round_tokens / engine.rounds);
 }
 
 // mllm chat: a REPL over one engine. The history is kept as tokens (Tokenizer::continue_chat) and a finished reply's
@@ -606,6 +611,8 @@ static void bench(const std::string& model, int prompt_tokens, int generation_to
     mllm::Engine engine(model, sizes.arena, prefill_chunk(prefill_on), 32, sizes.max_batch, sizes.max_context,
                         prefill_on, prefix_cache);
     engine.tokenizer.eos.clear();  // as mlx_lm.benchmark: never stop early
+    // and plain decode: random prompts say nothing about acceptance (tests/test_speculative.mm bench measures that)
+    engine.speculate = false;
     std::mt19937 rng(0);
     std::uniform_int_distribution<int> random_token(0, engine.spec.vocab_size - 1);
     std::vector<std::vector<int>> prompts(batch_size, std::vector<int>(prompt_tokens));

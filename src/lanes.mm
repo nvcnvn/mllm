@@ -335,8 +335,13 @@ void PrefillLane::throw_if_gpu_chunk_failed() {
 
 DecodeLane::DecodeLane(GpuOps& ops, Memory& mem, int max_batch, int max_context)
     : queue(new_lane_queue(mem)), event([mem.device newSharedEvent]), fence([mem.device newFence]), ops(ops), mem(mem),
-      workspaces{ops.workspace(1, max_batch, max_context), ops.workspace(1, max_batch, max_context)},
-      step_tables(mem.step_tables(max_batch, max_context)) {}
+      // with a head, room for a speculative verify's DRAFTS + 1 queries per request (attention's partials)
+      workspaces{ops.workspace(ops.has_mtp() ? DRAFTS + 1 : 1, max_batch, max_context),
+                 ops.workspace(ops.has_mtp() ? DRAFTS + 1 : 1, max_batch, max_context)},
+      step_tables(mem.step_tables(max_batch, max_context)), verify_tables(mem.step_tables(DRAFTS + 2, max_context)),
+      chain_tables{mem.step_tables(1, max_context)} {
+    static_assert(DRAFTS == 2, "chain_tables' initializer");
+}
 
 void DecodeLane::submit(DecodeWork work) {
     @autoreleasepool {
@@ -348,8 +353,10 @@ void DecodeLane::submit(DecodeWork work) {
         const int row_count = (int)work.rows.size();
         assert(can_submit() && row_count > 0 && row_count <= workspace.max_rows &&
                (in_flight.empty() || in_flight.back().work.step + 1 == work.step));
+        const bool speculative = work.rows[0].draft_from >= 0;
+        assert(!speculative || (row_count == 1 && in_flight.empty() && ops.has_mtp()));
         std::vector<int> source_rows(row_count, -1);  // fed rows: their row in the step in flight
-        const bool any_fed = write_step_inputs(work, workspace, source_rows);
+        const bool any_fed = !speculative && write_step_inputs(work, workspace, source_rows);
         id<MTLCommandBuffer> command_buffer = [queue commandBuffer];
         workspace.encoder = [command_buffer computeCommandEncoderWithDispatchType:MTLDispatchTypeConcurrent];
         // Defensive today: a row in both step N and N + 1 is fed, and feeding reads N's next_token_ids, a tracked
@@ -357,14 +364,19 @@ void DecodeLane::submit(DecodeWork work) {
         // Needed if workspace buffers become untracked. A fence, not encodeWaitForEvent: that cost a decode of one
         // request ~3.5% (297 vs 287 tok/s).
         [workspace.encoder waitForFence:fence];
-        if (any_fed)
-            ops.feed_previous_tokens(workspace, workspaces[(work.step + 1) % 2].next_token_ids, source_rows);
-        const int layer_count = mem.spec.n_layers();
-        encode_layers(ops, workspace, 0, layer_count);
-        ops.apply_weights(layer_count, workspace);
-        std::vector<SampleParams> sampler_params;
-        for (const DecodeRow& row : work.rows) sampler_params.push_back(row.sampler);
-        ops.pick_next_tokens(workspace, sampler_params);
+        if (speculative) {
+            encode_round(work, workspace);
+        } else {
+            if (any_fed)
+                ops.feed_previous_tokens(workspace, workspaces[(work.step + 1) % 2].next_token_ids, source_rows);
+            const int layer_count = mem.spec.n_layers();
+            encode_layers(ops, workspace, 0, layer_count);
+            ops.apply_weights(layer_count, workspace);
+            std::vector<SampleParams> sampler_params;
+            for (const DecodeRow& row : work.rows) sampler_params.push_back(row.sampler);
+            ops.pick_next_tokens(workspace, sampler_params);
+            if (ops.has_mtp()) ops.apply_mtp(workspace, {workspace.residual}, {workspace.next_token_ids});
+        }
         [workspace.encoder updateFence:fence];
         [workspace.encoder endEncoding];
         workspace.encoder = nil;
@@ -373,6 +385,42 @@ void DecodeLane::submit(DecodeWork work) {
         mem.arena.committed = work.step + 1;  // units released from now on wait for this step
         in_flight.push_back({command_buffer, std::move(work)});
     }
+}
+
+// The speculative round of submit(), into workspace.encoder: drafts, then the verify of [row.token, drafts] at
+// row.pos .. row.pos + DRAFTS.
+void DecodeLane::encode_round(const DecodeWork& work, Workspace& workspace) {
+    const DecodeRow& row = work.rows[0];
+    const int rows = DRAFTS + 1, layer_count = mem.spec.n_layers();
+    const Workspace& previous = workspaces[(work.step + 1) % 2];
+    // drafts: from the head's output at row.pos - 1, the chain at row.pos, row.pos + 1, ...
+    std::vector<id<MTLBuffer>> chain;
+    for (int j = 0; j + 1 < DRAFTS; j++) {
+        chain.push_back(chain_tables[j].begin(work.step + 1, event.signaledValue));
+        chain_tables[j].write(chain.back(), {{row.pos + j, 1, row.pages}});
+    }
+    ops.draft_tokens(workspace, {previous.residual, (size_t)row.draft_from * mem.spec.hidden * ELEM}, chain);
+    // verify: token_ids = [row.token, drafts...] (fed on the GPU), one request of DRAFTS + 1 rows; the linear layers
+    // write the state after each row into its own set
+    ((int32_t*)workspace.token_ids.contents)[0] = row.token;
+    std::vector<int> source_rows{-1};
+    for (int j = 0; j < DRAFTS; j++) source_rows.push_back(j);
+    workspace.request_count = rows, workspace.tokens_per_request = 1;
+    ops.feed_previous_tokens(workspace, workspace.next_token_ids, source_rows);
+    std::vector<uint32_t> state_sets = row.state_slots;  // read; then after token 0 (the same units), 1, 2, ...
+    state_sets.insert(state_sets.end(), row.state_slots.begin(), row.state_slots.end());
+    state_sets.insert(state_sets.end(), row.spare_state.begin(), row.spare_state.end());
+    assert(row.spare_state.size() == DRAFTS * row.state_slots.size());
+    workspace.step_table = verify_tables.begin(work.step + 1, event.signaledValue);
+    verify_tables.write(workspace.step_table, {{row.pos, rows, row.pages, state_sets}});
+    workspace.request_count = 1, workspace.tokens_per_request = rows, workspace.checkpoint_states = true;
+    encode_layers(ops, workspace, 0, layer_count);
+    ops.apply_weights(layer_count, workspace);
+    workspace.checkpoint_states = false;
+    workspace.request_count = rows, workspace.tokens_per_request = 1;  // lm_head and argmax on every row
+    ops.pick_next_tokens(workspace);
+    workspace.request_count = 1, workspace.tokens_per_request = rows;
+    ops.apply_mtp(workspace, {workspace.residual}, {workspace.next_token_ids});
 }
 
 // Writes the step's shape, token ids and step table into the workspace. A row whose token is -1 takes its token from
@@ -415,9 +463,19 @@ std::vector<std::pair<int, int>> DecodeLane::poll() {
         }
         const DecodeWork& oldest = in_flight.front().work;
         if (event.signaledValue < oldest.step + 1) return {};
-        std::vector<int> tokens = ops.next_tokens(workspaces[oldest.step % 2]);
+        const Workspace& workspace = workspaces[oldest.step % 2];
         std::vector<std::pair<int, int>> finished;
-        for (size_t b = 0; b < tokens.size(); b++) finished.emplace_back(oldest.rows[b].req_id, tokens[b]);
+        if (oldest.rows[0].draft_from >= 0) {  // the argmax after each row, while the draft before it matched
+            const int32_t *chosen = (const int32_t*)workspace.next_token_ids.contents,
+                          *drafts = (const int32_t*)workspace.token_ids.contents + 1;
+            for (int j = 0; j <= DRAFTS; j++) {
+                finished.emplace_back(oldest.rows[0].req_id, chosen[j]);
+                if (j == DRAFTS || drafts[j] != chosen[j]) break;
+            }
+        } else {
+            std::vector<int> tokens = ops.next_tokens(workspace);
+            for (size_t b = 0; b < tokens.size(); b++) finished.emplace_back(oldest.rows[b].req_id, tokens[b]);
+        }
         in_flight.pop_front();
         return finished;
     }

@@ -106,7 +106,8 @@ int main() {
             ((int32_t*)ws.token_ids.contents)[0] = seq[c];
             ws.request_count = 1, ws.tokens_per_request = 1, ws.step_table = tables.copies[0];
             mllm::encode_and_wait(queue, ws, [&] {
-                ops.draft_tokens(ws, {hidden_rows, (size_t)(c - 1) * hidden * mllm::ELEM}, {ws.token_ids}, {tables.copies[1]});
+                ops.apply_mtp(ws, {hidden_rows, (size_t)(c - 1) * hidden * mllm::ELEM}, {ws.token_ids});
+                ops.draft_tokens(ws, {ws.residual}, {tables.copies[1]});
             }, true);
             const int32_t* got = (const int32_t*)ws.next_token_ids.contents;
             const int first = golden::load<int32_t>(reference.data(drafts), 2 * (c - P)),

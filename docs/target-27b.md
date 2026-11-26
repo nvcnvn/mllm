@@ -176,9 +176,10 @@ The reference's own perplexity is 30.4.
 - **Untested error path:** the prefill chain's failure handling (`PrefillLane::poll`). Nothing can make a GPU command buffer fail in tests; a deliberately faulting kernel would.
 - **Tests that don't run at 27B:**
   - test_concurrent: skips at 2 MiB units, about 400 GB of memcpy at 27B.
-  - test_ane: waits on §5.
+  - test_ane: waits on §5. At 27B its part c "repeated 500" gives cos 0.6257 against a 0.996 floor (the same on main
+    561525f), so parts d / e never run at 27B (g23b QA; not fixed).
 - **Batched speed:** engine vs mlx-lm at B = 4/8 hasn't been rerun on a quiet machine. Only bench-ops' GPU step times exist: 91.5 / 115.9 ms.
-- **Speculative decoding (g21: measured, not built):** see [speculative.md](speculative.md). The 27B's own MTP head (4-bit, from the bf16 checkpoint) at k = 2 gives 2.56 tokens per verify on six prompts. Verify of 3 rows costs 72.8 ms against 64.9 for one (bench-ops). *Estimate:* ~30 tok/s greedy at B = 1, 2.0x.
+- **Speculative decoding (g23: built, on by default for B = 1 greedy):** see [speculative.md](speculative.md). The 27B's MTP head at k = 2: 25.6 tok/s mean vs 14.0 plain on six prompts (1.83x, 22.5-31.0), 2.56 tokens per round. The head running in every plain step costs B = 1 -1.6%, B = 4 -1.8%. Output is checked by tolerance against plain greedy (near-ties only).
 - **Old weight caches:** they're deleted. Only `-v3` dirs remain under `/Volumes/T5/cache/mllm/weights/`.
 
 ## 9. Close out

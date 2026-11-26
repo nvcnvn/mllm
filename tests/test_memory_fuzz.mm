@@ -14,6 +14,9 @@
 //     under it)
 //   - every request ends (FIFO admission, no deadlock); afterwards, evicting everything frees every unit
 //   - each scenario above actually happened (counters), so the test can't pass by not getting there.
+//   - speculative rounds (a lone greedy request, docs/speculative.md): 1..DRAFTS + 1 tokens kept, the state set after
+//     the last kept row becomes the request's (sets past it hold garbage), nothing past it reaches the cache; the
+//     spare state sets are taken when it runs alone (if the arena has them) and released when it joins a batch
 // Mirrors src/engine.mm: when the engine's rules change, change Simulation too. Hash collisions: test_prefix_cache.
 #include <algorithm>
 #include <cassert>
@@ -25,7 +28,8 @@
 
 #include "prefix_cache.h"
 
-constexpr int TOKENS_PER_PAGE = 4, STATE_UNITS = 3, CHUNK_TOKENS = 8;
+constexpr int TOKENS_PER_PAGE = 4, STATE_UNITS = 3, CHUNK_TOKENS = 8, DRAFTS = 2;  // DecodeLane::DRAFTS
+constexpr uint64_t GARBAGE = 0xbad;  // a rejected verify row's keys / values or state
 constexpr uint64_t CACHE_ROOT_HASH = 14695981039346656037ull;  // PrefixCache's hash before page 0: a node's parent
 
 // the content of a unit that holds tokens[0, count)
@@ -39,7 +43,8 @@ static uint64_t content_hash(const std::vector<int>& tokens, size_t count) {
 struct Stats {
     long hits = 0, evictions = 0, duplicate_snapshots = 0, snapshots = 0, released_in_flight = 0, two_chunks = 0,
          fed_ahead = 0, alloc_waits = 0, too_big_hits = 0, cancels = 0, early_ends = 0, tail_hits = 0,
-         ended_in_flight = 0;
+         ended_in_flight = 0, rounds = 0, round_cuts = 0, state_swaps = 0, spares_taken = 0, spares_refused = 0,
+         spares_released = 0;
 };
 
 struct SimRequest {
@@ -51,6 +56,12 @@ struct SimRequest {
     int position = 0, sent = 0;
     std::vector<int> snapshot_points;
     std::vector<uint32_t> pages, state_slots;
+    // Engine's speculative decoding: DRAFTS more state sets while alone, the step it last decoded in, its round in flight (the
+    // tokens the round will keep before any early end: 1 + the drafts the GPU accepts)
+    bool speculative = false, speculating = false;
+    std::vector<uint32_t> spare_state;
+    uint64_t last_step = UINT64_MAX;
+    int round_tokens = 0;
     uint32_t reserved = 0;
     int generated = 0;
     std::deque<uint64_t> decode_steps;    // decode steps it is in
@@ -87,6 +98,27 @@ struct Simulation {
     uint32_t units_needed(const SimRequest& request) const {
         return (uint32_t)((request.prompt.size() + request.max_tokens + TOKENS_PER_PAGE - 1) / TOKENS_PER_PAGE) +
                STATE_UNITS;
+    }
+
+    // Engine::take_spares / release_spares
+    bool take_spares(SimRequest& request) {
+        if (!request.spare_state.empty()) return true;
+        const uint32_t count = DRAFTS * STATE_UNITS;
+        if (std::any_of(requests.begin(), requests.end(),
+                        [](auto& entry) { return entry.second.state == SimRequest::WAITING; }) ||
+            !arena.admit(count, [&] { return cache.evict() && ++stats.evictions; })) {
+            stats.spares_refused++;
+            return false;
+        }
+        request.reserved += count;
+        for (uint32_t j = 0; j < count; j++) request.spare_state.push_back(allocate_unit(request));
+        stats.spares_taken++;
+        return true;
+    }
+    void release_spares(SimRequest& request) {
+        stats.spares_released += !request.spare_state.empty();
+        arena.release(request.spare_state);
+        request.spare_state.clear();
     }
 
     // Engine::allocate_unit
@@ -202,8 +234,9 @@ struct Simulation {
         arena.unreserve(request.reserved);
         std::vector<uint32_t> all_units = request.pages;
         all_units.insert(all_units.end(), request.state_slots.begin(), request.state_slots.end());
+        all_units.insert(all_units.end(), request.spare_state.begin(), request.spare_state.end());
         arena.release(all_units);
-        request.pages.clear(), request.state_slots.clear(), request.reserved = 0;
+        request.pages.clear(), request.state_slots.clear(), request.spare_state.clear(), request.reserved = 0;
         ended_requests++;
     }
 
@@ -262,9 +295,14 @@ struct Simulation {
             SimRequest& request = requests.at(request_id);
             assert(request.decode_steps.front() == step);
             request.decode_steps.pop_front();
+            const bool round = std::exchange(request.speculating, false);
             if (request.cancelled) {
                 if (request.ended) request.position++, cache_sequence(request);  // this step fed its last token
                 finish(request), finished.insert(request_id);
+                continue;
+            }
+            if (round) {
+                take_round(request, finished);
                 continue;
             }
             request.position++, request.generated++;
@@ -278,6 +316,27 @@ struct Simulation {
             }
             check_bookkeeping(false);
         }
+    }
+
+    // Engine::take_tokens for a round: keep tokens up to an early end or max_tokens, the state set after the last
+    void take_round(SimRequest& request, std::set<int>& finished) {
+        int kept = 0;
+        bool ends_early = false;
+        while (kept < request.round_tokens && request.generated < request.max_tokens) {
+            kept++, request.generated++;
+            if ((ends_early = random_engine() % 12 == 0)) break;
+        }
+        stats.early_ends += ends_early, stats.rounds++, stats.round_cuts += kept < request.round_tokens;
+        if (kept > 1)
+            std::swap_ranges(request.state_slots.begin(), request.state_slots.end(),
+                             request.spare_state.begin() + (kept - 2) * STATE_UNITS), stats.state_swaps++;
+        request.position += kept;
+        // the kept rows' keys / values: the rows past them in that page are don't-care (overwritten before read)
+        unit_content[request.pages[(request.position - 1) / TOKENS_PER_PAGE]] =
+            content_hash(request.sequence, request.position);
+        if (ends_early || request.generated == request.max_tokens)
+            request.ended = true, cache_sequence(request), finish(request), finished.insert(request.id);
+        check_bookkeeping(false);
     }
 
     void admit_waiting_requests() {
@@ -330,13 +389,28 @@ struct Simulation {
         std::vector<SimRequest*> batch;
         for (auto& [_, request] : requests)
             if (request.state == SimRequest::DECODE && !request.cancelled &&
-                (request.decode_steps.empty() ||
-                 (request.decode_steps.size() == 1 && request.generated + 1 < request.max_tokens)))
+                (request.decode_steps.empty() || (request.decode_steps.size() == 1 && !request.speculating &&
+                                                  request.generated + 1 < request.max_tokens)))
                 batch.push_back(&request);
         if (batch.empty() || decode.committed - decode.signaled >= 2) return;
         const uint64_t step = decode.committed + 1;
         std::set<uint32_t> units;
-        for (SimRequest* request : batch) add_decode_row(*request, step, units);
+        if (batch.size() == 1 && batch[0]->speculative) {  // alone: a round, from the step just before
+            SimRequest& request = *batch[0];
+            if (!request.decode_steps.empty()) return;
+            if (request.generated > 0 && request.last_step + 1 == step && request.max_tokens - request.generated >= 2 &&
+                take_spares(request)) {
+                add_round(request, step, units);
+                decode.committed = arena.committed = step;
+                decode.units_read[step] = std::move(units);
+                check_bookkeeping(true);
+                return;
+            }
+        }
+        for (SimRequest* request : batch) {
+            if (batch.size() > 1) release_spares(*request);
+            add_decode_row(*request, step, units);
+        }
         decode.committed = arena.committed = step;  // DecodeLane::submit
         decode.units_read[step] = std::move(units);
         check_bookkeeping(true);
@@ -348,9 +422,27 @@ struct Simulation {
         ensure_pages(request, position + 1);
         write_unit(request.pages[position / TOKENS_PER_PAGE], content_hash(request.sequence, position + 1));
         for (uint32_t unit : request.state_slots) write_unit(unit, content_hash(request.sequence, position + 1));
-        request.decode_steps.push_back(step);
+        request.decode_steps.push_back(step), request.last_step = step;
         units.insert(request.pages.begin(), request.pages.end());
         units.insert(request.state_slots.begin(), request.state_slots.end());
+    }
+
+    // the verify of rows position .. position + DRAFTS: the GPU accepts the first round_tokens - 1 drafts; row j writes
+    // its keys / values and the state after it into set j (state_slots, then the spare sets)
+    void add_round(SimRequest& request, uint64_t step, std::set<uint32_t>& units) {
+        request.round_tokens = 1 + random_engine() % (DRAFTS + 1);
+        ensure_pages(request, request.position + DRAFTS + 1);
+        for (int j = 0; j <= DRAFTS; j++) {
+            const uint64_t content =
+                j < request.round_tokens ? content_hash(request.sequence, request.position + j + 1) : GARBAGE;
+            write_unit(request.pages[(request.position + j) / TOKENS_PER_PAGE], content);
+            for (int u = 0; u < STATE_UNITS; u++)
+                write_unit(j ? request.spare_state[(j - 1) * STATE_UNITS + u] : request.state_slots[u], content);
+        }
+        request.decode_steps.push_back(step), request.last_step = step, request.speculating = true;
+        units.insert(request.pages.begin(), request.pages.end());
+        units.insert(request.state_slots.begin(), request.state_slots.end());
+        units.insert(request.spare_state.begin(), request.spare_state.end());
     }
 
     // exact: no admit in progress, so request refs equal their holders (admit holds a hit's pages before it owns them)
@@ -371,6 +463,7 @@ struct Simulation {
             reserved += request.reserved;
             for (uint32_t unit : request.pages) expected_request_refs[unit]++;
             for (uint32_t unit : request.state_slots) expected_request_refs[unit]++;
+            for (uint32_t unit : request.spare_state) expected_request_refs[unit]++;
         }
         std::vector<int> pending_count(arena.n_units);
         for (auto [unit, step] : arena.pending) pending_count[unit]++, assert(step <= arena.committed);
@@ -472,6 +565,8 @@ static void run(unsigned seed, uint32_t unit_count, int request_count, Stats& st
         assert(tick < request_count * 400 && "no progress: a request never ended");
         if (submitted < request_count && simulation.requests.size() < 10 && random_engine() % 3 == 0) {
             SimRequest request = prompts.random_request(simulation.next_request_id++);
+            // Engine::submit: greedy requests speculate when their extra state sets fit
+            request.speculative = random_engine() % 2;
             simulation.requests.emplace(request.id, std::move(request));
             submitted++;
         }
@@ -491,13 +586,17 @@ int main(int argc, char** argv) {
     // 40 units: admits evict constantly; 100: deep cache
     for (int seed = 0; seed < seeds; seed++) run(seed, 40 + seed % 3 * 30, 300, stats);
     printf("hits %ld (tail %ld), evictions %ld, snapshots %ld (dup %ld), released in flight %ld, 2 chunks %ld, fed "
-           "ahead %ld, alloc waits %ld, too-big hits %ld, cancels %ld, eos %ld, ended in flight %ld\n",
+           "ahead %ld, alloc waits %ld, too-big hits %ld, cancels %ld, eos %ld, ended in flight %ld, rounds %ld (cut "
+           "%ld, state swaps %ld), spares taken %ld (refused %ld, released %ld)\n",
            stats.hits, stats.tail_hits, stats.evictions, stats.snapshots, stats.duplicate_snapshots,
            stats.released_in_flight, stats.two_chunks, stats.fed_ahead, stats.alloc_waits, stats.too_big_hits,
-           stats.cancels, stats.early_ends, stats.ended_in_flight);
+           stats.cancels, stats.early_ends, stats.ended_in_flight, stats.rounds, stats.round_cuts, stats.state_swaps, stats.spares_taken, stats.spares_refused,
+           stats.spares_released);
     for (long count : {stats.hits, stats.tail_hits, stats.evictions, stats.snapshots, stats.duplicate_snapshots,
                        stats.released_in_flight, stats.two_chunks, stats.fed_ahead, stats.alloc_waits,
-                       stats.too_big_hits, stats.cancels, stats.early_ends, stats.ended_in_flight})
+                       stats.too_big_hits, stats.cancels, stats.early_ends, stats.ended_in_flight, stats.rounds,
+                       stats.round_cuts, stats.state_swaps, stats.spares_taken, stats.spares_refused,
+                       stats.spares_released})
         assert(count > 0 && "a scenario never happened: the test lost its point");
     printf("PASS (%d seeds)\n", seeds);
 }

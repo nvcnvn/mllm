@@ -145,7 +145,12 @@ static void check_blocks_on_golden_inputs(mllm::AneOps& ane, mllm::Workspace& wo
     workspace.request_count = 1, workspace.tokens_per_request = token_count;
     const mllm::Tensor& tokens = trace.at("prefill0/tokens");
     memcpy(workspace.token_ids.contents, trace.data(tokens), tokens.nbytes);
-    for (int layer : {0, 3, 4}) {
+    // the layers the golden trace has, with the one before (its inputs): 0, 3, 4 at 0.8B; 0, 3, 32, 63 at 27B
+    std::vector<int> layers;
+    const auto traced = [&](int layer) { return trace.tensors.count("prefill0/" + layer_name(layer) + "/dense/x"); };
+    for (int layer : {0, 3, 4, 32, 63})
+        if (traced(layer) && (layer == 0 || traced(layer - 1))) layers.push_back(layer);
+    for (int layer : layers) {
         const mllm::AneOps::Block& block = ane.block(layer, token_count);
         assert(block.chunk_size == 512);
         if (layer > 0) {
@@ -596,6 +601,7 @@ static void check_cancel_and_abort(mllm::Engine& engine, const Tokens& prompt, c
 static void check_long_prompt_against_gpu_prefill(mllm::Engine& ane_engine, const Tokens& long_prompt) {
     const Tokens after_ane = greedy_tokens(ane_engine, long_prompt, 30);
     mllm::Engine gpu_engine(golden::MODEL, 512 << 20, 512, 32, 16, 4096);
+    gpu_engine.speculate = false;  // golden: plain decode is bit-exact, speculative is not
     const Tokens after_gpu = greedy_tokens(gpu_engine, long_prompt, 30);
     size_t same = 0;
     while (same < after_gpu.size() && after_ane[same] == after_gpu[same]) same++;
@@ -655,6 +661,7 @@ int main() {
 
     // e.
     mllm::Engine ane_engine(golden::MODEL, 512 << 20, chunk, 32, 16, 4096, "ane");
+    ane_engine.speculate = false;  // golden: plain decode is bit-exact, speculative is not
     const Tokens golden_greedy_0 = golden_token_ids(golden_tokens, "greedy/0");
     check_greedy_until_first_tie(ane_engine, prompts, golden_tokens, gpu_below);
     check_split_tail_on_gpu(ane_engine);

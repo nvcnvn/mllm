@@ -77,6 +77,7 @@ static void check_one_request_arena(mllm::Engine& engine, const std::vector<Chat
     const uint32_t units_needed = engine.mem.units_for(longest + MAX_TOKENS) + engine.mem.state_units;
     {
         mllm::Engine small(golden::MODEL, units_needed * engine.mem.arena.unit_bytes, CHUNK_TOKENS);
+        small.speculate = false;  // golden: plain decode is bit-exact, speculative is not
         assert(run_to_completion(small, prompts) == solo);
 
         check_no_units_leaked(small);
@@ -96,6 +97,7 @@ static void check_fifo_admission(mllm::Engine& engine, const std::vector<Chat>& 
                    units_c = units_for_request(prompt_c.size(), 4);
     assert(units_b + units_a > units_b + units_c && units_a <= units_b + units_c);
     mllm::Engine fifo(golden::MODEL, (units_b + units_c) * engine.mem.arena.unit_bytes, CHUNK_TOKENS);
+    fifo.speculate = false;  // golden: plain decode is bit-exact, speculative is not
     const int request_b = fifo.submit(prompt_b, {.max_tokens = 8}),
               request_a = fifo.submit(prompt_a, {.max_tokens = MAX_TOKENS});
     const int request_c = fifo.submit(prompt_c, {.max_tokens = 4});
@@ -189,6 +191,7 @@ int main() {
 
     // 0.8B 256 MiB, 27B 1 GiB
     mllm::Engine engine(golden::MODEL, golden_spec["layout"]["arena_bytes"].get<size_t>(), CHUNK_TOKENS);
+    engine.speculate = false;  // golden: plain decode is bit-exact, speculative is not
     const TokenLists solo = check_solo(engine, prompts, golden_ids);
     check_batched(engine, prompts, solo);
     check_one_request_arena(engine, prompts, solo);

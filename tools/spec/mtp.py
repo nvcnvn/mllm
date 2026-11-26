@@ -2,7 +2,7 @@
 #
 #   weights  Reads only the mtp.* tensors of the bf16 Qwen/Qwen3.6-27B (accept.py's load_mtp: tensor by tensor, +1 on
 #            the norms), quantizes them as accept.py's reference does (nn.quantize, 4-bit, group 64; the norms stay
-#            bf16) and writes <cache>/weights/<model_key>-v3/mtp/mtp.safetensors (a subdir: older engines glob the dir) next to the engine's weights cache, laid
+#            bf16) and writes <cache>/weights/<model_key>-v3/mtp/mtp.safetensors next to the engine's weights cache, laid
 #            out like it (memory.mm aligned_weight_files: data at 0 mod 16, q|k|v and gate|up back to back). Then
 #            re-reads the file and checks it equals a fresh reference byte for byte, and writes the reference's sha256
 #            per tensor to <cache>/golden/<model_key>/mtp_weights.json (tests/test_weights.mm checks the engine's).
@@ -90,7 +90,7 @@ def write_aligned(tensors, path):
         offset += len(data)
     text = json.dumps(header, separators=(",", ":"))
     text += " " * ((8 + len(text) + 15) // 16 * 16 - 8 - len(text))
-    tmp = f"{path}.tmp{os.getpid()}"  # memory.mm removes a crashed run's copy
+    tmp = f"{path}.tmp{os.getpid()}"  # weights() removes a crashed run's copy
     with open(tmp, "wb") as f:
         f.write(len(text).to_bytes(8, "little") + text.encode())
         for at, data in blobs:
@@ -101,8 +101,10 @@ def write_aligned(tensors, path):
 
 def weights():
     key = _model_key(model_dir())
-    path = CACHE / "weights" / f"{key}-v3" / "mtp" / "mtp.safetensors"  # a subdir: released loaders glob *.safetensors
+    path = CACHE / "weights" / f"{key}-v3" / "mtp" / "mtp.safetensors"
     path.parent.mkdir(parents=True, exist_ok=True)
+    for stale in path.parent.glob("mtp.safetensors.tmp*"):  # a crashed run's partial copy
+        stale.unlink()
     _, tensors = reference_mtp()
     write_aligned(tensors, str(path))
     _, fresh = reference_mtp()

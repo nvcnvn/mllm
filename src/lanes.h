@@ -40,6 +40,11 @@ struct DecodeRow {
     int req_id, token, pos;  // token -1: the request's row in the step in flight, its token fed on the GPU
     std::vector<uint32_t> pages, state_slots;
     SampleParams sampler;
+    // >= 0: a speculative round (greedy, the step's only row, docs/speculative.md), drafting from the head's output in
+    // this row of the step just before. Its verify writes the linear state after each of its DRAFTS + 1 tokens into
+    // its own set: after token 0 into state_slots, after token j into spare_state's set j - 1 (state_units each).
+    int draft_from = -1;
+    std::vector<uint32_t> spare_state;
 };
 
 struct DecodeWork {
@@ -121,14 +126,22 @@ private:
 
 class DecodeLane {
 public:
+    // Speculative rounds draft this many tokens (k: docs/speculative.md, 4-row verify costs too much for k = 3)
+    static constexpr int DRAFTS = 2;
     DecodeLane(GpuOps& ops, Memory& mem, int max_batch, int max_context);
     // At most one step ahead: step N + 1 is encoded and committed while N runs. Its rows can take N's token on the
     // GPU (DecodeRow::token -1; greedy or sampled, both chosen there), so a decode of one request never waits for the
     // CPU's encode and commit.
     bool can_submit() const { return in_flight.size() < 2; }
-    void submit(DecodeWork work);  // sets mem.arena.committed = work.step + 1
+    // Sets mem.arena.committed = work.step + 1. Every step ends with the MTP head (if any) over its rows and the tokens
+    // they chose, so the head's K/V covers every decoded position and its output can seed the next round's drafts.
+    // A speculative round (one row, draft_from >= 0, nothing in flight, the step before it was this lane's last):
+    // draft_tokens from that step's head output, then verify [token, drafts] as one request of DRAFTS + 1 rows
+    // (multi-row kernels, so checked by tolerance), lm_head and argmax on every row, then the head over those rows.
+    void submit(DecodeWork work);
     // The oldest step's (req_id, token) once its event passed; throws if a step failed (every step in flight is
-    // dropped: a later one may have fed on its tokens).
+    // dropped: a later one may have fed on its tokens). A speculative round gives its request 1 + n tokens: the
+    // 27B's argmax after each of its n accepted drafts (equal to them) and after the last (the bonus or correction).
     std::vector<std::pair<int, int>> poll();
     uint64_t signaled() const { return event.signaledValue; }  // steps done: units pending at <= this are free
     bool busy() const { return !in_flight.empty(); }
@@ -146,12 +159,15 @@ private:
     // by step parity: the CPU writes step N + 1's token_ids and reads N's next_token_ids / next_token_scores meanwhile
     Workspace workspaces[2];
     StepTables step_tables;
+    // a speculative round's: the verify's (one row, its 2 + DRAFTS state sets) and the draft chain's one-row tables
+    StepTables verify_tables, chain_tables[DRAFTS - 1];
     struct InFlightStep {
         id<MTLCommandBuffer> command_buffer;
         DecodeWork work;
     };
     std::deque<InFlightStep> in_flight;
     bool write_step_inputs(const DecodeWork& work, Workspace& workspace, std::vector<int>& source_rows);
+    void encode_round(const DecodeWork& work, Workspace& workspace);
 };
 
 }  // namespace mllm

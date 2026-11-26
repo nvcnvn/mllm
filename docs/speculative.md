@@ -1,4 +1,4 @@
-# Speculative decoding at 27B: measured (g21), being built (g22: the draft head)
+# Speculative decoding at 27B: measured (g21), built (g22-g23)
 
 **Verdict:** worth building. Use the 27B's own MTP head, quantized to 4 bits, with k = 2 draft tokens. The *estimate*
 is ~30 tok/s greedy at B = 1, about 2.0x today's 15.3. A third draft token only pays once 4-row verify is cheaper.
@@ -111,7 +111,7 @@ tok/s = tokens per verify / (verify(k + 1) + k × draft + k × 0.65 ms state che
 
 ## In the engine so far (g22: steps 1-3)
 - **Weights.** `tools/spec/mtp.py weights` writes `<weights cache>/mtp/mtp.safetensors` (31 tensors, 0.239 GB; HF's
-  `mtp.*` names). It's a subdirectory because released versions glob `*.safetensors` in the cache dir. The file equals
+  `mtp.*` names), in a subdirectory of its own. The file equals
   `accept.py`'s 4-bit head byte for byte, and `test_weights` checks the engine's GPU read-back against its hashes.
   `ModelSpec::mtp` is set when the file exists; without it (0.8B, other models) nothing changes.
 - **K/V.** The head is one more full layer in the unit, after the model's: 27B unit 2048 -> 2176 KiB (+6.25%), 73 -> 70
@@ -119,12 +119,52 @@ tok/s = tokens per verify / (verify(k + 1) + k × draft + k × 0.65 ms state che
   with the next prompt token (`PrefillWork::next_token`). Prefill at 2048 tokens: 124.0 vs 129.7 tok/s without the head
   (-4.4%, 3 interleaved pairs; decode 14.88 vs 15.00, noise). The plan's 1.6% left out the last layer's o_proj + FFN.
 - **Drafting.** `GpuOps::draft_tokens` (k = 2, argmax fed on the GPU, one command buffer): 8.4 ms after 2-3 accepted
-  rows, 10.0 ms after 1 (bench-ops "speculative draft").
+  rows, 10.0 ms after 1 (g22's design). Since g23 the head runs over all 3 verify rows inside the verify, so the draft
+  no longer depends on how many rows were accepted (bench-ops "speculative draft": head over 3 rows + draft).
 - **Checks** (`tests/test_mtp.mm`, 27B, three golden prompts + 128 greedy tokens): the head alone on MLX's hidden states
   gives K/V bit-exact with MLX; the head's K/V from the engine's own prefill: cos >= 0.99988; drafts equal `accept.py`'s
-  on 723 of 725 (99.72%); step 1's scores within 0.25 at 24 rows. The 27B golden suite stays bit-exact with the head.
-- **Not yet:** plain decode doesn't write the head's K/V for decoded positions (a prefix-cache entry after a
-  non-speculative reply has it for the prompt only).
+  on 723 of 725 (99.72%); step 1's scores within 0.25 at 24 rows. QA (g23b) reran the 27B golden suite with the head (test_engine, test_stack, test_lanes, speculation off):
+  bit-exact.
+- Plain decode now writes the head's K/V too (g23, below).
+
+## In the engine (g23: verify, rollback, wiring; on by default)
+- **What runs.** A lone B = 1 greedy request on a model with the head decodes in rounds (`DecodeLane::encode_round`).
+  Each round drafts k = 2 from the previous step's head output, verifies 3 rows through the 27B (the prefill path,
+  lm_head + argmax on every row), then runs the head over the 3 rows with the verify's argmax. The linear layers write
+  the state after each row into its own set (`Workspace::checkpoint_states`; 2 spare sets, taken only while the request decodes alone: `Engine::take_spares`,
+  so batched greedy requests need no more units than sampled ones). Acceptance
+  swaps the kept set into `state_slots`. The head also runs at the end of every plain step, so its K/V covers every
+  position and no validity tracking is needed. Off for temp > 0, B > 1 (the batch decodes plainly), `--logits`, and
+  `mllm bench` (mlx_lm.benchmark's protocol). Golden tests set `Engine::speculate = false`.
+- **Speed** (`build/tests/test_speculative bench`, 27B, 256 tokens per prompt, interleaved S P S P on a quiet
+  machine, g23b):
+
+  | prompt | prompt tokens | speculative tok/s | tokens per round | plain tok/s | speedup |
+  |---|---|---|---|---|---|
+  | chat | 33 | 31.0, 29.0 | 2.63 | 14.6, 14.0 | 2.09x |
+  | code | 61 | 27.6, 24.9 | 2.71 | 13.9, 12.6 | 1.99x |
+  | code-edit | 868 | 23.0, 22.7 | 2.43 | 13.9, 13.9 | 1.64x |
+  | reasoning | 75 | 26.7, 26.7 | 2.77 | 14.0, 14.0 | 1.90x |
+  | summary | 3303 | 25.9, 24.2 | 2.54 | 14.0, 14.0 | 1.79x |
+  | plan-think | 39 | 22.5, 22.5 | 2.29 | 14.4, 14.3 | 1.57x |
+  | **mean** | | **25.6** | 2.56 | **14.0** | **1.83x** |
+
+  Tokens per round match accept.py's k = 2 (2.34-2.77). One round's GPU time is 83.5 ms, plus a 2.7 ms gap for the CPU
+  sync (`generate`, the code prompt, 2.70 tokens per round: 31 tok/s). The estimate was 84 ms. Per-prompt tok/s is
+  below 2.70 / 86 ms on some prompts; not yet explained. Under another session's CPU load (~860% CPU, outside the lock)
+  the same bench gave a 23.7 tok/s mean: the per-round CPU sync is exposed to it, plain decode is not. QA saw rounds
+  drift from 84 to ~100 ms under sustained load while plain steps stayed flat (likely GPU clock / power): sustained
+  speculative decode is ~23-27 tok/s, and the 31.0 is a cool-GPU number.
+- **The head's cost on plain decode** (`mllm bench -p 512 -g 128 -n 3`, 3 interleaved pairs vs main 561525f, which
+  has no head): B = 1 14.81 -> 14.57 tok/s (-1.6%), B = 4 35.19 -> 34.55 (-1.8%).
+- **Checks** (`tests/test_speculative.mm`, 27B, 128 tokens): speculative output equals plain greedy on golden 0 and 2
+  and plan-think. Golden 1, code-edit and summary diverge at tokens 97, 48 and 54, each at a near-tie: plain's scores
+  for the two tokens differ by 0, 0.125 and 0. Threshold 1.2 = 2 x test_rollback's max |3-row verify - 1-row| score at
+  27B (0.60); test_speculative passed with it (QA, g23b). A NaN head K/V leaves the output equal (tolerance) and drops acceptance to 1.01 tokens per round (2.62 /
+  2.54 clean). The next turn after a speculative reply hits the cache (184 of 205 tokens). It equals the cold run and
+  drafts as well (2.80 tokens per round on both). test_rollback at 27B: kept state cos >= 0.9993, rejected rows leave
+  no trace (bit-exact). test_memory_fuzz's Sim runs rounds and takes / releases the spare sets. `mllm serve` logs and
+  reports (`usage.speculative`) rounds and tokens per round per request.
 
 ## Risks
 - Verify cost past 3 rows is kernel-bound (above). k = 2 is the safe choice until that kernel changes.
