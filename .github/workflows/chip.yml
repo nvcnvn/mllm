@@ -24,7 +24,7 @@ jobs:
         run: |
           xcrun -sdk macosx metal --version || xcodebuild -downloadComponent MetalToolchain
           make -j"$(sysctl -n hw.ncpu)"
-          pipx run build --wheel --outdir dist
+          uvx --from build pyproject-build --wheel --outdir dist
       - name: mmmllm compare
         env:
           MLX_METAL_GPU_ARCH: ${{ inputs.arch }}
