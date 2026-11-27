@@ -35,4 +35,4 @@ jobs:
           MLX_METAL_GPU_ARCH: ${{ inputs.arch }}
         run: |
           build/tests/test_metal; echo "test_metal rc=$?"
-          build/mllm generate mlx-community/Qwen3.5-0.8B-4bit "Hi" --max-tokens 8; echo "generate rc=$?"
+          lldb --batch -o run -o bt -o "frame variable" -k bt -k quit -- build/mllm generate mlx-community/Qwen3.5-0.8B-4bit "Hi" --max-tokens 8
