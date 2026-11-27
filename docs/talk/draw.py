@@ -1672,20 +1672,18 @@ Z_PATHS = {"kv": ["arena", "K/V unit", "layer row", "cell"], "state": ["arena", 
 
 
 def zoom_frame(title, sub, path, cur, h=720):
+    """No title in the picture (the slide or post heading carries it, and numbers differ between them): a breadcrumb
+    of zoom levels, the current one bold, then the one-line context."""
     g = Svg(1280, h)
-    g.text(24, 40, title, 26, weight=700)
+    items = Z_PATHS[path] if path else ["arena"]
+    spans = []
+    for i, it in enumerate(items):
+        on = i == cur
+        spans.append(f'<tspan fill="{INK if on else FAINT}" font-weight="{700 if on else 400}">{escape(it)}</tspan>')
+    sep = f'<tspan fill="{FAINT}">  ›  </tspan>'
+    g.out.append(f'<text x="24" y="38" font-family="{FONT}" font-size="17" xml:space="preserve">{sep.join(spans)}</text>')
     for i, ln in enumerate(wrap_words(sub, 150)):
         g.text(24, 66 + i * 20, ln, 15, MUTED)
-    # breadcrumb, top right
-    x = 1256
-    items = Z_PATHS[path] if path else ["arena"]
-    for i in reversed(range(len(items))):
-        on = i == cur
-        g.text(x, 40, items[i], 13, INK if on else FAINT, "end", weight=700 if on else 400)
-        x -= 7.6 * len(items[i]) + 4
-        if i:
-            g.text(x, 40, "›", 13, FAINT, "end")
-            x -= 16
     return g
 
 
@@ -1717,8 +1715,8 @@ def zoom_arena():
             g.rect(x, y0, uw - 4, uh, fill="#9AA0A6", stroke="#5F6368", rx=5)
     g.text(x0 + 24 * uw + 4, y0 + 34, "…", 16, FAINT)
     g.text(x0 + 24 * uw + 4, y0 + 54, "6,143", 11, FAINT, font=MONO)
-    zoom_next(g, x0 + 22 * uw, y0, uw - 4, uh, "zoom 2 ↓")
-    zoom_next(g, x0 + 12 * uw, y0, uw - 4, uh, "zoom 5 ↓")
+    zoom_next(g, x0 + 22 * uw, y0, uw - 4, uh, "K/V unit ↓")
+    zoom_next(g, x0 + 12 * uw, y0, uw - 4, uh, "state slot ↓")
     lx, ly = x0, y0 + 130
     for name, f, st, d in (("A's K/V pages", Z_AC, Z_AC, None), ("A's state", Z_AL, Z_AC, None),
                            ("other requests", "#9AA0A6", "#5F6368", None),
@@ -1732,9 +1730,9 @@ def zoom_arena():
     g.rect(24, y, 1232, 64, fill="#FFFFFF", stroke=Z_AC, rx=8, sw=1.5)
     g.text(40, y + 26, "A's row in the step table: the only place that says which unit is which", 13, INK, weight=700)
     g.text(40, y + 50, "pages  3 4 5 22        state  12 13 14 15 16 … (74 numbers)", 15, INK, font=MONO)
-    cards = [(Z_AC, "#FFFFFF", "a K/V page (zoom 2–4)",
+    cards = [(Z_AC, "#FFFFFF", "a K/V page",
               ["32 tokens of keys and values,", "for the 16 full-attention layers.", "One more every 32 tokens."]),
-             (Z_AL, INK, "a piece of the state (zoom 5–6)",
+             (Z_AL, INK, "a piece of the state",
               ["Part of one fixed summary for the", "48 linear-attention layers.", "74 units, for the request's whole life."])]
     for k, (fill, ink, head, lines) in enumerate(cards):
         x = 24 + k * 624
@@ -1767,10 +1765,10 @@ def zoom_unit():
             g.rect(x0 + c * cw + 1, y + 1, cw - 2, rh - 2, fill=Z_AL if c < 4 else Z_AV, stroke=Z_AC, sw=0.7, rx=2)
         g.text(x0 + 8 * cw + 16, y + 18, f"{r * 128:,} KiB" if r else "0", 12, FAINT, font=MONO)
     zoom_next(g, x0, y0, 8 * cw, rh, "", below=False)
-    g.text(x0 + 8 * cw + 104, y0 + 18, "← zoom 3", 12.5, "#9A7B00", weight=700)
+    g.text(x0 + 8 * cw + 104, y0 + 18, "← next", 12.5, "#9A7B00", weight=700)
     yb = y0 + 16 * rh + 40
     g.text(x0, yb, "16 rows × 128 KiB = 2 MiB. Each row: K and V for the 4 KV heads of that layer.", 14, INK)
-    g.text(x0, yb + 22, "Layers 0–2, 4–6, … 60–62 are linear attention: they have no row here (zoom 5).", 14, MUTED)
+    g.text(x0, yb + 22, "Layers 0–2, 4–6, … 60–62 are linear attention: they live in the state slot.", 14, MUTED)
     g.save(OUT / "zoom-unit.svg")
 
 
@@ -1790,7 +1788,7 @@ def zoom_row():
         g.text(x + cw / 2, y0 + ch + 22, f"+{c * 16} KiB" if c else "+0", 12, FAINT, "middle", font=MONO)
         g.text(x + cw / 2, y0 - 14, f"query heads {h * 6}–{h * 6 + 5}", 12, MUTED, "middle")
     zoom_next(g, x0, y0, cw, ch, "")
-    g.text(x0 + cw / 2, y0 + ch + 46, "zoom 4 ↓", 12.5, "#9A7B00", "middle", weight=700)
+    g.text(x0 + cw / 2, y0 + ch + 46, "next ↓", 12.5, "#9A7B00", "middle", weight=700)
     # query heads → KV heads
     yq = 470
     g.text(24, yq - 14, "who reads them: 24 query heads, 6 per KV head", 14, INK, weight=700)
@@ -1833,10 +1831,10 @@ def zoom_cell():
     # the address, one term per zoom level
     ya = y0 + 32 * lh + 40
     g.rect(24, ya, 1232, 112, fill="#F8F9FA", stroke=LINE, rx=8)
-    terms = [("22 × 2 MiB", "zoom 1: which unit", "from the step table"),
-             ("0 × 128 KiB", "zoom 2: which layer row", "g = 0 for layer 3"),
-             ("0 × 16 KiB", "zoom 3: K/V and head", "(kv × 4 + head)"),
-             ("4 × 512 B", "zoom 4: which line", "token 100 − 96")]
+    terms = [("22 × 2 MiB", "arena: which unit", "from the step table"),
+             ("0 × 128 KiB", "unit: which layer row", "g = 0 for layer 3"),
+             ("0 × 16 KiB", "row: K/V and head", "(kv × 4 + head)"),
+             ("4 × 512 B", "cell: which line", "token 100 − 96")]
     g.text(40, ya + 40, "address =", 17, INK, weight=700, font=MONO)
     x = 150
     for k, (t, a, b) in enumerate(terms):
@@ -1851,55 +1849,81 @@ def zoom_cell():
 
 def zoom_state():
     g = zoom_frame("Zoom 5 · the state slot: 74 units, one byte span",
-                   "A's state for the 48 linear layers, laid end to end over its 74 units in step-table order "
-                   "(units 12, 13, 14, 15, 16, …). Each layer takes 3.06 MiB, so most layers cross a unit boundary.",
+                   "A's state for the 48 linear layers is one 146.8 MiB array. Top row: the units it is stored in, in "
+                   "step-table order. Bottom row: what the bytes are. Same byte axis; only the start and the end shown.",
                    "state", 1)
-    x0, y0, per_row, uw, uh, rg = 90, 150, 19, 60, 64, 36
-    used = len(Z_LINEAR) * Z_PER
+    x0, gap = 160, 90
+    segs = [(0, 10), (142, 148)]  # MiB ranges shown, same scale, "…" between
+    scale = (1256 - x0 - gap) / sum(b - a for a, b in segs)
 
-    def at(byte):
-        u = byte / Z_UNIT
-        r = min(int(u // per_row), 3)
-        return r, x0 + (u - r * per_row) * uw
+    def X(mib):
+        x = x0
+        for k, (a, b) in enumerate(segs):
+            if a <= mib <= b:
+                return x + (mib - a) * scale
+            x += (b - a) * scale + gap
+        raise ValueError(mib)
 
-    def row_y(r):
-        return y0 + r * (uh + rg)
-
-    for j, layer in enumerate(Z_LINEAR):
-        a, b = j * Z_PER, (j + 1) * Z_PER
-        x = a
-        while x < b:
-            r, xa = at(x)
-            e = min(b, (r + 1) * per_row * Z_UNIT)
-            xb = x0 + (e / Z_UNIT - r * per_row) * uw
-            g.rect(f"{xa:.1f}", row_y(r), f"{xb - xa:.1f}", uh, fill=Z_AL if j % 2 == 0 else Z_AL2)
-            x = e
-        r, xa = at(a)
-        g.rect(f"{xa:.1f}", row_y(r) + 28, 3, uh - 28, fill=Z_AC)
-        g.text(f"{xa + 5:.1f}", row_y(r) + uh + 14, layer, 10.5, MUTED, font=MONO)
-    r, xa = at(used)
-    g.rect(f"{xa:.1f}", row_y(r), f"{x0 + (74 - r * per_row) * uw - xa:.1f}", uh, fill="#FFFFFF")
-    g.text(f"{xa + 6:.1f}", row_y(r) + 38, "unused", 11, FAINT)
-    names = A_STATE + ["…"]
-    for u in range(74):
-        r = u // per_row
-        x = x0 + (u - r * per_row) * uw
-        g.rect(f"{x:.1f}", row_y(r), uw, uh, stroke="#3C4043", sw=1.2)
-        g.text(f"{x + uw / 2:.1f}", row_y(r) + 20, f"s{u}", 11, INK, "middle", weight=700)
-        if u < len(names):
-            g.text(f"{x + uw / 2:.1f}", row_y(r) - 6, f"unit {names[u]}" if names[u] != "…" else "…", 10.5, FAINT,
+    yu, yl, h = 170, 290, 64
+    g.text(x0 - 16, yu + 30, "units", 15, INK, "end", weight=700)
+    g.text(x0 - 16, yu + 48, "where it is", 12, MUTED, "end")
+    g.text(x0 - 16, yl + 30, "layers", 15, INK, "end", weight=700)
+    g.text(x0 - 16, yl + 48, "what it is", 12, MUTED, "end")
+    # units: 2 MiB boxes
+    names = {0: "12", 1: "13", 2: "14", 3: "15", 4: "16"}
+    for (a, b) in segs:
+        for u in range(a // 2, b // 2):
+            xa, xb = X(2 * u), X(2 * u + 2)
+            g.rect(f"{xa:.1f}", yu, f"{xb - xa:.1f}", h, fill="#FFFFFF", stroke="#3C4043", sw=1.4)
+            g.text(f"{(xa + xb) / 2:.1f}", yu + 28, f"s{u}", 15, INK, "middle", weight=700)
+            g.text(f"{(xa + xb) / 2:.1f}", yu + 48, f"unit {names[u]}" if u in names else "unit …", 12, MUTED,
                    "middle", font=MONO)
-    g.text(x0 - 14, row_y(0) + 38, "s0", 12, FAINT, "end", font=MONO)
-    for r in range(1, 4):
-        g.text(x0 - 14, row_y(r) + 38, f"s{r * per_row}", 12, FAINT, "end", font=MONO)
-    zoom_next(g, x0, row_y(0), Z_PER / Z_UNIT * uw, uh, "", below=False)
-    yb = row_y(3) + uh + 50
-    g.rect(x0, yb - 14, 12, 12, fill=Z_AC)
-    g.text(x0 + 18, yb - 3, "a layer starts (the number under it is its model layer); shaded band = its bytes; "
-           "black box = a unit", 12.5, MUTED)
-    g.text(x0, yb + 24, "48 layers × 3.06 MiB = 146.8 MiB → 74 units (the last 1.2 MiB unused). Byte x of the span is "
-           "in unit state[x / 2 MiB], at x % 2 MiB.", 14, INK)
-    g.text(x0, yb + 46, "Layer 0, outlined, is zoom 6.", 14, "#9A7B00", weight=700)
+    # layers: 3.06 MiB bars, one colour; the unused tail
+    per = Z_PER / MIB
+    for j, layer in enumerate(Z_LINEAR):
+        lo, hi = j * per, (j + 1) * per
+        for (a, b) in segs:
+            ca, cb = max(lo, a), min(hi, b)
+            if ca >= cb:
+                continue
+            xa, xb = X(ca), X(cb)
+            g.rect(f"{xa:.1f}", yl, f"{xb - xa:.1f}", h, fill=Z_AL, stroke=Z_AC, sw=1.4)
+            if xb - xa > 70:
+                g.text(f"{(xa + xb) / 2:.1f}", yl + 28, f"layer {layer}", 14, INK, "middle", weight=700)
+                g.text(f"{(xa + xb) / 2:.1f}", yl + 48, "3.06 MiB", 12, MUTED, "middle")
+            elif xb - xa > 24:
+                g.text(f"{(xa + xb) / 2:.1f}", yl + 37, layer, 12, INK, "middle", weight=700)
+    used = len(Z_LINEAR) * per
+    xa, xb = X(used), X(148)
+    g.rect(f"{xa:.1f}", yl, f"{xb - xa:.1f}", h, fill="#FFFFFF", stroke="#BDC1C6", sw=1.2, dash="4 3")
+    g.text(f"{(xa + xb) / 2:.1f}", yl + 37, "unused", 12, MUTED, "middle")
+    # unit borders drawn through both rows: they don't line up with the layers
+    for (a, b) in segs:
+        for m in range(a, b + 1, 2):
+            g.line(f"{X(m):.1f}", yu + h, f"{X(m):.1f}", yl + h + 10, "#9AA0A6", 1, dash="3 3")
+            anchor = "end" if m == b else ("start" if m == a and a else "middle")
+            g.text(f"{X(m) + (4 if anchor == 'start' else 0):.1f}", yl + h + 28, f"{m} MiB" if m else "0", 12,
+                   MUTED, anchor, font=MONO)
+    # the "…" between the two ranges
+    xg = X(10) + gap / 2
+    for y in (yu + h / 2 + 6, yl + h / 2 + 6):
+        g.text(xg, y, "…", 22, FAINT, "middle")
+    g.text(xg, yl + h + 48, "68 more units", 11, FAINT, "middle")
+    zoom_next(g, X(0), yl, X(per) - X(0), h, "")
+    g.text(X(per / 2), yl - 14, "next ↓", 12, "#9A7B00", "middle", weight=700)
+    # how to read it
+    y = 470
+    lines = [
+        ("Units are 2 MiB, a layer's state is 3.06 MiB, so the borders don't line up. They don't need to:",
+         INK, 700),
+        ("the GPU finds byte x of the array in unit  state[x / 2 MiB],  at offset  x % 2 MiB.", INK, 400),
+        ("Layer 1 starts at 3.06 MiB → s1 (unit 13), 1.06 MiB in. Layer 0 runs from s0 into s1.", MUTED, 400),
+        ("Layers 3, 7, 11, … 63 are missing: they are full attention, and keep K/V pages instead.",
+         MUTED, 400),
+        ("48 layers × 3.06 MiB = 146.8 MiB → 74 units of 2 MiB = 148 MiB: the last 1.2 MiB is unused.", MUTED, 400),
+    ]
+    for i, (t, c, w) in enumerate(lines):
+        g.text(x0, y + i * 26, t, 15 if i < 2 else 14, c, weight=w, font=MONO if i == 1 and False else FONT)
     g.save(OUT / "zoom-state.svg")
 
 
@@ -1933,10 +1957,10 @@ def zoom_state_layer():
         g.text(x + hw / 2, y + 46, "128 × 128", 11, MUTED, "middle", font=MONO)
     yc = yh + 16 + 4 * (hh + 8) + 30
     g.text(24, yc, "conv: the last 3 inputs of the layer's short convolution, 3 × 10,240 × bf16 = 60 KiB.", 14, INK)
-    g.text(24, yc + 24, "Compare zoom 4: K/V gets one new line per token and old lines never change, so a cache can "
+    g.text(24, yc + 24, "Compare the K/V cell: it gets one new line per token and old lines never change, so a cache can "
            "share a full page.", 14, MUTED)
     g.text(24, yc + 46, "Here every matrix changes with every token, so there is no \"state at token t\" left behind: "
-           "the cache needs a copy (a snapshot).", 14, MUTED)
+           "the cache needs a copy, unless the request is done with it.", 14, MUTED)
     g.save(OUT / "zoom-state-layer.svg")
 
 

@@ -568,7 +568,8 @@ anywhere.
 ![74 units in step-table order, with the 48 linear layers' state laid end to end across them; layer 0 outlined](talk/zoom-state.svg)
 
 **Notes.** The other use of the same units. A's state for the 48 linear layers is one 146.8 MiB byte span, laid over
-its 74 units in the order the step table lists them. A layer takes 3.06 MiB, so layers cross unit boundaries; the
+its 74 units in the order the step table lists them. Two rows on one byte axis: where the bytes are (units), and what
+they are (one state per layer, all the same colour: shades here would read as K vs V from zoom 2). A layer takes 3.06 MiB, so layers cross unit boundaries; the
 kernel doesn't care, because it finds byte *x* at `state[x / 2 MiB] × 2 MiB + x % 2 MiB`. The units of a slot don't
 need to be neighbours either.
 
