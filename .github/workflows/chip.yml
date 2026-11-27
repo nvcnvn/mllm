@@ -29,3 +29,10 @@ jobs:
         env:
           MLX_METAL_GPU_ARCH: ${{ inputs.arch }}
         run: uvx --python 3.12 --from "mmmllm[compare] @ file://$(ls "$PWD"/dist/*.whl)" mmmllm compare
+      - name: The engine alone (when compare fails)
+        if: failure()
+        env:
+          MLX_METAL_GPU_ARCH: ${{ inputs.arch }}
+        run: |
+          build/tests/test_metal; echo "test_metal rc=$?"
+          build/mllm generate mlx-community/Qwen3.5-0.8B-4bit "Hi" --max-tokens 8; echo "generate rc=$?"
