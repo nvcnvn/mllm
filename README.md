@@ -4,8 +4,8 @@ Bit-exact with mlx-lm at batch 1, ~1.05x its prefill; numbers in [reports/mlx-lm
 and [docs/target-27b.md](docs/target-27b.md).
 
 **Runs on:** macOS 15+, Apple M1 to M4 GPUs including Pro / Max / Ultra: kernel and tile choices follow MLX's rules
-for each chip (src/gpu_rules.h), so results stay bit-exact with mlx-lm there; tested on an M4 Pro, the others await
-reports (see below). M5 stops with a clear message (MLX's neural-accelerator kernels aren't ported). **Models:** Qwen3.5 / Qwen3.6 in mlx-community 4-bit, e.g.
+for each chip (src/gpu_rules.h), so results stay bit-exact with mlx-lm there; tested on an M4 Pro; M1-M3 are untested,
+reports welcome (see below). M5 stops with a clear message (MLX's neural-accelerator kernels aren't ported). **Models:** Qwen3.5 / Qwen3.6 in mlx-community 4-bit, e.g.
 `mlx-community/Qwen3.5-0.8B-4bit`, `mlx-community/Qwen3.6-27B-4bit` (32 GB+ Mac).
 **Memory:** the KV cache (arena), max context and serve's max batch shrink to what the GPU may use (Metal's
 recommended working set: ~72% of RAM on 8 / 16 / 24 GB Macs, ~87% at 64 GB) and a model that can't fit stops before loading, with a clear message.
@@ -57,7 +57,7 @@ Install [uv](https://docs.astral.sh/uv/) (`brew install uv`, or `curl -LsSf http
 close other apps, then:
 
 ```sh
-uvx --python 3.12 --from 'mmmllm[compare]==0.4.0rc1' mmmllm compare
+uvx --python 3.12 --from 'mmmllm[compare]' mmmllm compare
 ```
 
 It runs both engines greedily on 3 fixed prompts and checks every step's logits against mlx-lm's, bit for bit

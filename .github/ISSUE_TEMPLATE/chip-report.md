@@ -8,7 +8,7 @@ labels: chip-report
 Run this in Terminal (needs uv: `brew install uv`, or `curl -LsSf https://astral.sh/uv/install.sh | sh`):
 
 ```sh
-uvx --python 3.12 --from 'mmmllm[compare]==0.4.0rc1' mmmllm compare
+uvx --python 3.12 --from 'mmmllm[compare]' mmmllm compare
 ```
 
 and paste its whole output as-is:

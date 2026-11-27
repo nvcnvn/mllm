@@ -1,0 +1,21 @@
+# `mmmllm compare` (the README's chip report) on GitHub's Apple-silicon VMs: an M1, the only other chip we can reach.
+# Runs the published package, as a tester would. Run it from the Actions tab or `gh workflow run chip.yml`.
+name: chip
+on:
+  workflow_dispatch:
+    inputs:
+      spec:
+        description: "package spec, e.g. mmmllm[compare]==0.5.0"
+        default: "mmmllm[compare]"
+permissions:
+  contents: read
+jobs:
+  compare:
+    runs-on: macos-15
+    timeout-minutes: 30
+    steps:
+      - uses: astral-sh/setup-uv@v6
+      - name: Machine
+        run: sw_vers; sysctl -n machdep.cpu.brand_string hw.memsize; system_profiler SPDisplaysDataType
+      - name: mmmllm compare
+        run: uvx --python 3.12 --from "${{ inputs.spec }}" mmmllm compare
