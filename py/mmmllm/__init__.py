@@ -113,7 +113,7 @@ def correctness(path, n=64):
                                 "--prefix-cache", "off"],  # its snapshot points split chunks where mlx-lm doesn't
                                capture_output=True, text=True)
             if r.returncode:
-                sys.exit(r.stderr.strip())
+                sys.exit(r.stderr.strip() or f"mmmllm generate: exit {r.returncode}, no message")
             bits = np.fromfile(out, dtype=np.uint16).astype(np.uint32) << 16  # bf16 -> float32, exactly
             ours.append((r.stdout.removesuffix("\n"), bits.view(np.float32)))
     model, tokenizer = load(path)

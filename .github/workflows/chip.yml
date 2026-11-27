@@ -1,21 +1,31 @@
-# `mmmllm compare` (the README's chip report) on GitHub's Apple-silicon VMs: an M1, the only other chip we can reach.
-# Runs the published package, as a tester would. Run it from the Actions tab or `gh workflow run chip.yml`.
+# `mmmllm compare` (the README's chip report) on GitHub's Apple-silicon VM, built from this ref. The VM's GPU names
+# itself air64_v27 (paravirtual), which neither MLX nor the engine maps to a chip; MLX_METAL_GPU_ARCH makes both
+# pick that chip's rules on the VM's real M1 GPU, so applegpu_g13g checks the M1 path end to end.
+# Run: `gh workflow run chip.yml` (or the Actions tab).
 name: chip
 on:
   workflow_dispatch:
     inputs:
-      spec:
-        description: "package spec, e.g. mmmllm[compare]==0.5.0"
-        default: "mmmllm[compare]"
+      arch:
+        description: "MLX_METAL_GPU_ARCH for both engines"
+        default: "applegpu_g13g"
 permissions:
   contents: read
 jobs:
   compare:
     runs-on: macos-15
-    timeout-minutes: 30
+    timeout-minutes: 40
     steps:
+      - uses: actions/checkout@v4
       - uses: astral-sh/setup-uv@v6
       - name: Machine
-        run: sw_vers; sysctl -n machdep.cpu.brand_string hw.memsize; system_profiler SPDisplaysDataType
+        run: sw_vers; sysctl -n machdep.cpu.brand_string hw.memsize
+      - name: Build the wheel
+        run: |
+          xcrun -sdk macosx metal --version || xcodebuild -downloadComponent MetalToolchain
+          make -j"$(sysctl -n hw.ncpu)"
+          pipx run build --wheel --outdir dist
       - name: mmmllm compare
-        run: uvx --python 3.12 --from "${{ inputs.spec }}" mmmllm compare
+        env:
+          MLX_METAL_GPU_ARCH: ${{ inputs.arch }}
+        run: uvx --python 3.12 --from "mmmllm[compare] @ file://$(ls "$PWD"/dist/*.whl)" mmmllm compare
