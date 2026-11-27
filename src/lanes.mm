@@ -64,7 +64,7 @@ double encode_and_wait(id<MTLCommandQueue> queue, Workspace& workspace, const st
 
 static id<MTLCommandQueue> new_lane_queue(Memory& mem) {
     id<MTLCommandQueue> queue = [mem.device newCommandQueue];
-    [queue addResidencySet:mem.residency];
+    if (mem.residency) [queue addResidencySet:mem.residency];
     return queue;
 }
 

@@ -271,9 +271,9 @@ Memory::Memory(const ModelSpec& spec, id<MTLDevice> device, size_t arena_bytes, 
     arena_buffer = buffer((size_t)arena.n_units * arena.unit_bytes,
                           MTLResourceStorageModeShared | MTLResourceHazardTrackingModeUntracked);
     memset(arena_buffer.contents, 0, arena_buffer.length);  // pre-touch: page in now, not during a step
-    NSError* error = nil;
-    residency = [device newResidencySetWithDescriptor:[MTLResidencySetDescriptor new] error:&error];
-    if (!residency) throw std::runtime_error(std::string("residency set: ") + error.localizedDescription.UTF8String);
+    // nil on a VM's paravirtual GPU (GitHub's M1 runners, with no NSError): run without it; every use is a message to
+    // nil (a no-op) except lanes.mm's addResidencySet, which checks.
+    residency = [device newResidencySetWithDescriptor:[MTLResidencySetDescriptor new] error:nil];
     [residency addAllocation:arena_buffer];
     [residency commit];
     [residency requestResidency];
