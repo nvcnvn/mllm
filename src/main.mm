@@ -431,7 +431,7 @@ static mllm::EngineSizes fit(const std::string& model, const std::string& prefil
     size_t weights = 0;  // what Weights loads (the headers only are read here)
     for (const auto& [name, tensor] : mllm::Safetensors(spec.path).tensors)
         if (name.starts_with("language_model.")) weights += tensor.nbytes;
-    if (spec.mtp) weights += std::filesystem::file_size(mllm::spec::weights_dir(spec.path) + "/mtp/mtp.safetensors");
+    if (spec.mtp) weights += std::filesystem::file_size(spec.mtp_file);
     id<MTLDevice> device = MTLCreateSystemDefaultDevice();
     size_t budget = device.recommendedMaxWorkingSetSize;
     if (const char* budget_gb = getenv("MLLM_GPU_BUDGET_GB")) {

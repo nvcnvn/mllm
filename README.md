@@ -34,6 +34,13 @@ curl -N localhost:8080/v1/completions -d '{"prompt": "The capital of France is",
 
 `mmmllm` with no arguments lists every command and flag (`--port`, `--max-batch`, `--max-ctx`, `--arena-gib`, ...).
 
+**Speculative decoding** (27B): greedy replies (temperature 0) from one request at a time go about 1.8x faster
+on an M4 Pro (about 25 vs 14 tok/s). A small draft layer guesses 2 tokens ahead and the 27B checks them in one pass
+([speculative.md](docs/speculative.md)). The draft is Qwen's own MTP head, which mlx-community's conversion drops: on
+first use of the 27B, `mmmllm` downloads it (0.24 GB, [nvcnvn/Qwen3.6-27B-MTP-4bit](https://huggingface.co/nvcnvn/Qwen3.6-27B-MTP-4bit))
+to the Hugging Face cache. Without it the 27B decodes as before. The output matches plain decoding except at
+near-ties between two tokens.
+
 **Neural Engine prefill**: `--prefill ane` runs prefill's matmuls on the Neural Engine, with the GPU feeding it its
 own 4-bit weights a layer at a time (no second copy; ~3 GB more memory at 27B). At 27B on an M4 Pro: 4096-token
 prompts 191 vs 131 tok/s, and decode next to a long prefill keeps 12 tok/s instead of 3

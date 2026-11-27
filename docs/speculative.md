@@ -113,7 +113,10 @@ tok/s = tokens per verify / (verify(k + 1) + k × draft + k × 0.65 ms state che
 - **Weights.** `tools/spec/mtp.py weights` writes `<weights cache>/mtp/mtp.safetensors` (31 tensors, 0.239 GB; HF's
   `mtp.*` names), in a subdirectory of its own. The file equals
   `accept.py`'s 4-bit head byte for byte, and `test_weights` checks the engine's GPU read-back against its hashes.
-  `ModelSpec::mtp` is set when the file exists; without it (0.8B, other models) nothing changes.
+  `ModelSpec::mtp` is set when the file exists; without it (0.8B, other models) nothing changes. Published as
+  [nvcnvn/Qwen3.6-27B-MTP-4bit](https://huggingface.co/nvcnvn/Qwen3.6-27B-MTP-4bit) (same bytes, sha256 367ee4de...):
+  the Python wrapper (`DRAFTS` in py/mmmllm/__init__.py) downloads it on first use of a Qwen3.6-27B and passes it as
+  `$MLLM_DRAFT`, which the engine reads when the weights cache has no `mtp/` (`ModelSpec::mtp_file`).
 - **K/V.** The head is one more full layer in the unit, after the model's: 27B unit 2048 -> 2176 KiB (+6.25%), 73 -> 70
   units per state slot. Prefill now also runs the last layer's rest and the final norm, then the head over every row
   with the next prompt token (`PrefillWork::next_token`). Prefill at 2048 tokens: 124.0 vs 129.7 tok/s without the head

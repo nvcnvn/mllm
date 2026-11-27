@@ -101,8 +101,8 @@ static void write_aligned_file(const Safetensors& source, size_t file_index, con
 // weight / scales / biases are written back to back, so a merged multiply is a view of the file, not a copy at load
 // (architecture.md Deferred, "before the 27B target"); (c) only language_model.* tensors (v3: the vision tower,
 // 0.9 GB at 27B, is never read). Tensor bytes and names are unchanged. A chain member in another source file moves
-// to its first member's file. tools/spec/mtp.py's mtp.safetensors (the MTP head, written aligned the same way) is
-// loaded too when it's there.
+// to its first member's file. The MTP head's file (ModelSpec::mtp_file, written aligned the same way) is loaded
+// too when there is one.
 static std::vector<std::string> aligned_weight_files(const std::string& path) {
     const std::vector<std::string> files = files_in(path);
     const fs::path dir = spec::weights_dir(path);
@@ -115,7 +115,7 @@ static std::vector<std::string> aligned_weight_files(const std::string& path) {
         for (size_t file_index = 0; file_index < files.size(); file_index++)
             write_aligned_file(source, file_index, out[file_index]);
     }
-    if (fs::exists(dir / "mtp" / "mtp.safetensors")) out.push_back((dir / "mtp" / "mtp.safetensors").string());
+    if (const std::string mtp = spec::load(path).mtp_file; !mtp.empty()) out.push_back(mtp);
     return out;
 }
 

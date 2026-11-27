@@ -11,8 +11,10 @@ struct ModelSpec {
     int hidden, vocab_size;
     int query_heads, key_value_heads, head_dim;  // full attention
     int linear_key_heads, linear_value_heads, linear_key_dim, linear_value_dim, conv_kernel;  // Gated DeltaNet
-    // tools/spec/mtp.py wrote the MTP draft head's weights into weights_dir/mtp/: one more full-attention layer, its K/V in
-    // every page unit after the model's full layers (docs/speculative.md)
+    // The MTP draft head's weights: one more full-attention layer, its K/V in every page unit after the model's full layers
+    // (docs/speculative.md). From tools/spec/mtp.py (weights_dir/mtp/mtp.safetensors), else $MLLM_DRAFT (the Python
+    // wrapper downloads the head's HF repo and sets it); empty = no head, plain decode.
+    std::string mtp_file;
     bool mtp = false;
 
     int n_layers() const { return (int)kinds.size(); }

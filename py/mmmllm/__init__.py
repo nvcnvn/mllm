@@ -27,6 +27,29 @@ def local(model):
         return snapshot_download(model, allow_patterns=ALLOW)
 
 
+# A model name part -> the HF repo of its MTP draft head (docs/speculative.md): mlx-community's conversions drop it.
+DRAFTS = {"Qwen3.6-27B": "nvcnvn/Qwen3.6-27B-MTP-4bit"}
+
+
+def draft(model):
+    """The draft head's file for speculative decoding, downloaded on first use; None: plain decode."""
+    repo = next((r for name, r in DRAFTS.items() if name in model), None)
+    if not repo:
+        return None
+    from huggingface_hub import hf_hub_download
+    try:
+        return hf_hub_download(repo, "mtp.safetensors", local_files_only=True)
+    except Exception:
+        pass
+    print(f"mmmllm: fetching the draft head for speculative decoding (about 1.8x faster greedy replies): {repo}, "
+          "0.24 GB", file=sys.stderr, flush=True)
+    try:
+        return hf_hub_download(repo, "mtp.safetensors")
+    except Exception as e:
+        print(f"mmmllm: no draft head ({type(e).__name__}), decoding without speculation", file=sys.stderr)
+        return None
+
+
 def tee(cmd):
     sys.stdout.flush()  # our header before the child's stderr, also when redirected to a file
     p = subprocess.Popen(cmd, stdout=subprocess.PIPE, text=True)
@@ -171,6 +194,8 @@ def main():
         path = local(a[i])  # keep the repo id (API responses name the model): the engine finds it in the same cache
         from huggingface_hub import constants
         os.environ["HF_HUB_CACHE"] = constants.HF_HUB_CACHE
+        if a[0] != "bench" and (head := draft(path)):  # bench always decodes plainly
+            os.environ["MLLM_DRAFT"] = head
         if any(flag == "--prefill" and value == "ane" for flag, value in zip(a, a[1:])):
             build_ane_blocks(path, a)
     os.execv(BIN, ["mmmllm", *a])  # argv[0]: the name its usage and errors print

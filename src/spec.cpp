@@ -64,7 +64,10 @@ ModelSpec load(const std::string& model) {
     spec.linear_key_dim = text.at("linear_key_head_dim");
     spec.linear_value_dim = text.at("linear_value_head_dim");
     spec.conv_kernel = text.at("linear_conv_kernel_dim");
-    spec.mtp = fs::exists(weights_dir(path) + "/mtp/mtp.safetensors");
+    spec.mtp_file = weights_dir(path) + "/mtp/mtp.safetensors";
+    if (!fs::exists(spec.mtp_file)) spec.mtp_file = getenv("MLLM_DRAFT") ? getenv("MLLM_DRAFT") : "";
+    if (!spec.mtp_file.empty() && !fs::exists(spec.mtp_file)) spec.mtp_file.clear();
+    spec.mtp = !spec.mtp_file.empty();
     return spec;
 }
 
